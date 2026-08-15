@@ -5,7 +5,7 @@ from pathlib import Path
 from mutagen.flac import FLAC, Picture
 
 from app.models import Enrichment, Identity, TagHints, TagSet
-from app.util import format_artist_list, is_synced_lrc, sanitize_filename, year_from_date
+from app.util import format_artist_list, is_synced_lrc, parse_track_number, sanitize_filename, year_from_date
 
 ALLOWED = (
     "TITLE",
@@ -43,6 +43,30 @@ def read_hints(path: Path, filename: str) -> TagHints:
         discnumber=_first(audio, "discnumber", "DISCNUMBER"),
         filename=filename,
     )
+
+
+def hints_to_tagset(hints: TagHints) -> TagSet:
+    return TagSet(
+        title=hints.title,
+        album=hints.album,
+        artist=hints.artist,
+        albumartist=hints.albumartist,
+        composer=hints.composer,
+        genre=hints.genre,
+        date=year_from_date(hints.date) or hints.date,
+        tracknumber=parse_track_number(hints.tracknumber),
+        discnumber=parse_track_number(hints.discnumber),
+        lyrics="",
+    )
+
+
+def read_cover(path: Path) -> tuple[bytes | None, str | None]:
+    audio = FLAC(path)
+    pictures = audio.pictures or []
+    if not pictures:
+        return None, None
+    front = next((pic for pic in pictures if pic.type == 3), pictures[0])
+    return front.data, front.mime or "image/jpeg"
 
 
 def audio_info(path: Path) -> tuple[float, int | None, int | None]:

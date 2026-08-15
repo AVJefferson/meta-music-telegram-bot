@@ -84,3 +84,31 @@ def file_stem_hints(filename: str) -> str:
     stem = Path(filename).stem
     stem = re.sub(r"^\d+\s*[-._]\s*", "", stem)
     return stem.strip()
+
+
+def format_bytes(n: int | None) -> str:
+    if n is None:
+        return "?"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.0f} MB"
+    if n >= 1000:
+        return f"{n / 1000:.0f} KB"
+    return f"{n} B"
+
+
+def format_quality(bit_depth: int | None, sample_rate: int | None, size: int | None = None) -> str:
+    depth = f"{bit_depth}-bit" if bit_depth else "?-bit"
+    if sample_rate:
+        rate = f"{sample_rate / 1000:g}kHz"
+    else:
+        rate = "?kHz"
+    parts = [depth, rate]
+    if size is not None:
+        parts.append(format_bytes(size))
+    return ", ".join(parts)
+
+
+def normalize_match_text(value: str) -> str:
+    text = (value or "").casefold()
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()

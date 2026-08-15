@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal
 
@@ -53,6 +53,8 @@ class Identity:
     mb_release_group_id: str | None = None
     source: str = "unknown"
     candidates: list[Candidate] = field(default_factory=list)
+    confidence_reason: str = ""
+    source_report: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -62,6 +64,10 @@ class Enrichment:
     lyrics: str | None = None
     genre: str = ""
     instrumental: bool = False
+    cover_source: str = "none"
+    caa_release: str | None = None
+    itunes_report: dict[str, Any] = field(default_factory=dict)
+    lastfm_tags: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -123,3 +129,52 @@ class TrackRecord:
     @property
     def local(self) -> Path | None:
         return Path(self.local_path) if self.local_path else None
+
+
+@dataclass
+class PendingReview:
+    id: int
+    phase: str
+    status: str
+    local_path: str
+    sidecar_path: str | None
+    relative_path: str | None
+    kind: str
+    original_json: str
+    recommended_json: str
+    working_json: str
+    candidates_json: str
+    identity_json: str
+    source_report_json: str
+    drive_conflicts_json: str
+    drive_root_id: str | None
+    chat_id: int
+    thread_id: int | None
+    status_message_id: int
+    topic_name: str
+    file_name: str
+    track_id: int | None
+    replace_id: int | None
+    old_drive_id: str | None
+    created_at: str
+    expires_at: str
+
+
+def identity_from_dict(data: dict[str, Any]) -> Identity:
+    raw = dict(data)
+    candidates = []
+    for item in raw.get("candidates") or []:
+        if isinstance(item, Candidate):
+            candidates.append(item)
+            continue
+        allowed = {f.name for f in fields(Candidate)}
+        candidates.append(Candidate(**{k: v for k, v in item.items() if k in allowed}))
+    raw["candidates"] = candidates
+    allowed = {f.name for f in fields(Identity)}
+    return Identity(**{k: v for k, v in raw.items() if k in allowed})
+
+
+def tagset_from_dict(data: dict[str, Any] | None) -> TagSet:
+    raw = data or {}
+    allowed = {f.name for f in fields(TagSet)}
+    return TagSet(**{k: (v if isinstance(v, str) else str(v or "")) for k, v in raw.items() if k in allowed})

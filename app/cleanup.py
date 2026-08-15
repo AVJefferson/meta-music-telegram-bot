@@ -105,6 +105,7 @@ def _purge_tmp(tmp_root: Path) -> None:
 
 async def run_cleanup(ctx: Ctx) -> None:
     log.info("weekly cleanup start")
+    await run_expire_pending(ctx)
     for row in ctx.catalog.list_failed():
         await _retry_row(ctx, row)
     for row in ctx.catalog.list_uploaded_with_local():
@@ -113,3 +114,9 @@ async def run_cleanup(ctx: Ctx) -> None:
     rmdir_empty(ctx.settings.review_root)
     _purge_tmp(ctx.settings.tmp_root)
     log.info("weekly cleanup done")
+
+
+async def run_expire_pending(ctx: Ctx) -> None:
+    from app.queue import expire_pending
+
+    await expire_pending(ctx)

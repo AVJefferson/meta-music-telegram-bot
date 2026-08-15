@@ -9,21 +9,49 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.filters import Command
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, TelegramObject
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.catalog import Catalog
-from app.cleanup import run_cleanup
+from app.cleanup import run_cleanup, run_expire_pending
 from app.config import Settings
 from app.drive import DriveClient
 from app.genre import GenreMapper
 from app.identify import MBClient
 from app.models import Ctx, Job
 from app.queue import worker
+from app.review_ui import build_review_router
 from app.util import html_esc
 
 log = logging.getLogger(__name__)
+
+NOISY_LOGGERS = (
+    "musicbrainzngs",
+    "httpx",
+    "httpcore",
+    "googleapiclient",
+    "googleapiclient.discovery",
+    "googleapiclient.http",
+    "apscheduler",
+    "aiogram.event",
+    "urllib3",
+)
+
+
+def setup_logging(level_name: str) -> None:
+    mapping = {"debug": logging.DEBUG, "info": logging.INFO, "error": logging.ERROR}
+    level = mapping.get((level_name or "info").strip().lower(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+    if level > logging.DEBUG:
+        for name in NOISY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.WARNING)
+    logging.getLogger("app").setLevel(level)
 
 
 class CtxMiddleware(BaseMiddleware):
@@ -110,7 +138,12 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
             return
         file_id, file_name = file_info(message)
         thread_id, topic_name = resolve_topic(message, ctx)
-        status = await message.reply(f"Queued <code>{html_esc(file_name)}</code>…", parse_mode="HTML")
+        status_id = 0
+        try:
+            status = await message.reply(f"Queued <code>{html_esc(file_name)}</code>…", parse_mode="HTML")
+            status_id = status.message_id
+        except Exception as exc:
+            log.warning("queue reply failed: %s", exc)
         await jobs.put(
             Job(
                 chat_id=message.chat.id,
@@ -118,7 +151,7 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
                 topic_name=topic_name,
                 file_id=file_id,
                 file_name=file_name,
-                status_message_id=status.message_id,
+                status_message_id=status_id,
             )
         )
 
@@ -140,15 +173,12 @@ async def wait_for_telegram(bot: Bot) -> None:
 
 
 async def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
     settings = Settings()
+    setup_logging(settings.log_level)
     for path in (
         settings.library_root,
         settings.review_root,
+        settings.pending_root,
         settings.tmp_root,
         settings.state_db.parent,
     ):
@@ -176,12 +206,14 @@ async def main() -> None:
     jobs: asyncio.Queue[Job] = asyncio.Queue()
     ctx = Ctx(settings=settings, catalog=catalog, drive=drive, http=http, genre=genre, bot=bot, mb=mb)
 
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())
     dp.update.middleware(CtxMiddleware(ctx))
     dp.include_router(build_router(jobs))
+    dp.include_router(build_review_router())
 
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(run_cleanup, CronTrigger.from_crontab(settings.cleanup_cron, timezone="UTC"), args=[ctx])
+    scheduler.add_job(run_expire_pending, "interval", minutes=15, args=[ctx])
     scheduler.start()
 
     worker_task = asyncio.create_task(worker("main", jobs, ctx), name="tagger-worker")

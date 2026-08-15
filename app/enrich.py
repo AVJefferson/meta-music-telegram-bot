@@ -93,41 +93,10 @@ async def _cover_from_caa(http: httpx.AsyncClient, identity: Identity) -> tuple[
     return None
 
 
-async def _cover_from_itunes(http: httpx.AsyncClient, identity: Identity) -> tuple[bytes, str] | None:
+async def _itunes_search(http: httpx.AsyncClient, identity: Identity) -> list[dict]:
     term = " ".join(p for p in [identity.artists[0] if identity.artists else "", identity.title] if p)
     if not term:
-        return None
-    url = "https://itunes.apple.com/search"
-    try:
-        response = await http.get(
-            url,
-            params={"term": term, "entity": "song", "limit": 5},
-            timeout=20.0,
-        )
-        response.raise_for_status()
-        results = response.json().get("results") or []
-    except httpx.HTTPError:
-        return None
-    title_cf = identity.title.casefold()
-    for item in results:
-        track = str(item.get("trackName") or "").casefold()
-        if title_cf and title_cf not in track and track not in title_cf:
-            continue
-        art = item.get("artworkUrl100") or item.get("artworkUrl60")
-        if not art:
-            continue
-        for size in ("1200x1200bb", "600x600bb"):
-            candidate = art.replace("100x100bb", size).replace("60x60bb", size)
-            got = await _download_cover(http, candidate)
-            if got:
-                return got
-    return None
-
-
-async def _itunes_genre(http: httpx.AsyncClient, identity: Identity) -> str | None:
-    term = " ".join(p for p in [identity.artists[0] if identity.artists else "", identity.title] if p)
-    if not term:
-        return None
+        return []
     try:
         response = await http.get(
             "https://itunes.apple.com/search",
@@ -135,19 +104,48 @@ async def _itunes_genre(http: httpx.AsyncClient, identity: Identity) -> str | No
             timeout=20.0,
         )
         response.raise_for_status()
-        results = response.json().get("results") or []
+        return response.json().get("results") or []
     except httpx.HTTPError:
-        return None
+        return []
+
+
+def _itunes_match(identity: Identity, results: list[dict]) -> dict | None:
     title_cf = identity.title.casefold()
     for item in results:
         track = str(item.get("trackName") or "").casefold()
         if title_cf and title_cf not in track and track not in title_cf:
             continue
-        genre = item.get("primaryGenreName")
-        if genre:
-            return str(genre)
-    if results and results[0].get("primaryGenreName"):
-        return str(results[0]["primaryGenreName"])
+        return item
+    return results[0] if results else None
+
+
+def _itunes_report(item: dict | None) -> dict:
+    if not item:
+        return {}
+    art = item.get("artworkUrl100") or item.get("artworkUrl60")
+    year = ""
+    raw_date = str(item.get("releaseDate") or "")
+    if len(raw_date) >= 4 and raw_date[:4].isdigit():
+        year = raw_date[:4]
+    return {
+        "title": item.get("trackName") or "",
+        "artist": item.get("artistName") or "",
+        "album": item.get("collectionName") or "",
+        "year": year,
+        "genre": item.get("primaryGenreName") or "",
+        "artwork": bool(art),
+    }
+
+
+async def _cover_from_itunes_item(http: httpx.AsyncClient, item: dict) -> tuple[bytes, str] | None:
+    art = item.get("artworkUrl100") or item.get("artworkUrl60")
+    if not art:
+        return None
+    for size in ("1200x1200bb", "600x600bb"):
+        candidate = art.replace("100x100bb", size).replace("60x60bb", size)
+        got = await _download_cover(http, candidate)
+        if got:
+            return got
     return None
 
 
@@ -227,16 +225,28 @@ async def enrich(
     lastfm_api_key: str,
     topic_language: str | None,
 ) -> Enrichment:
+    itunes_results = await _itunes_search(http, identity)
+    itunes_item = _itunes_match(identity, itunes_results)
+    itunes_meta = _itunes_report(itunes_item)
+
     cover = await _cover_from_caa(http, identity)
-    if cover is None:
-        cover = await _cover_from_itunes(http, identity)
+    cover_source = "none"
+    caa_release = None
+    if cover is not None:
+        cover_source = "caa"
+        caa_release = identity.mb_release_id or identity.mb_release_group_id
+    elif itunes_item:
+        cover = await _cover_from_itunes_item(http, itunes_item)
+        if cover is not None:
+            cover_source = "itunes"
 
     lyrics, instrumental = await _lrclib(http, identity)
     extra_tags = list(identity.raw_genre_tags)
-    itunes_genre = await _itunes_genre(http, identity)
+    itunes_genre = str(itunes_meta.get("genre") or "")
     if itunes_genre:
         extra_tags.insert(0, itunes_genre)
-    extra_tags.extend(await _lastfm_tags(http, lastfm_api_key, identity))
+    lastfm_tags = await _lastfm_tags(http, lastfm_api_key, identity)
+    extra_tags.extend(lastfm_tags)
     if instrumental:
         extra_tags.append("Instrumental")
 
@@ -248,4 +258,8 @@ async def enrich(
         lyrics=lyrics,
         genre=genre_str,
         instrumental=instrumental,
+        cover_source=cover_source,
+        caa_release=caa_release,
+        itunes_report=itunes_meta,
+        lastfm_tags=lastfm_tags,
     )

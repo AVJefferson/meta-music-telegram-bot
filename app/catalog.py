@@ -5,7 +5,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.models import TrackRecord
+from app.models import PendingReview, TrackRecord
 
 
 def _utc_now() -> str:
@@ -32,6 +32,36 @@ def _row_to_track(row: sqlite3.Row) -> TrackRecord:
         error=row["error"],
         created_at=row["created_at"],
         uploaded_at=row["uploaded_at"],
+    )
+
+
+def _row_to_pending(row: sqlite3.Row) -> PendingReview:
+    return PendingReview(
+        id=row["id"],
+        phase=row["phase"],
+        status=row["status"],
+        local_path=row["local_path"],
+        sidecar_path=row["sidecar_path"],
+        relative_path=row["relative_path"],
+        kind=row["kind"],
+        original_json=row["original_json"],
+        recommended_json=row["recommended_json"],
+        working_json=row["working_json"],
+        candidates_json=row["candidates_json"],
+        identity_json=row["identity_json"],
+        source_report_json=row["source_report_json"],
+        drive_conflicts_json=row["drive_conflicts_json"],
+        drive_root_id=row["drive_root_id"],
+        chat_id=row["chat_id"],
+        thread_id=row["thread_id"],
+        status_message_id=row["status_message_id"],
+        topic_name=row["topic_name"],
+        file_name=row["file_name"],
+        track_id=row["track_id"],
+        replace_id=row["replace_id"],
+        old_drive_id=row["old_drive_id"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
     )
 
 
@@ -75,6 +105,34 @@ class Catalog:
                   thread_id INTEGER PRIMARY KEY,
                   name TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS pending_reviews (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  phase TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  local_path TEXT NOT NULL,
+                  sidecar_path TEXT,
+                  relative_path TEXT,
+                  kind TEXT NOT NULL,
+                  original_json TEXT NOT NULL DEFAULT '{}',
+                  recommended_json TEXT NOT NULL DEFAULT '{}',
+                  working_json TEXT NOT NULL DEFAULT '{}',
+                  candidates_json TEXT NOT NULL DEFAULT '[]',
+                  identity_json TEXT NOT NULL DEFAULT '{}',
+                  source_report_json TEXT NOT NULL DEFAULT '{}',
+                  drive_conflicts_json TEXT NOT NULL DEFAULT '[]',
+                  drive_root_id TEXT,
+                  chat_id INTEGER NOT NULL,
+                  thread_id INTEGER,
+                  status_message_id INTEGER NOT NULL DEFAULT 0,
+                  topic_name TEXT NOT NULL DEFAULT '',
+                  file_name TEXT NOT NULL DEFAULT '',
+                  track_id INTEGER,
+                  replace_id INTEGER,
+                  old_drive_id TEXT,
+                  created_at TEXT NOT NULL,
+                  expires_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_reviews(status, expires_at);
                 """
             )
             self._conn.commit()
@@ -99,7 +157,7 @@ class Catalog:
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM tracks WHERE mb_recording_id=? AND kind='library' "
-                "AND status IN ('uploaded', 'pending', 'failed') "
+                "AND status IN ('uploaded', 'pending', 'failed', 'awaiting_drive') "
                 "ORDER BY (status='uploaded') DESC, id DESC LIMIT 1",
                 (mb_recording_id,),
             ).fetchone()
@@ -119,6 +177,7 @@ class Catalog:
         title: str | None,
         artist: str | None,
         album: str | None,
+        status: str = "pending",
     ) -> int:
         with self._lock:
             cur = self._conn.execute(
@@ -127,7 +186,7 @@ class Catalog:
                     mb_recording_id, acoustid, kind, local_path, sidecar_path,
                     relative_path, status, bit_depth, sample_rate, title, artist, album,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     mb_recording_id,
@@ -136,6 +195,7 @@ class Catalog:
                     local_path,
                     sidecar_path,
                     relative_path,
+                    status,
                     bit_depth,
                     sample_rate,
                     title,
@@ -186,6 +246,189 @@ class Catalog:
                 (track_id,),
             )
             self._conn.commit()
+
+    def mark_skipped(self, track_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE tracks SET status='skipped', error=NULL WHERE id=?",
+                (track_id,),
+            )
+            self._conn.commit()
+
+    def find_uploaded_by_relative(self, relative_path: str) -> TrackRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM tracks WHERE relative_path=? AND status='uploaded' "
+                "ORDER BY id DESC LIMIT 1",
+                (relative_path,),
+            ).fetchone()
+        return _row_to_track(row) if row else None
+
+    def update_track_paths(
+        self,
+        track_id: int,
+        *,
+        local_path: str,
+        sidecar_path: str | None,
+        relative_path: str,
+        title: str | None,
+        artist: str | None,
+        album: str | None,
+        status: str | None = None,
+    ) -> None:
+        with self._lock:
+            if status:
+                self._conn.execute(
+                    """
+                    UPDATE tracks SET local_path=?, sidecar_path=?, relative_path=?,
+                        title=?, artist=?, album=?, status=? WHERE id=?
+                    """,
+                    (local_path, sidecar_path, relative_path, title, artist, album, status, track_id),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE tracks SET local_path=?, sidecar_path=?, relative_path=?,
+                        title=?, artist=?, album=? WHERE id=?
+                    """,
+                    (local_path, sidecar_path, relative_path, title, artist, album, track_id),
+                )
+            self._conn.commit()
+
+    def insert_pending_review(
+        self,
+        *,
+        phase: str,
+        local_path: str,
+        sidecar_path: str | None,
+        relative_path: str | None,
+        kind: str,
+        original_json: str,
+        recommended_json: str,
+        working_json: str,
+        candidates_json: str,
+        identity_json: str,
+        source_report_json: str,
+        drive_conflicts_json: str = "[]",
+        drive_root_id: str | None = None,
+        chat_id: int,
+        thread_id: int | None,
+        status_message_id: int,
+        topic_name: str,
+        file_name: str,
+        track_id: int | None = None,
+        replace_id: int | None = None,
+        old_drive_id: str | None = None,
+        expires_at: str,
+    ) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO pending_reviews (
+                    phase, status, local_path, sidecar_path, relative_path, kind,
+                    original_json, recommended_json, working_json, candidates_json,
+                    identity_json, source_report_json, drive_conflicts_json, drive_root_id,
+                    chat_id, thread_id, status_message_id, topic_name, file_name,
+                    track_id, replace_id, old_drive_id, created_at, expires_at
+                ) VALUES (
+                    ?, 'waiting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    phase,
+                    local_path,
+                    sidecar_path,
+                    relative_path,
+                    kind,
+                    original_json,
+                    recommended_json,
+                    working_json,
+                    candidates_json,
+                    identity_json,
+                    source_report_json,
+                    drive_conflicts_json,
+                    drive_root_id,
+                    chat_id,
+                    thread_id,
+                    status_message_id,
+                    topic_name,
+                    file_name,
+                    track_id,
+                    replace_id,
+                    old_drive_id,
+                    _utc_now(),
+                    expires_at,
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def get_pending_review(self, pending_id: int) -> PendingReview | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM pending_reviews WHERE id=?", (pending_id,)
+            ).fetchone()
+        return _row_to_pending(row) if row else None
+
+    def update_pending_review(
+        self,
+        pending_id: int,
+        **fields: object,
+    ) -> None:
+        if not fields:
+            return
+        allowed = {
+            "phase",
+            "status",
+            "local_path",
+            "sidecar_path",
+            "relative_path",
+            "kind",
+            "original_json",
+            "recommended_json",
+            "working_json",
+            "candidates_json",
+            "identity_json",
+            "source_report_json",
+            "drive_conflicts_json",
+            "drive_root_id",
+            "status_message_id",
+            "track_id",
+            "replace_id",
+            "old_drive_id",
+        }
+        cols = []
+        values = []
+        for key, value in fields.items():
+            if key not in allowed:
+                raise ValueError(f"unknown pending field {key}")
+            cols.append(f"{key}=?")
+            values.append(value)
+        values.append(pending_id)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE pending_reviews SET {', '.join(cols)} WHERE id=?",
+                values,
+            )
+            self._conn.commit()
+
+    def claim_expired_pending(self) -> list[PendingReview]:
+        now = _utc_now()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM pending_reviews WHERE status='waiting' AND expires_at<=? ORDER BY id",
+                (now,),
+            ).fetchall()
+            claimed: list[PendingReview] = []
+            for row in rows:
+                cur = self._conn.execute(
+                    "UPDATE pending_reviews SET status='expiring' WHERE id=? AND status='waiting'",
+                    (row["id"],),
+                )
+                if cur.rowcount:
+                    claimed.append(_row_to_pending(row))
+            self._conn.commit()
+        return claimed
 
     def update_quality_and_local(
         self,

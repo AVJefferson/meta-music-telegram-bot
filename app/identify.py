@@ -10,8 +10,17 @@ import musicbrainzngs
 
 from app.config import Settings
 from app.models import Candidate, Identity, TagHints
+from app.songlog import mb_snapshot
 from app.tags import audio_info
-from app.util import file_stem_hints, parse_mb_user_agent, parse_track_number, split_artist_field, year_from_date
+from app.util import (
+    file_stem_hints,
+    format_artist_list,
+    normalize_match_text,
+    parse_mb_user_agent,
+    parse_track_number,
+    split_artist_field,
+    year_from_date,
+)
 
 log = logging.getLogger(__name__)
 
@@ -207,7 +216,15 @@ def _identity_from_recording(
 
     composers = _composers_from_recording(mb, recording)
 
-    return Identity(
+    mb_duration = duration
+    raw_length = recording.get("length")
+    if raw_length:
+        try:
+            mb_duration = int(raw_length) / 1000.0
+        except (TypeError, ValueError):
+            mb_duration = duration
+
+    identity = Identity(
         confidence="low",
         title=title,
         album=album,
@@ -228,6 +245,9 @@ def _identity_from_recording(
         mb_release_group_id=rg_id,
         source=source,
     )
+    identity.source_report["musicbrainz"] = mb_snapshot(identity)
+    identity.source_report["mb_duration"] = mb_duration
+    return identity
 
 
 def _acoustid_lookup(path: Path, api_key: str) -> dict | None:
@@ -242,6 +262,189 @@ def _acoustid_lookup(path: Path, api_key: str) -> dict | None:
     best = results[0]
     best["_fp_duration"] = duration
     return best
+
+
+def identity_from_mbid(
+    mb: MBClient,
+    mbid: str,
+    *,
+    duration: float,
+    bit_depth: int | None,
+    sample_rate: int | None,
+    acoustid: str | None,
+    acoustid_score: float | None,
+    source: str,
+) -> Identity:
+    return _identity_from_recording(
+        mb,
+        mbid,
+        duration=duration,
+        bit_depth=bit_depth,
+        sample_rate=sample_rate,
+        acoustid=acoustid,
+        acoustid_score=acoustid_score,
+        source=source,
+    )
+
+
+def _rec_duration_seconds(rec: dict) -> float | None:
+    raw = rec.get("duration")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value > 10_000:
+        value /= 1000.0
+    return value
+
+
+def _cluster_key(rec: dict) -> str:
+    title = normalize_match_text(str(rec.get("title") or ""))
+    artists = artist_names_from_acoustid(rec.get("artists"))
+    primary = normalize_match_text(artists[0] if artists else "")
+    return f"{title}|{primary}"
+
+
+def _cluster_recordings(recordings: list[dict]) -> list[list[dict]]:
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for rec in recordings:
+        key = _cluster_key(rec) or rec.get("id") or str(len(order))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(rec)
+    return [groups[key] for key in order]
+
+
+def _best_in_cluster(cluster: list[dict], file_duration: float) -> dict:
+    def sort_key(rec: dict) -> tuple[float, int]:
+        rec_dur = _rec_duration_seconds(rec)
+        if rec_dur is None or file_duration <= 0:
+            return (9999.0, 0)
+        return (abs(file_duration - rec_dur), 0)
+
+    return sorted(cluster, key=sort_key)[0]
+
+
+def _duration_status(file_duration: float, rec_duration: float | None) -> str:
+    if rec_duration is None or file_duration <= 0:
+        return "unknown"
+    delta = abs(file_duration - rec_duration)
+    if delta > 8:
+        return "mismatch"
+    if delta <= 3 or delta <= 0.05 * file_duration:
+        return "match"
+    return "close"
+
+
+def _text_agrees(left: str, right: str) -> bool:
+    a = normalize_match_text(left)
+    b = normalize_match_text(right)
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a
+
+
+def _filename_tag_agrees(hints: TagHints, title: str, artists: list[str]) -> bool:
+    artist = artists[0] if artists else ""
+    stem = file_stem_hints(hints.filename)
+    title_ok = False
+    if hints.title and _text_agrees(hints.title, title):
+        title_ok = True
+    if stem and (_text_agrees(stem, title) or (title and title.casefold() in stem.casefold())):
+        title_ok = True
+    artist_ok = True
+    if hints.artist and artist:
+        artist_ok = _text_agrees(hints.artist, artist) or artist.casefold() in hints.artist.casefold()
+    if stem and artist and not artist_ok:
+        artist_ok = artist.casefold() in stem.casefold()
+    return title_ok and artist_ok
+
+
+def _candidates_from_clusters(clusters: list[list[dict]], score: float, file_duration: float) -> list[Candidate]:
+    out: list[Candidate] = []
+    seen: set[str] = set()
+    ranked = sorted(clusters, key=len, reverse=True)
+    for cluster in ranked:
+        rec = _best_in_cluster(cluster, file_duration)
+        mbid = rec.get("id") or ""
+        if not mbid or mbid in seen:
+            continue
+        seen.add(mbid)
+        out.append(
+            Candidate(
+                mb_recording_id=mbid,
+                title=str(rec.get("title") or ""),
+                artist=" / ".join(artist_names_from_acoustid(rec.get("artists"))),
+                score=score,
+            )
+        )
+        if len(out) >= 5:
+            break
+    return out
+
+
+def _acoustid_report(ac_result: dict, recordings: list[dict], clusters: list[list[dict]], score: float) -> dict:
+    rows = []
+    for rec in recordings:
+        rows.append(
+            {
+                "mbid": rec.get("id") or "",
+                "title": rec.get("title") or "",
+                "artist": format_artist_list(artist_names_from_acoustid(rec.get("artists"))),
+                "duration": _rec_duration_seconds(rec),
+            }
+        )
+    return {
+        "score": score,
+        "id": ac_result.get("id") or "",
+        "recordings": rows,
+        "clusters": len(clusters),
+    }
+
+
+def _score_confidence(
+    *,
+    clusters: list[list[dict]],
+    chosen: dict,
+    file_duration: float,
+    hints: TagHints,
+    mb_duration: float | None,
+    score: float,
+    min_score: float,
+) -> tuple[str, str]:
+    if score < min_score:
+        return "low", "acoustid score below threshold"
+    rec_duration = mb_duration if mb_duration is not None else _rec_duration_seconds(chosen)
+    status = _duration_status(file_duration, rec_duration)
+    delta = None
+    if rec_duration is not None and file_duration > 0:
+        delta = abs(file_duration - rec_duration)
+    agrees = _filename_tag_agrees(
+        hints,
+        str(chosen.get("title") or ""),
+        artist_names_from_acoustid(chosen.get("artists")),
+    )
+    cluster_count = len(clusters)
+    log.debug(
+        "confidence inputs score=%.3f clusters=%s duration_delta=%s status=%s agrees=%s mbid=%s",
+        score,
+        cluster_count,
+        f"{delta:.2f}" if delta is not None else "unknown",
+        status,
+        agrees,
+        chosen.get("id"),
+    )
+    if cluster_count > 1:
+        return "low", "acoustid multi-cluster"
+    if status == "mismatch":
+        return "low", "duration mismatch"
+    if status == "close" and not agrees:
+        return "low", "duration close, filename disagree"
+    return "high", "acoustid single-cluster"
 
 
 def _unique_recordings(ac_result: dict) -> list[dict]:
@@ -295,7 +498,21 @@ def _identity_from_hints(
         sample_rate=sample_rate,
         raw_genre_tags=[g.strip() for g in hints.genre.replace("|", ",").split(",") if g.strip()],
         source="existing-tags",
+        confidence_reason="existing-tags",
     )
+
+
+def _attach_report(identity: Identity, hints: TagHints, acoustid_report: dict | None = None) -> Identity:
+    report = dict(identity.source_report or {})
+    if acoustid_report is not None:
+        report["acoustid"] = acoustid_report
+    report["file"] = hints.filename
+    report["filename_stem"] = Path(hints.filename).stem
+    report["duration"] = identity.duration
+    report["bit_depth"] = identity.bit_depth
+    report["sample_rate"] = identity.sample_rate
+    identity.source_report = report
+    return identity
 
 
 def identify_file(path: Path, hints: TagHints, settings: Settings, mb: MBClient) -> Identity:
@@ -321,8 +538,12 @@ def identify_file(path: Path, hints: TagHints, settings: Settings, mb: MBClient)
         score = float(ac_result.get("score") or 0)
         acoustid_id = ac_result.get("id")
         recordings = _unique_recordings(ac_result)
-        if recordings and score >= settings.acoustid_min_score:
-            chosen = recordings[0]
+        clusters = _cluster_recordings(recordings) if recordings else []
+        ac_report = _acoustid_report(ac_result, recordings, clusters, score)
+        if recordings:
+            ranked = sorted(clusters, key=len, reverse=True)
+            chosen = _best_in_cluster(ranked[0], duration)
+            source = "acoustid" if score >= settings.acoustid_min_score else "acoustid-low"
             try:
                 identity = _identity_from_recording(
                     mb,
@@ -332,32 +553,50 @@ def identify_file(path: Path, hints: TagHints, settings: Settings, mb: MBClient)
                     sample_rate=sample_rate,
                     acoustid=acoustid_id,
                     acoustid_score=score,
-                    source="acoustid",
+                    source=source,
                 )
-                identity.candidates = _candidates_from_acoustid(recordings, score)
-                identity.confidence = "high" if len(recordings) == 1 else "low"
+                identity.candidates = _candidates_from_clusters(clusters, score, duration)
+                chosen_for_score = {
+                    "id": chosen.get("id"),
+                    "title": identity.title or chosen.get("title"),
+                    "artists": chosen.get("artists") or [{"name": n} for n in identity.artists],
+                }
+                mb_duration = identity.source_report.get("mb_duration")
+                try:
+                    mb_duration_f = float(mb_duration) if mb_duration is not None else None
+                except (TypeError, ValueError):
+                    mb_duration_f = None
+                identity.confidence, identity.confidence_reason = _score_confidence(
+                    clusters=clusters,
+                    chosen=chosen_for_score,
+                    file_duration=duration,
+                    hints=hints,
+                    mb_duration=mb_duration_f,
+                    score=score,
+                    min_score=settings.acoustid_min_score,
+                )
+                if source == "acoustid-low":
+                    identity.confidence = "low"
+                    identity.confidence_reason = "acoustid score below threshold"
                 if not identity.title:
                     identity.title = str(chosen.get("title") or hints.title)
                 if not identity.artists:
                     identity.artists = artist_names_from_acoustid(chosen.get("artists"))
-                return identity
-            except musicbrainzngs.WebServiceError:
-                log.warning("mb recording lookup failed for %s", chosen.get("id"))
-        if recordings:
-            chosen = recordings[0]
-            try:
-                identity = _identity_from_recording(
-                    mb,
-                    chosen["id"],
-                    duration=duration,
-                    bit_depth=bit_depth,
-                    sample_rate=sample_rate,
-                    acoustid=acoustid_id,
-                    acoustid_score=score,
-                    source="acoustid-low",
+                _attach_report(identity, hints, ac_report)
+                log.debug(
+                    "identified mbid=%s confidence=%s reason=%s score=%.3f clusters=%s",
+                    identity.mb_recording_id,
+                    identity.confidence,
+                    identity.confidence_reason,
+                    score,
+                    len(clusters),
                 )
-                identity.candidates = _candidates_from_acoustid(recordings, score)
-                identity.confidence = "low"
+                log.info(
+                    "identified %s confidence=%s reason=%s",
+                    hints.filename,
+                    identity.confidence,
+                    identity.confidence_reason,
+                )
                 return identity
             except musicbrainzngs.WebServiceError:
                 log.warning("mb recording lookup failed for %s", chosen.get("id"))
@@ -384,6 +623,7 @@ def identify_file(path: Path, hints: TagHints, settings: Settings, mb: MBClient)
                     source="mb-search",
                 )
                 identity.confidence = "low"
+                identity.confidence_reason = "mb-search"
                 identity.candidates = [
                     Candidate(
                         mb_recording_id=r.get("id") or "",
@@ -394,9 +634,13 @@ def identify_file(path: Path, hints: TagHints, settings: Settings, mb: MBClient)
                     for r in found
                     if r.get("id")
                 ]
+                _attach_report(identity, hints)
+                log.info("identified %s confidence=low reason=mb-search", hints.filename)
                 return identity
             except musicbrainzngs.WebServiceError:
                 log.warning("mb recording lookup failed after search")
 
     identity = _identity_from_hints(hints, duration, bit_depth, sample_rate)
+    _attach_report(identity, hints)
+    log.info("identified %s confidence=low reason=existing-tags", hints.filename)
     return identity

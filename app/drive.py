@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import io
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
+
+from app.config import Settings
+from app.drive_scopes import DRIVE_SCOPE
 
 from app.config import Settings
 from app.drive_scopes import DRIVE_SCOPE
@@ -16,6 +21,31 @@ from app.drive_scopes import DRIVE_SCOPE
 log = logging.getLogger(__name__)
 FOLDER_MIME = "application/vnd.google-apps.folder"
 _NO_RETRY_STATUS = {400, 401, 403, 404}
+
+
+@dataclass
+class DriveChild:
+    id: str
+    name: str
+    mime_type: str
+    size: int | None
+    modified: str | None
+
+    @property
+    def is_folder(self) -> bool:
+        return self.mime_type == FOLDER_MIME
+
+
+def _child_from_meta(meta: dict) -> DriveChild:
+    size_raw = meta.get("size")
+    size = int(size_raw) if size_raw is not None and str(size_raw).isdigit() else None
+    return DriveChild(
+        id=meta["id"],
+        name=meta.get("name") or "",
+        mime_type=meta.get("mimeType") or "",
+        size=size,
+        modified=meta.get("modifiedTime"),
+    )
 
 
 class DriveAccessError(RuntimeError):
@@ -147,6 +177,145 @@ class DriveClient:
             return files[0]["id"], files[0].get("webViewLink")
         return self.create_folder(name)
 
+    def list_children(self, folder_id: str) -> list[DriveChild]:
+        out: list[DriveChild] = []
+        page_token: str | None = None
+        while True:
+            resp = (
+                self._service.files()
+                .list(
+                    q=f"'{folder_id}' in parents and trashed = false",
+                    spaces="drive",
+                    fields="nextPageToken, files(id, name, mimeType, size, modifiedTime)",
+                    pageSize=100,
+                    pageToken=page_token,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                )
+                .execute()
+            )
+            for meta in resp.get("files") or []:
+                out.append(_child_from_meta(meta))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return out
+
+    def find_name_conflicts(self, parent_id: str, filename: str) -> list[DriveChild]:
+        hits = [c for c in self.list_children(parent_id) if c.name == filename and not c.is_folder]
+        hits.sort(key=lambda c: c.modified or "", reverse=True)
+        return hits
+
+    def unused_name(self, parent_id: str, filename: str) -> str:
+        names = {c.name for c in self.list_children(parent_id)}
+        if filename not in names:
+            return filename
+        stem = Path(filename).stem
+        suffix = Path(filename).suffix
+        n = 2
+        while True:
+            candidate = f"{stem} ({n}){suffix}"
+            if candidate not in names:
+                return candidate
+            n += 1
+
+    def get_child_meta(self, file_id: str) -> DriveChild | None:
+        try:
+            meta = (
+                self._service.files()
+                .get(
+                    fileId=file_id,
+                    fields="id,name,mimeType,size,modifiedTime,trashed",
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
+        except HttpError as exc:
+            if exc.resp.status == 404:
+                return None
+            raise
+        if meta.get("trashed"):
+            return None
+        return _child_from_meta(meta)
+
+    def ensure_parent(self, root_folder_id: str, relative: Path) -> str:
+        parts = list(relative.parts)
+        if not parts:
+            raise ValueError("empty relative path")
+        parent = root_folder_id
+        for folder in parts[:-1]:
+            parent = self._ensure_folder(parent, folder)
+        return parent
+
+    def create_file(
+        self,
+        local_file: Path,
+        parent_id: str,
+        filename: str,
+        mime_type: str,
+    ) -> tuple[str, str | None]:
+        media = MediaFileUpload(
+            str(local_file),
+            mimetype=mime_type,
+            resumable=True,
+            chunksize=8 * 1024 * 1024,
+        )
+        return self._send_media(
+            media,
+            body={"name": filename, "parents": [parent_id]},
+        )
+
+    def replace_file(self, file_id: str, local_file: Path, mime_type: str) -> tuple[str, str | None]:
+        media = MediaFileUpload(
+            str(local_file),
+            mimetype=mime_type,
+            resumable=True,
+            chunksize=8 * 1024 * 1024,
+        )
+        return self._send_media(media, file_id=file_id)
+
+    def upload_bytes(
+        self,
+        data: bytes,
+        parent_id: str,
+        filename: str,
+        mime_type: str,
+        *,
+        replace_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type, resumable=False)
+        body = {"name": filename, "parents": [parent_id]}
+        return self._send_media(media, body=body, file_id=replace_id)
+
+    def _send_media(
+        self,
+        media,
+        *,
+        body: dict | None = None,
+        file_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        if file_id:
+            request = self._service.files().update(
+                fileId=file_id,
+                media_body=media,
+                fields="id,webViewLink",
+                supportsAllDrives=True,
+            )
+        else:
+            request = self._service.files().create(
+                body=body or {},
+                media_body=media,
+                fields="id,webViewLink",
+                supportsAllDrives=True,
+            )
+        if getattr(media, "resumable", False):
+            response = None
+            while response is None:
+                _status, response = request.next_chunk()
+            return response["id"], response.get("webViewLink")
+        meta = request.execute()
+        return meta["id"], meta.get("webViewLink")
+
     def file_exists(self, file_id: str) -> bool:
         try:
             meta = (
@@ -218,10 +387,10 @@ class DriveClient:
         cached = self._folder_cache.get(key)
         if cached:
             return cached
-        found = self._find_child(parent_id, name, folder=True)
+        found = next((c for c in self.list_children(parent_id) if c.name == name and c.is_folder), None)
         if found:
-            self._folder_cache[key] = found
-            return found
+            self._folder_cache[key] = found.id
+            return found.id
         meta = (
             self._service.files()
             .create(
@@ -235,31 +404,6 @@ class DriveClient:
         self._folder_cache[key] = folder_id
         return folder_id
 
-    def _find_child(self, parent_id: str, name: str, *, folder: bool) -> str | None:
-        mime_clause = (
-            f"and mimeType = '{FOLDER_MIME}'"
-            if folder
-            else f"and mimeType != '{FOLDER_MIME}'"
-        )
-        query = (
-            f"name = '{_escape_query(name)}' and '{parent_id}' in parents "
-            f"and trashed = false {mime_clause}"
-        )
-        resp = (
-            self._service.files()
-            .list(
-                q=query,
-                spaces="drive",
-                fields="files(id, name)",
-                pageSize=10,
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-            )
-            .execute()
-        )
-        files = resp.get("files") or []
-        return files[0]["id"] if files else None
-
     def _upload_or_replace(
         self,
         local_file: Path,
@@ -267,28 +411,7 @@ class DriveClient:
         filename: str,
         mime_type: str,
     ) -> tuple[str, str | None]:
-        media = MediaFileUpload(
-            str(local_file),
-            mimetype=mime_type,
-            resumable=True,
-            chunksize=8 * 1024 * 1024,
-        )
-        existing = self._find_child(parent_id, filename, folder=False)
-        if existing:
-            request = self._service.files().update(
-                fileId=existing,
-                media_body=media,
-                fields="id,webViewLink",
-                supportsAllDrives=True,
-            )
-        else:
-            request = self._service.files().create(
-                body={"name": filename, "parents": [parent_id]},
-                media_body=media,
-                fields="id,webViewLink",
-                supportsAllDrives=True,
-            )
-        response = None
-        while response is None:
-            _status, response = request.next_chunk()
-        return response["id"], response.get("webViewLink")
+        conflicts = self.find_name_conflicts(parent_id, filename)
+        if conflicts:
+            return self.replace_file(conflicts[0].id, local_file, mime_type)
+        return self.create_file(local_file, parent_id, filename, mime_type)
