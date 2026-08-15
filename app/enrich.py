@@ -8,7 +8,7 @@ from PIL import Image
 
 from app.genre import GenreMapper
 from app.models import Enrichment, Identity
-from app.util import is_synced_lrc
+from app.util import is_synced_lrc, normalize_match_text
 
 log = logging.getLogger(__name__)
 
@@ -59,8 +59,8 @@ async def _download_cover(http: httpx.AsyncClient, url: str) -> tuple[bytes, str
 
 async def _cover_from_caa(http: httpx.AsyncClient, identity: Identity) -> tuple[bytes, str] | None:
     for kind, mbid in (
-        ("release", identity.mb_release_id),
         ("release-group", identity.mb_release_group_id),
+        ("release", identity.mb_release_id),
     ):
         if not mbid:
             continue
@@ -149,6 +149,75 @@ async def _cover_from_itunes_item(http: httpx.AsyncClient, item: dict) -> tuple[
     return None
 
 
+async def _itunes_album_search(http: httpx.AsyncClient, identity: Identity) -> list[dict]:
+    artist = ""
+    if identity.album_artists:
+        artist = identity.album_artists[0]
+    elif identity.artists:
+        artist = identity.artists[0]
+    album = identity.album or ""
+    terms: list[str] = []
+    if artist and album:
+        terms.append(f"{artist} {album}")
+    if album:
+        terms.append(album)
+    seen: set[str] = set()
+    out: list[dict] = []
+    for term in terms:
+        key = term.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            response = await http.get(
+                "https://itunes.apple.com/search",
+                params={"term": term, "entity": "album", "limit": 5},
+                timeout=20.0,
+            )
+            response.raise_for_status()
+            out.extend(response.json().get("results") or [])
+        except httpx.HTTPError:
+            continue
+    return out
+
+
+def _itunes_album_match(identity: Identity, results: list[dict]) -> dict | None:
+    album_n = normalize_match_text(identity.album)
+    if not album_n:
+        return results[0] if results else None
+    for item in results:
+        name = normalize_match_text(str(item.get("collectionName") or ""))
+        if name == album_n or album_n in name or name in album_n:
+            return item
+    return results[0] if results else None
+
+
+async def fetch_cover(
+    http: httpx.AsyncClient,
+    identity: Identity,
+    *,
+    album_search: bool,
+) -> tuple[tuple[bytes, str] | None, str, str | None]:
+    cover = await _cover_from_caa(http, identity)
+    if cover is not None:
+        caa = identity.mb_release_group_id or identity.mb_release_id
+        return cover, "caa", caa
+    if album_search:
+        album_item = _itunes_album_match(identity, await _itunes_album_search(http, identity))
+        if album_item:
+            cover = await _cover_from_itunes_item(http, album_item)
+            if cover is not None:
+                return cover, "itunes", None
+        return None, "none", None
+    results = await _itunes_search(http, identity)
+    item = _itunes_match(identity, results)
+    if item:
+        cover = await _cover_from_itunes_item(http, item)
+        if cover is not None:
+            return cover, "itunes", None
+    return None, "none", None
+
+
 async def _lastfm_tags(http: httpx.AsyncClient, api_key: str, identity: Identity) -> list[str]:
     if not api_key or not identity.title or not identity.artists:
         return []
@@ -224,21 +293,15 @@ async def enrich(
     genre: GenreMapper,
     lastfm_api_key: str,
     topic_language: str | None,
+    *,
+    cover: bytes | None = None,
+    cover_mime: str | None = None,
+    cover_source: str = "none",
+    caa_release: str | None = None,
 ) -> Enrichment:
     itunes_results = await _itunes_search(http, identity)
     itunes_item = _itunes_match(identity, itunes_results)
     itunes_meta = _itunes_report(itunes_item)
-
-    cover = await _cover_from_caa(http, identity)
-    cover_source = "none"
-    caa_release = None
-    if cover is not None:
-        cover_source = "caa"
-        caa_release = identity.mb_release_id or identity.mb_release_group_id
-    elif itunes_item:
-        cover = await _cover_from_itunes_item(http, itunes_item)
-        if cover is not None:
-            cover_source = "itunes"
 
     lyrics, instrumental = await _lrclib(http, identity)
     extra_tags = list(identity.raw_genre_tags)
@@ -251,9 +314,8 @@ async def enrich(
         extra_tags.append("Instrumental")
 
     genre_str = genre.classify(extra_tags, extra_language=topic_language)
-    cover_bytes, cover_mime = cover if cover else (None, None)
     return Enrichment(
-        cover=cover_bytes,
+        cover=cover,
         cover_mime=cover_mime,
         lyrics=lyrics,
         genre=genre_str,

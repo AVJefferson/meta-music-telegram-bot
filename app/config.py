@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     pending_root: Path = Path("/data/pending")
     state_db: Path = Path("/data/state.sqlite")
     tmp_root: Path = Path("/data/tmp")
+    covers_root: Path = Path("/data/covers")
     cleanup_cron: str = "0 3 * * 0"
     genre_map_path: Path = Field(default_factory=lambda: Path(__file__).resolve().parent.parent / "genre_map.yaml")
 

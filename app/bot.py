@@ -180,6 +180,7 @@ async def main() -> None:
         settings.review_root,
         settings.pending_root,
         settings.tmp_root,
+        settings.covers_root,
         settings.state_db.parent,
     ):
         path.mkdir(parents=True, exist_ok=True)

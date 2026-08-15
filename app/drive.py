@@ -10,10 +10,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
-
-from app.config import Settings
-from app.drive_scopes import DRIVE_SCOPE
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
 
 from app.config import Settings
 from app.drive_scopes import DRIVE_SCOPE
@@ -246,6 +243,33 @@ class DriveClient:
         for folder in parts[:-1]:
             parent = self._ensure_folder(parent, folder)
         return parent
+
+    def find_path(self, root_id: str, folder_parts: list[str]) -> str | None:
+        parent = root_id
+        for name in folder_parts:
+            key = (parent, name)
+            cached = self._folder_cache.get(key)
+            if cached:
+                parent = cached
+                continue
+            found = next(
+                (c for c in self.list_children(parent) if c.name == name and c.is_folder),
+                None,
+            )
+            if not found:
+                return None
+            self._folder_cache[key] = found.id
+            parent = found.id
+        return parent
+
+    def download_bytes(self, file_id: str) -> bytes:
+        request = self._service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _status, done = downloader.next_chunk()
+        return buf.getvalue()
 
     def create_file(
         self,

@@ -5,8 +5,10 @@ import logging
 import shutil
 from pathlib import Path
 
+from app.covers import purge_stale_covers, upload_album_cover_if_missing
 from app.library import rmdir_empty, unlink_quiet
 from app.models import Ctx, TrackRecord
+from app.tags import read_cover
 from app.util import html_esc
 
 log = logging.getLogger(__name__)
@@ -62,6 +64,16 @@ async def _retry_row(ctx: Ctx, row: TrackRecord) -> None:
                     relative.with_suffix(".json"),
                     "application/json",
                 )
+        if row.kind == "library" and local.suffix.lower() == ".flac":
+            try:
+                parent = await asyncio.to_thread(ctx.drive.ensure_parent, root, relative)
+                cover, cover_mime = await asyncio.to_thread(read_cover, local)
+                if cover:
+                    await asyncio.to_thread(
+                        upload_album_cover_if_missing, ctx, parent, cover, cover_mime
+                    )
+            except Exception:
+                log.warning("album cover retry upload failed", exc_info=True)
         log.info("retried upload ok id=%s", row.id)
     except Exception as exc:
         ctx.catalog.mark_failed(row.id, str(exc))
@@ -113,6 +125,9 @@ async def run_cleanup(ctx: Ctx) -> None:
     rmdir_empty(ctx.settings.library_root)
     rmdir_empty(ctx.settings.review_root)
     _purge_tmp(ctx.settings.tmp_root)
+    removed = purge_stale_covers(ctx.settings.covers_root)
+    if removed:
+        log.info("purged %s stale album cover(s)", removed)
     log.info("weekly cleanup done")
 
 

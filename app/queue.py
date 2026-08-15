@@ -11,9 +11,10 @@ from pathlib import Path
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery
 
 from app.cleanup import alert_general
+from app.covers import album_changed, cover_identity, resolve_album_cover, upload_album_cover_if_missing
 from app.enrich import enrich
 from app.identify import identify_file, identity_from_mbid
 from app.library import library_relative, place_file, review_relative, unlink_quiet, write_sidecar
@@ -28,16 +29,13 @@ from app.models import (
     tagset_from_dict,
 )
 from app.review_ui import (
-    ReviewStates,
     conflict_keyboard,
     empty_markup,
-    field_keyboard,
     format_conflict,
-    format_field_prompt,
     format_summary,
     parse_callback,
     review_keyboard,
-    set_field,
+    toggle_working_field,
 )
 from app.songlog import apply_chosen, merge_enrichment, render_songlog, seed_report
 from app.tags import hints_to_tagset, identity_to_tags, read_cover, read_hints, write_tags
@@ -163,12 +161,17 @@ async def process_job(job: Job, ctx: Ctx) -> None:
         identity = await asyncio.to_thread(identify_file, tmp, hints, settings, ctx.mb)
 
         await edit_status(ctx, job, "Fetching cover, lyrics, genre…")
+        cover_hit = await resolve_album_cover(ctx, identity, job.topic_name)
         enrichment = await enrich(
             ctx.http,
             identity,
             ctx.genre,
             settings.lastfm_api_key,
             job.topic_name,
+            cover=cover_hit.data,
+            cover_mime=cover_hit.mime,
+            cover_source=cover_hit.source,
+            caa_release=cover_hit.caa_release,
         )
         tags = identity_to_tags(identity, enrichment)
         if not tags.title:
@@ -257,7 +260,7 @@ async def start_tag_review(
         expires_at=_expires_at(),
     )
     text = format_summary(original, tags, tags, reason=identity.confidence_reason)
-    markup = review_keyboard(pending_id)
+    markup = review_keyboard(pending_id, original, tags, tags)
     status_id = await edit_status(ctx, job, text, markup)
     ctx.catalog.update_pending_review(pending_id, status_message_id=status_id)
     log.info("review waiting id=%s file=%s reason=%s", pending_id, job.file_name, identity.confidence_reason)
@@ -488,6 +491,7 @@ async def _commit_upload(
             source_report=source_report,
             tags=tags,
             identity=identity,
+            kind=kind,
         )
         ctx.catalog.mark_uploaded(track_id, file_id, url)
         if old_drive_id and old_drive_id != file_id and conflict_action != "keep_both":
@@ -604,7 +608,15 @@ async def _upload_sidecars(
     source_report: dict,
     tags: TagSet,
     identity: Identity,
+    kind: str,
 ) -> None:
+    if kind == "library":
+        cover, mime = await asyncio.to_thread(read_cover, dest)
+        if cover:
+            try:
+                await asyncio.to_thread(upload_album_cover_if_missing, ctx, parent_id, cover, mime)
+            except Exception:
+                log.warning("album cover upload failed", exc_info=True)
     json_name = dest.with_suffix(".json").name
     log_name = dest.with_suffix(".log").name
     if sidecar_path and sidecar_path.exists():
@@ -651,7 +663,7 @@ async def _refresh_tag_ui(ctx: Ctx, row: PendingReview) -> None:
     original, recommended, working, identity, _report, _candidates = _load_pending_state(row)
     job = _job_from_pending(row)
     text = format_summary(original, recommended, working, reason=identity.confidence_reason)
-    status_id = await edit_status(ctx, job, text, review_keyboard(row.id))
+    status_id = await edit_status(ctx, job, text, review_keyboard(row.id, original, recommended, working))
     if status_id != row.status_message_id:
         ctx.catalog.update_pending_review(row.id, status_message_id=status_id)
 
@@ -682,34 +694,23 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
         await state.clear()
         await _apply_confirm(ctx, row, kind="review")
         return
-    if action.op == "back":
-        await state.clear()
-        await _refresh_tag_ui(ctx, row)
-        return
     if action.op == "cand" and action.index is not None:
         await state.clear()
         await _apply_candidate(ctx, row, action.index)
         return
-    if action.op == "edit" and action.field:
-        original, recommended, _working, _identity, _report, _cands = _load_pending_state(row)
-        await state.set_state(ReviewStates.waiting_custom)
-        await state.update_data(pending_id=row.id, field=action.field)
-        job = _job_from_pending(row)
-        text = format_field_prompt(action.field, original, recommended)
-        status_id = await edit_status(ctx, job, text, field_keyboard(row.id, action.field))
-        ctx.catalog.update_pending_review(row.id, status_message_id=status_id)
+    if action.op == "toggle" and action.field:
+        original, recommended, working, _identity, _report, _cands = _load_pending_state(row)
+        working = toggle_working_field(original, recommended, working, action.field)
+        ctx.catalog.update_pending_review(row.id, working_json=_dumps(working))
+        row = ctx.catalog.get_pending_review(row.id)
+        if row:
+            await _refresh_tag_ui(ctx, row)
         return
     if action.op in {"use_file", "use_rec"}:
         await state.clear()
-        original, recommended, working, _identity, _report, _cands = _load_pending_state(row)
+        original, recommended, _working, _identity, _report, _cands = _load_pending_state(row)
         source = original if action.op == "use_file" else recommended
-        if action.field:
-            value = source.get("date") if action.field == "year" else source.get(action.field) or ""
-            if action.field == "year":
-                value = source.get("date") or source.get("year") or ""
-            working = set_field(working, action.field, str(value or ""))
-        else:
-            working = dict(source)
+        working = dict(source)
         ctx.catalog.update_pending_review(row.id, working_json=_dumps(working))
         row = ctx.catalog.get_pending_review(row.id)
         if row:
@@ -720,32 +721,6 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
         await _apply_drive_choice(ctx, row, mapping[action.op])
 
 
-async def handle_custom_tag(message: Message, ctx: Ctx, state: FSMContext) -> None:
-    if message.chat.id != ctx.settings.allowed_chat_id:
-        return
-    data = await state.get_data()
-    pending_id = data.get("pending_id")
-    field = data.get("field")
-    if not pending_id or not field:
-        await state.clear()
-        return
-    row = ctx.catalog.get_pending_review(int(pending_id))
-    if row is None or row.status != "waiting":
-        await state.clear()
-        return
-    working = _loads(row.working_json, {})
-    working = set_field(working, str(field), (message.text or "").strip())
-    ctx.catalog.update_pending_review(row.id, working_json=_dumps(working))
-    await state.clear()
-    row = ctx.catalog.get_pending_review(row.id)
-    if row:
-        await _refresh_tag_ui(ctx, row)
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-
 async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
     original, recommended, working, identity, report, _cands = _load_pending_state(row)
     tags = tagset_from_dict(working)
@@ -754,7 +729,23 @@ async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
         await edit_status(ctx, _job_from_pending(row), "Local file missing. Cannot continue.")
         ctx.catalog.update_pending_review(row.id, status="failed")
         return
-    cover, mime = await asyncio.to_thread(read_cover, local)
+    if kind == "library" and album_changed(identity, tags):
+        cover_hit = await resolve_album_cover(
+            ctx,
+            cover_identity(identity, tags),
+            row.topic_name,
+            album=tags.album,
+            albumartist=tags.albumartist or tags.artist,
+        )
+        cover, mime = cover_hit.data, cover_hit.mime
+        if cover_hit.source != "none":
+            report["cover_source"] = cover_hit.source
+            caa = report.get("coverartarchive") or {}
+            caa["used"] = cover_hit.source == "caa"
+            caa["release"] = cover_hit.caa_release or ""
+            report["coverartarchive"] = caa
+    else:
+        cover, mime = await asyncio.to_thread(read_cover, local)
     await asyncio.to_thread(write_tags, local, tags, cover, mime)
     report = apply_chosen(report, tags, identity)
 
@@ -838,12 +829,17 @@ async def _apply_candidate(ctx: Ctx, row: PendingReview, index: int) -> None:
     new_identity.confidence = "low"
     new_identity.confidence_reason = identity.confidence_reason
     new_identity.source_report = {**identity.source_report, **new_identity.source_report}
+    cover_hit = await resolve_album_cover(ctx, new_identity, row.topic_name)
     enrichment = await enrich(
         ctx.http,
         new_identity,
         ctx.genre,
         ctx.settings.lastfm_api_key,
         row.topic_name,
+        cover=cover_hit.data,
+        cover_mime=cover_hit.mime,
+        cover_source=cover_hit.source,
+        caa_release=cover_hit.caa_release,
     )
     tags = identity_to_tags(new_identity, enrichment)
     local = Path(row.local_path)

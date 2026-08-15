@@ -6,12 +6,10 @@ from typing import Any
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Message,
 )
 
 from app.models import Ctx, TagSet
@@ -27,22 +25,8 @@ FIELDS: list[tuple[str, str]] = [
     ("genre", "Genre"),
     ("year", "Year"),
 ]
-EDIT_FIELDS: list[tuple[str, str]] = [
-    ("title", "Title"),
-    ("artist", "Artist"),
-    ("album", "Album"),
-    ("albumartist", "Album artist"),
-    ("genre", "Genre"),
-    ("year", "Year"),
-]
 FIELD_KEYS = {key for key, _ in FIELDS}
-_CALLBACK = re.compile(
-    r"^p(\d+):(ok|rev|back|dr|dk|ds|c(\d+)|e:([a-z]+)|uf:([a-z]+)|ur:([a-z]+)|uf|ur)$"
-)
-
-
-class ReviewStates(StatesGroup):
-    waiting_custom = State()
+_CALLBACK = re.compile(r"^p(\d+):(ok|rev|dr|dk|ds|c(\d+)|t:([a-z]+)|uf|ur)$")
 
 
 @dataclass
@@ -65,8 +49,6 @@ def parse_callback(data: str | None) -> PendingAction | None:
         return PendingAction(pending_id, "ok")
     if rest == "rev":
         return PendingAction(pending_id, "rev")
-    if rest == "back":
-        return PendingAction(pending_id, "back")
     if rest == "dr":
         return PendingAction(pending_id, "drive_replace")
     if rest == "dk":
@@ -79,12 +61,8 @@ def parse_callback(data: str | None) -> PendingAction | None:
         return PendingAction(pending_id, "use_rec")
     if rest.startswith("c") and match.group(3) is not None:
         return PendingAction(pending_id, "cand", index=int(match.group(3)))
-    if rest.startswith("e:") and match.group(4) in FIELD_KEYS:
-        return PendingAction(pending_id, "edit", field=match.group(4))
-    if rest.startswith("uf:") and match.group(5) in FIELD_KEYS:
-        return PendingAction(pending_id, "use_file", field=match.group(5))
-    if rest.startswith("ur:") and match.group(6) in FIELD_KEYS:
-        return PendingAction(pending_id, "use_rec", field=match.group(6))
+    if rest.startswith("t:") and match.group(4) in FIELD_KEYS:
+        return PendingAction(pending_id, "toggle", field=match.group(4))
     return None
 
 
@@ -102,6 +80,19 @@ def set_field(data: dict[str, Any], key: str, value: str) -> dict[str, Any]:
     else:
         out[key] = value
     return out
+
+
+def toggle_working_field(
+    original: dict[str, Any] | TagSet,
+    recommended: dict[str, Any] | TagSet,
+    working: dict[str, Any],
+    field: str,
+) -> dict[str, Any]:
+    file_val = _get_field(original, field)
+    rec_val = _get_field(recommended, field)
+    now_val = _get_field(working, field)
+    next_val = rec_val if now_val == file_val else file_val
+    return set_field(working, field, next_val)
 
 
 def _clip(text: str) -> str:
@@ -153,22 +144,6 @@ def format_summary(
     return _clip("\n".join(lines))
 
 
-def format_field_prompt(
-    field: str,
-    original: dict[str, Any] | TagSet,
-    recommended: dict[str, Any] | TagSet,
-) -> str:
-    label = next((name for key, name in FIELDS if key == field), field)
-    file_val = _get_field(original, field) or "(none)"
-    rec_val = _get_field(recommended, field) or "(none)"
-    return _clip(
-        f"<b>Edit {html_esc(label)}</b>\n\n"
-        f"Original in file: {html_esc(file_val)}\n"
-        f"Recommended: {html_esc(rec_val)}\n\n"
-        "Tap a button, or send a custom value as the next message."
-    )
-
-
 def format_conflict(
     filename: str,
     conflicts: list[dict[str, Any]],
@@ -196,34 +171,44 @@ def format_conflict(
     return _clip("\n".join(lines))
 
 
-def review_keyboard(pending_id: int) -> InlineKeyboardMarkup:
+def _any_field_differs(
+    original: dict[str, Any] | TagSet,
+    recommended: dict[str, Any] | TagSet,
+) -> bool:
+    return any(_get_field(original, key) != _get_field(recommended, key) for key, _ in FIELDS)
+
+
+def review_keyboard(
+    pending_id: int,
+    original: dict[str, Any] | TagSet,
+    recommended: dict[str, Any] | TagSet,
+    working: dict[str, Any] | TagSet,
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
-        [
-            InlineKeyboardButton(text="Use File", callback_data=f"p{pending_id}:uf"),
-            InlineKeyboardButton(text="Use recommended", callback_data=f"p{pending_id}:ur"),
-        ]
+        [InlineKeyboardButton(text="Send to review", callback_data=f"p{pending_id}:rev")]
     ]
-    field_buttons = [
-        InlineKeyboardButton(text=f"Edit {label.lower()}", callback_data=f"p{pending_id}:e:{key}")
-        for key, label in EDIT_FIELDS
-    ]
-    for i in range(0, len(field_buttons), 2):
-        rows.append(field_buttons[i : i + 2])
-    rows.append([InlineKeyboardButton(text="Confirm", callback_data=f"p{pending_id}:ok")])
-    rows.append([InlineKeyboardButton(text="Send to review", callback_data=f"p{pending_id}:rev")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def field_keyboard(pending_id: int, field: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    if _any_field_differs(original, recommended):
+        rows.append(
             [
-                InlineKeyboardButton(text="Use file", callback_data=f"p{pending_id}:uf:{field}"),
-                InlineKeyboardButton(text="Use recommended", callback_data=f"p{pending_id}:ur:{field}"),
-            ],
-            [InlineKeyboardButton(text="Back", callback_data=f"p{pending_id}:back")],
-        ]
-    )
+                InlineKeyboardButton(text="Use File", callback_data=f"p{pending_id}:uf"),
+                InlineKeyboardButton(text="Use recommended", callback_data=f"p{pending_id}:ur"),
+            ]
+        )
+    toggles: list[InlineKeyboardButton] = []
+    for key, label in FIELDS:
+        file_val = _get_field(original, key)
+        rec_val = _get_field(recommended, key)
+        if file_val == rec_val:
+            continue
+        now_val = _get_field(working, key)
+        pick = "file" if now_val == file_val else "rec"
+        toggles.append(
+            InlineKeyboardButton(text=f"{label}: {pick}", callback_data=f"p{pending_id}:t:{key}")
+        )
+    for i in range(0, len(toggles), 2):
+        rows.append(toggles[i : i + 2])
+    rows.append([InlineKeyboardButton(text="Confirm", callback_data=f"p{pending_id}:ok")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def conflict_keyboard(pending_id: int) -> InlineKeyboardMarkup:
@@ -250,13 +235,5 @@ def build_review_router() -> Router:
         from app.queue import handle_pending_callback
 
         await handle_pending_callback(callback, ctx, state)
-
-    @router.message(ReviewStates.waiting_custom, F.text)
-    async def on_custom_tag(message: Message, ctx: Ctx, state: FSMContext) -> None:
-        from app.queue import handle_custom_tag
-
-        if message.text and message.text.startswith("/"):
-            return
-        await handle_custom_tag(message, ctx, state)
 
     return router
