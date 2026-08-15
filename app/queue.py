@@ -336,6 +336,7 @@ def _write_cover_option_files(options: list[CoverOption], pending_dir: Path) -> 
                 "label": option.label,
                 "digest": option.digest,
                 "caa_release": option.caa_release or "",
+                "url": option.url or "",
             }
         )
     return meta
@@ -353,38 +354,166 @@ def _read_cover_option(local: Path, option: dict) -> tuple[bytes, str, str, str 
     return data, "image/jpeg", source, caa
 
 
-def _cleanup_cover_option_files(local: Path, options: list) -> None:
+_API_COVER_ROOT = Path("/var/lib/telegram-bot-api/cover-picker")
+
+
+def _cleanup_staged_covers(album_key: str) -> None:
+    if not album_key:
+        return
+    path = _API_COVER_ROOT / album_key
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _cleanup_cover_option_files(local: Path, options: list, album_key: str = "") -> None:
     for option in options:
         if isinstance(option, dict):
             unlink_quiet(local.parent / str(option.get("path") or ""))
+    _cleanup_staged_covers(album_key)
+
+
+def _cover_caption(index: int, option: dict, album: str, albumartist: str) -> str:
+    label = str(option.get("label") or f"{index + 1}")
+    caption = f"{index + 1}. {label}"
+    if index == 0:
+        caption = f"Pick cover\n{albumartist} — {album}\n{caption}"
+    return caption[:1024]
+
+
+def _gallery_kwargs(job: Job) -> dict:
+    kwargs: dict = {"chat_id": job.chat_id}
+    if job.thread_id:
+        kwargs["message_thread_id"] = job.thread_id
+    return kwargs
+
+
+async def _send_one_cover(
+    ctx: Ctx,
+    path: Path,
+    kwargs: dict,
+    url: str = "",
+) -> int | None:
+    payload = path.read_bytes()
+    photo = url if url.startswith("https://") or url.startswith("http://") else None
+    if photo:
+        try:
+            sent = await ctx.bot.send_photo(photo=photo, **kwargs)
+            log.info("cover sent via photo-url %s", path.name)
+            return sent.message_id
+        except Exception as exc:
+            log.warning("cover send_photo url failed %s: %s", path.name, exc)
+    try:
+        sent = await ctx.bot.send_photo(
+            photo=BufferedInputFile(payload, filename=path.name), **kwargs
+        )
+        log.info("cover sent via photo-bytes %s", path.name)
+        return sent.message_id
+    except Exception as exc:
+        log.warning("cover send_photo failed %s: %s", path.name, exc)
+    try:
+        sent = await ctx.bot.send_document(
+            document=BufferedInputFile(payload, filename=path.name), **kwargs
+        )
+        log.info("cover sent via doc-bytes %s", path.name)
+        return sent.message_id
+    except Exception as exc:
+        log.warning("cover send_document failed %s: %s", path.name, exc)
+    if url:
+        text = str(kwargs.get("caption") or "")
+        msg: dict = {
+            "chat_id": kwargs["chat_id"],
+            "text": f"{text}\n{url}".strip(),
+            "disable_web_page_preview": False,
+        }
+        if kwargs.get("message_thread_id"):
+            msg["message_thread_id"] = kwargs["message_thread_id"]
+        try:
+            sent = await ctx.bot.send_message(**msg)
+            log.info("cover sent via link preview %s", path.name)
+            return sent.message_id
+        except Exception as exc:
+            log.warning("cover link preview failed %s: %s", path.name, exc)
+    return None
 
 
 async def _send_cover_gallery(
     ctx: Ctx,
     job: Job,
-    options: list[CoverOption],
+    pending_dir: Path,
+    options: list[dict],
     album: str,
     albumartist: str,
+    album_key: str,
 ) -> list[int]:
-    caption = f"Pick cover\n{albumartist} — {album}"
-    if len(caption) > 1000:
-        caption = caption[:1000]
-    media = [
-        InputMediaPhoto(
-            media=BufferedInputFile(option.data, filename=f"cover-{index}.jpg"),
-            caption=caption if index == 0 else None,
-        )
-        for index, option in enumerate(options)
-    ]
-    kwargs: dict = {"chat_id": job.chat_id, "media": media}
-    if job.thread_id:
-        kwargs["message_thread_id"] = job.thread_id
-    try:
-        messages = await ctx.bot.send_media_group(**kwargs)
-    except Exception:
-        log.debug("cover gallery send failed", exc_info=True)
+    del album_key
+    ready: list[tuple[int, dict, Path]] = []
+    for index, option in enumerate(options):
+        src = pending_dir / str(option.get("path") or "")
+        if not src.is_file():
+            log.warning("cover option file missing %s", src)
+            continue
+        ready.append((index, option, src))
+    if not ready:
+        log.warning("cover gallery empty album=%s options=%s", album, len(options))
         return []
-    return [msg.message_id for msg in messages]
+
+    base = _gallery_kwargs(job)
+    if len(ready) >= 2:
+        media = []
+        for i, (index, option, path) in enumerate(ready):
+            item: dict = {"media": BufferedInputFile(path.read_bytes(), filename=path.name)}
+            if i == 0:
+                item["caption"] = _cover_caption(index, option, album, albumartist)
+            media.append(InputMediaPhoto(**item))
+        try:
+            sent = await ctx.bot.send_media_group(media=media, **base)
+            ids = [msg.message_id for msg in sent]
+            log.info("cover sent via media_group album=%s photos=%s", album, len(ids))
+            return ids
+        except Exception as exc:
+            log.warning("cover send_media_group failed: %s", exc)
+
+    ids: list[int] = []
+    for index, option, path in ready:
+        kwargs = dict(base)
+        kwargs["caption"] = _cover_caption(index, option, album, albumartist)
+        message_id = await _send_one_cover(ctx, path, kwargs, url=str(option.get("url") or ""))
+        if message_id is None:
+            log.warning("cover option %s not sent", path.name)
+            continue
+        ids.append(message_id)
+    if not ids:
+        log.warning("cover gallery empty album=%s options=%s", album, len(options))
+    return ids
+
+
+async def _ensure_leader_gallery(
+    ctx: Ctx,
+    leader: PendingReview,
+    album: str,
+    albumartist: str,
+    album_k: str,
+) -> list[int]:
+    report = _loads(leader.source_report_json, {})
+    picker = _cover_picker_meta(report)
+    existing = [int(x) for x in (picker.get("media_message_ids") or []) if x]
+    if existing:
+        return existing
+    options = list(picker.get("options") or [])
+    if not options:
+        return []
+    job = _job_from_pending(leader)
+    media_ids = await _send_cover_gallery(
+        ctx, job, Path(leader.local_path).parent, options, album, albumartist, album_k
+    )
+    picker["media_message_ids"] = media_ids
+    report["cover_picker"] = picker
+    ctx.catalog.update_pending_review(leader.id, source_report_json=_dumps(report))
+    if media_ids:
+        text = format_cover_prompt(album, albumartist, options, leader.file_name)
+        status_id = await edit_status(ctx, job, text, cover_keyboard(leader.id, options))
+        ctx.catalog.update_pending_review(leader.id, status_message_id=status_id)
+    return media_ids
 
 
 async def _delete_cover_gallery(ctx: Ctx, chat_id: int, message_ids: list) -> None:
@@ -500,6 +629,7 @@ async def maybe_cover_picker(
         track_id=track_id,
     )
     if leader:
+        await _ensure_leader_gallery(ctx, leader, album, albumartist, album_k)
         dest = await _park_pending_flac(ctx, job, local)
         parked = dict(report)
         parked["cover_picker"] = {
@@ -548,13 +678,27 @@ async def maybe_cover_picker(
         "media_message_ids": [],
     }
     new_id = _upsert_cover_pending(ctx, dest=dest, report=parked, **park_kwargs)
-    media_ids = await _send_cover_gallery(ctx, job, options, album, albumartist)
-    parked["cover_picker"]["media_message_ids"] = media_ids
-    ctx.catalog.update_pending_review(new_id, source_report_json=_dumps(parked))
     text = format_cover_prompt(album, albumartist, option_meta, job.file_name)
     status_id = await edit_status(ctx, job, text, cover_keyboard(new_id, option_meta))
     ctx.catalog.update_pending_review(new_id, status_message_id=status_id)
-    log.info("cover picker waiting id=%s file=%s options=%s", new_id, job.file_name, len(options))
+    media_ids = await _send_cover_gallery(
+        ctx, job, dest.parent, option_meta, album, albumartist, album_k
+    )
+    parked["cover_picker"]["media_message_ids"] = media_ids
+    if not media_ids:
+        text = format_cover_prompt(
+            album, albumartist, option_meta, job.file_name, rights_warning=True
+        )
+        status_id = await edit_status(ctx, job, text, cover_keyboard(new_id, option_meta))
+        ctx.catalog.update_pending_review(new_id, status_message_id=status_id)
+    ctx.catalog.update_pending_review(new_id, source_report_json=_dumps(parked))
+    log.info(
+        "cover picker waiting id=%s file=%s options=%s photos=%s",
+        new_id,
+        job.file_name,
+        len(options),
+        len(media_ids),
+    )
     return True
 
 
@@ -688,7 +832,7 @@ async def _apply_cover_choice(ctx: Ctx, row: PendingReview, index: int) -> None:
     cache_album_cover(ctx, album, albumartist, data)
     _set_cover_report(report, source, caa_release)
     await _delete_cover_gallery(ctx, row.chat_id, list(picker.get("media_message_ids") or []))
-    _cleanup_cover_option_files(local, options)
+    _cleanup_cover_option_files(local, options, str(picker.get("album_key") or ""))
     album_k = picker.get("album_key")
     report.pop("cover_picker", None)
     ctx.catalog.update_pending_review(row.id, source_report_json=_dumps(report))
@@ -1405,7 +1549,11 @@ async def expire_pending(ctx: Ctx) -> None:
                     await _delete_cover_gallery(
                         ctx, row.chat_id, list(picker.get("media_message_ids") or [])
                     )
-                    _cleanup_cover_option_files(local, picker.get("options") or [])
+                    _cleanup_cover_option_files(
+                        local,
+                        picker.get("options") or [],
+                        str(picker.get("album_key") or ""),
+                    )
                 await edit_status(ctx, job, "Timed out (24h). Using first cover option…")
                 report.pop("cover_picker", None)
                 await _resume_library_after_cover(ctx, row, working, identity, report)

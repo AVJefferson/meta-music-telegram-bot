@@ -36,6 +36,7 @@ class CoverOption:
     label: str
     digest: str
     caa_release: str | None = None
+    url: str | None = None
 
 
 def is_shareable_album(album: str) -> bool:
@@ -184,6 +185,7 @@ async def list_cover_candidates(
         source: str,
         label: str,
         caa_release: str | None = None,
+        url: str | None = None,
     ) -> None:
         if len(options) >= MAX_COVER_OPTIONS:
             return
@@ -203,16 +205,18 @@ async def list_cover_candidates(
                 label=label,
                 digest=digest,
                 caa_release=caa_release,
+                url=url or None,
             )
         )
 
     if file_cover and file_cover[0]:
         add(file_cover[0], file_cover[1], "file", "file")
-    for cover, mbid in await list_caa_fronts(ctx.http, identity):
-        add(cover[0], cover[1], "caa", "CAA", mbid)
+    for cover, mbid, url in await list_caa_fronts(ctx.http, identity):
+        add(cover[0], cover[1], "caa", "CAA", mbid, url)
     itunes = await list_itunes_album_cover(ctx.http, identity)
     if itunes:
-        add(itunes[0], itunes[1], "itunes", "iTunes")
+        cover, url = itunes
+        add(cover[0], cover[1], "itunes", "iTunes", url=url)
     caa_opts = [opt for opt in options if opt.source == "caa"]
     if len(caa_opts) > 1:
         for index, opt in enumerate(caa_opts, start=1):

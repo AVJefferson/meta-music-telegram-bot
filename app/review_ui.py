@@ -214,16 +214,19 @@ def review_keyboard(
 
 
 def cover_keyboard(pending_id: int, options: list[dict[str, Any]]) -> InlineKeyboardMarkup:
-    buttons: list[InlineKeyboardButton] = []
+    rows: list[list[InlineKeyboardButton]] = []
     for index, option in enumerate(options):
         label = str(option.get("label") or f"{index + 1}")
-        buttons.append(
+        row = [
             InlineKeyboardButton(
                 text=f"{index + 1} {label}",
                 callback_data=f"p{pending_id}:cv{index}",
             )
-        )
-    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+        ]
+        url = str(option.get("url") or "")
+        if url.startswith("http://") or url.startswith("https://"):
+            row.append(InlineKeyboardButton(text="view", url=url))
+        rows.append(row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -234,6 +237,7 @@ def format_cover_prompt(
     filename: str,
     *,
     waiting: bool = False,
+    rights_warning: bool = False,
 ) -> str:
     if waiting:
         return _clip(
@@ -249,9 +253,21 @@ def format_cover_prompt(
         "",
     ]
     for index, option in enumerate(options):
-        lines.append(f"{index + 1}. {html_esc(str(option.get('label') or ''))}")
+        label = html_esc(str(option.get("label") or ""))
+        url = str(option.get("url") or "")
+        if url.startswith("http://") or url.startswith("https://"):
+            lines.append(f'{index + 1}. {label} — <a href="{html_esc(url)}">preview</a>')
+        else:
+            lines.append(f"{index + 1}. {label}")
     lines.append("")
     lines.append("Later tracks of this album reuse the pick.")
+    if rights_warning:
+        lines.append("")
+        lines.append(
+            "Bot cannot send photos in this group. "
+            "Make it admin, or enable Photos and Files in group permissions. "
+            "Tap <b>view</b> / preview links until then."
+        )
     return _clip("\n".join(lines))
 
 

@@ -8,7 +8,7 @@ Audio is never re-encoded. FLAC uses Vorbis comments (not ID3).
 
 1. Bot from [@BotFather](https://t.me/BotFather)
    - `/setprivacy` → **Disable** (otherwise the bot only sees commands)
-   - Add the bot to the forum group
+   - Add the bot to the forum group. Grant **Photos** and **Files** (make it admin, or enable those in group permissions) — cover previews need them.
 2. `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org) (local Bot API, required for files over 20MB)
 3. Free [AcoustID application key](https://acoustid.org/new-application)
 4. MusicBrainz user-agent with a real contact email

@@ -79,17 +79,21 @@ async def _caa_payloads(http: httpx.AsyncClient, identity: Identity) -> list[tup
     return out
 
 
-async def _download_caa_entry(http: httpx.AsyncClient, image: dict) -> tuple[bytes, str] | None:
+async def _download_caa_entry(
+    http: httpx.AsyncClient, image: dict
+) -> tuple[tuple[bytes, str], str] | None:
     thumbs = image.get("thumbnails") or {}
     for key in ("1200", "large", "500", "small"):
         thumb = thumbs.get(key)
         if thumb:
-            got = await _download_cover(http, thumb)
+            got = await _download_cover(http, str(thumb))
             if got:
-                return got
+                return got, str(thumb)
     original = image.get("image")
     if original:
-        return await _download_cover(http, original)
+        got = await _download_cover(http, str(original))
+        if got:
+            return got, str(original)
     return None
 
 
@@ -103,7 +107,7 @@ async def list_caa_fronts(
     *,
     limit: int = CAA_FRONT_LIMIT,
     fronts_only: bool = True,
-) -> list[tuple[tuple[bytes, str], str]]:
+) -> list[tuple[tuple[bytes, str], str, str]]:
     payloads = await _caa_payloads(http, identity)
     buckets: list[tuple[str, list, list]] = []
     for mbid, payload in payloads:
@@ -120,7 +124,7 @@ async def list_caa_fronts(
             if images:
                 picks.append((mbid, images[0]))
                 break
-    results: list[tuple[tuple[bytes, str], str]] = []
+    results: list[tuple[tuple[bytes, str], str, str]] = []
     seen: set[str] = set()
     for mbid, image in picks:
         if len(results) >= limit:
@@ -132,7 +136,8 @@ async def list_caa_fronts(
             seen.add(key)
         got = await _download_caa_entry(http, image)
         if got:
-            results.append((got, mbid))
+            cover, url = got
+            results.append((cover, mbid, url))
     return results
 
 
@@ -242,11 +247,18 @@ def _itunes_album_match(identity: Identity, results: list[dict]) -> dict | None:
 
 async def list_itunes_album_cover(
     http: httpx.AsyncClient, identity: Identity
-) -> tuple[bytes, str] | None:
+) -> tuple[tuple[bytes, str], str] | None:
     album_item = _itunes_album_match(identity, await _itunes_album_search(http, identity))
     if not album_item:
         return None
-    return await _cover_from_itunes_item(http, album_item)
+    cover = await _cover_from_itunes_item(http, album_item)
+    if not cover:
+        return None
+    art = str(album_item.get("artworkUrl100") or album_item.get("artworkUrl60") or "")
+    url = ""
+    if art:
+        url = art.replace("100x100bb", "1200x1200bb").replace("60x60bb", "1200x1200bb")
+    return cover, url
 
 
 async def fetch_cover(
