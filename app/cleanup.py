@@ -12,19 +12,26 @@ from app.util import html_esc
 log = logging.getLogger(__name__)
 
 
-async def alert_general(ctx: Ctx, text: str) -> None:
+async def alert_general(ctx: Ctx, text: str, fallback_thread_id: int | None = None) -> None:
     chat_id = ctx.settings.allowed_chat_id
-    thread = ctx.settings.alert_thread_id
-    try:
-        await ctx.bot.send_message(
-            chat_id,
-            text,
-            message_thread_id=thread,
-            parse_mode="HTML",
-        )
-    except Exception:
-        log.warning("alert with thread_id=%s failed, retrying without thread", thread)
-        await ctx.bot.send_message(chat_id, text, parse_mode="HTML")
+    candidates: list[int | None] = [ctx.settings.alert_thread_id]
+    if fallback_thread_id and fallback_thread_id not in candidates:
+        candidates.append(fallback_thread_id)
+    candidates.append(None)
+    seen: set[int | None] = set()
+    for thread in candidates:
+        if thread in seen:
+            continue
+        seen.add(thread)
+        try:
+            kwargs: dict = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+            if thread:
+                kwargs["message_thread_id"] = thread
+            await ctx.bot.send_message(**kwargs)
+            return
+        except Exception as exc:
+            log.warning("alert failed thread_id=%s: %s", thread, exc)
+    log.error("could not send Drive alert to Telegram")
 
 
 async def _retry_row(ctx: Ctx, row: TrackRecord) -> None:

@@ -14,6 +14,11 @@ log = logging.getLogger(__name__)
 
 DRIVE_SCOPE = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
+_NO_RETRY_STATUS = {400, 401, 403, 404}
+
+
+class DriveAccessError(RuntimeError):
+    """Folder missing or not shared with the service account."""
 
 
 def _load_sa_info(raw: str) -> dict:
@@ -34,8 +39,38 @@ class DriveClient:
     def __init__(self, service_account_json: str) -> None:
         info = _load_sa_info(service_account_json)
         creds = service_account.Credentials.from_service_account_info(info, scopes=DRIVE_SCOPE)
+        self.email = info.get("client_email") or getattr(creds, "service_account_email", "")
         self._service = build("drive", "v3", credentials=creds, cache_discovery=False)
         self._folder_cache: dict[tuple[str, str], str] = {}
+
+    def _wrap_http_error(self, exc: HttpError, folder_id: str | None = None) -> Exception:
+        if exc.resp.status != 404:
+            return exc
+        where = f" id={folder_id}" if folder_id else ""
+        return DriveAccessError(
+            f"Drive folder{where} not visible to {self.email}. "
+            f"Share that folder with {self.email} as Editor "
+            f"(Shared Drive: add the service account as a member). "
+            f"Google returns 404 when the account has no access."
+        )
+
+    def assert_folders(self, folders: dict[str, str]) -> None:
+        for label, folder_id in folders.items():
+            if not folder_id:
+                raise DriveAccessError(f"{label} is empty")
+            try:
+                meta = (
+                    self._service.files()
+                    .get(
+                        fileId=folder_id,
+                        fields="id,name,mimeType",
+                        supportsAllDrives=True,
+                    )
+                    .execute()
+                )
+            except HttpError as exc:
+                raise self._wrap_http_error(exc, folder_id) from exc
+            log.info("drive %s ok name=%s", label, meta.get("name"))
 
     def file_exists(self, file_id: str) -> bool:
         try:
@@ -70,9 +105,12 @@ class DriveClient:
             raise ValueError("empty relative path")
         filename = parts[-1]
         parent = root_folder_id
-        for folder in parts[:-1]:
-            parent = self._ensure_folder(parent, folder)
-        return self._upload_or_replace(local_file, parent, filename, mime_type)
+        try:
+            for folder in parts[:-1]:
+                parent = self._ensure_folder(parent, folder)
+            return self._upload_or_replace(local_file, parent, filename, mime_type)
+        except HttpError as exc:
+            raise self._wrap_http_error(exc, root_folder_id) from exc
 
     def upload_with_retry(
         self,
@@ -86,10 +124,17 @@ class DriveClient:
         for i in range(attempts):
             try:
                 return self.upload_tree(local_file, root_folder_id, relative, mime_type)
+            except DriveAccessError:
+                raise
+            except HttpError as exc:
+                last = self._wrap_http_error(exc, root_folder_id)
+                if exc.resp.status in _NO_RETRY_STATUS:
+                    raise last from exc
+                log.warning("drive upload attempt %s failed: %s", i + 1, exc)
             except Exception as exc:  # noqa: BLE001 — retry then surface
                 last = exc
                 log.warning("drive upload attempt %s failed: %s", i + 1, exc)
-                time.sleep(2**i)
+            time.sleep(2**i)
         assert last is not None
         raise last
 

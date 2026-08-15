@@ -230,6 +230,7 @@ async def _save_and_upload(
             f"Title: {html_esc(tags.title)}\n"
             f"Local: <code>{html_esc(dest)}</code>\n"
             f"Error: {html_esc(exc)}",
+            fallback_thread_id=job.thread_id,
         )
         await edit_status(
             ctx,

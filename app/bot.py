@@ -144,6 +144,7 @@ async def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     settings = Settings()
     for path in (
         settings.library_root,
@@ -155,6 +156,12 @@ async def main() -> None:
 
     catalog = Catalog(settings.state_db)
     drive = DriveClient(settings.google_service_account_json)
+    drive.assert_folders(
+        {
+            "GDRIVE_FOLDER_ID": settings.gdrive_folder_id,
+            "GDRIVE_REVIEW_FOLDER_ID": settings.gdrive_review_folder_id,
+        }
+    )
     genre = GenreMapper(settings.genre_map_path)
     mb = MBClient(settings.musicbrainz_user_agent)
     http = httpx.AsyncClient(
