@@ -553,10 +553,11 @@ async def _send_cover_gallery(
     base = _gallery_kwargs(job)
     if len(ready) >= 2:
         media = []
-        for i, (index, option, path) in enumerate(ready):
-            item: dict = {"media": BufferedInputFile(path.read_bytes(), filename=path.name)}
-            if i == 0:
-                item["caption"] = _cover_caption(index, option, album, albumartist)
+        for index, option, path in ready:
+            item: dict = {
+                "media": BufferedInputFile(path.read_bytes(), filename=path.name),
+                "caption": _cover_caption(index, option, album, albumartist),
+            }
             media.append(InputMediaPhoto(**item))
         try:
             sent = await ctx.bot.send_media_group(media=media, **base)
