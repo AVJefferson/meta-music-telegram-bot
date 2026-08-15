@@ -40,6 +40,7 @@ from app.models import (
     tagset_from_dict,
 )
 from app.review_ui import (
+    bulk_choice,
     conflict_keyboard,
     cover_keyboard,
     empty_markup,
@@ -1505,8 +1506,7 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
     if action.op in {"use_file", "use_rec"}:
         await state.clear()
         original, recommended, _working, _identity, _report, _cands = _load_pending_state(row)
-        source = original if action.op == "use_file" else recommended
-        working = dict(source)
+        working = bulk_choice(original, recommended, use_file=action.op == "use_file")
         ctx.catalog.update_pending_review(
             row.id, working_json=_dumps(working), status="waiting"
         )

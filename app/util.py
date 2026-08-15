@@ -7,6 +7,11 @@ from pathlib import Path
 _INVALID_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _LRC = re.compile(r"\[\d{1,2}:\d{2}")
 _UA = re.compile(r"^([^/]+)/(\S+)\s*\(([^)]+)\)")
+# Slashes only split when spaced, so band names like AC/DC survive.
+_ARTIST_SEPARATORS = re.compile(
+    r"\s*;\s*|\s+/\s+|\s+&\s+|\s+(?:feat|ft|featuring)\.?\s+",
+    re.IGNORECASE,
+)
 
 
 def format_artist_list(names: list[str]) -> str:
@@ -71,13 +76,22 @@ def parse_track_number(value: str | None) -> str:
 def split_artist_field(value: str) -> list[str]:
     if not value:
         return []
-    parts = [p.strip() for p in value.split(",") if p.strip()]
-    if not parts:
-        return []
-    if " & " in parts[-1]:
-        last = [p.strip() for p in parts[-1].split(" & ") if p.strip()]
-        return parts[:-1] + last
-    return parts
+    out: list[str] = []
+    for chunk in value.split(","):
+        for name in _ARTIST_SEPARATORS.split(chunk):
+            name = name.strip()
+            if name:
+                out.append(name)
+    return out
+
+
+def artist_name_set(value: str) -> frozenset[str]:
+    names = {normalize_match_text(name) for name in split_artist_field(value)}
+    return frozenset(name for name in names if name)
+
+
+def same_artist_names(left: str, right: str) -> bool:
+    return artist_name_set(left) == artist_name_set(right)
 
 
 def file_stem_hints(filename: str) -> str:

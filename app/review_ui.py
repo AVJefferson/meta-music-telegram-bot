@@ -13,7 +13,7 @@ from aiogram.types import (
 )
 
 from app.models import Ctx, TagSet
-from app.util import format_bytes, format_quality, html_esc
+from app.util import format_bytes, format_quality, html_esc, same_artist_names
 
 TG_LIMIT = 4000
 FIELDS: list[tuple[str, str]] = [
@@ -26,6 +26,7 @@ FIELDS: list[tuple[str, str]] = [
     ("year", "Year"),
 ]
 FIELD_KEYS = {key for key, _ in FIELDS}
+MULTI_VALUE_FIELDS = {"artist", "albumartist", "composer"}
 _CALLBACK = re.compile(r"^p(\d+):(ok|rev|cancel|dr|dk|ds|cv(\d+)|c(\d+)|t:([a-z]+)|uf|ur)$")
 
 
@@ -75,6 +76,12 @@ def _get_field(data: dict[str, Any] | TagSet, key: str) -> str:
     if key == "year":
         return str(raw.get("date") or raw.get("year") or "")
     return str(raw.get(key) or "")
+
+
+def _values_match(key: str, left: str, right: str) -> bool:
+    if left == right:
+        return True
+    return key in MULTI_VALUE_FIELDS and same_artist_names(left, right)
 
 
 def set_field(data: dict[str, Any], key: str, value: str) -> dict[str, Any]:
@@ -129,9 +136,11 @@ def format_summary(
         file_val = _get_field(original, key)
         rec_val = _get_field(recommended, key)
         now_val = _get_field(working, key)
-        if file_val == rec_val:
-            line = f"<b>{label}</b>: {html_esc(file_val) or '—'}"
-            if now_val != rec_val:
+        if _values_match(key, file_val, rec_val):
+            line = f"<b>{label}</b>: {html_esc(rec_val) or '—'}"
+            if file_val != rec_val:
+                line += " (reordered)"
+            if not _values_match(key, now_val, rec_val):
                 line += f"\n  now: {html_esc(now_val) or '—'}"
             lines.append(line)
         else:
@@ -179,7 +188,28 @@ def _any_field_differs(
     original: dict[str, Any] | TagSet,
     recommended: dict[str, Any] | TagSet,
 ) -> bool:
-    return any(_get_field(original, key) != _get_field(recommended, key) for key, _ in FIELDS)
+    return any(
+        not _values_match(key, _get_field(original, key), _get_field(recommended, key))
+        for key, _ in FIELDS
+    )
+
+
+def bulk_choice(
+    original: dict[str, Any] | TagSet,
+    recommended: dict[str, Any] | TagSet,
+    *,
+    use_file: bool,
+) -> dict[str, Any]:
+    source = original if use_file else recommended
+    chosen = asdict(source) if isinstance(source, TagSet) else dict(source)
+    if not use_file:
+        return chosen
+    for key in MULTI_VALUE_FIELDS:
+        file_val = _get_field(original, key)
+        rec_val = _get_field(recommended, key)
+        if file_val != rec_val and _values_match(key, file_val, rec_val):
+            chosen = set_field(chosen, key, rec_val)
+    return chosen
 
 
 def review_keyboard(
@@ -202,7 +232,7 @@ def review_keyboard(
     for key, label in FIELDS:
         file_val = _get_field(original, key)
         rec_val = _get_field(recommended, key)
-        if file_val == rec_val:
+        if _values_match(key, file_val, rec_val):
             continue
         now_val = _get_field(working, key)
         pick = "file" if now_val == file_val else "rec"

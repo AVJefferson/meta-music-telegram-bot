@@ -15,6 +15,7 @@ from app.models import Candidate, Identity, TagHints
 from app.songlog import mb_snapshot
 from app.tags import audio_info
 from app.util import (
+    artist_name_set,
     file_stem_hints,
     format_artist_list,
     normalize_match_text,
@@ -378,7 +379,12 @@ def _filename_tag_agrees(hints: TagHints, title: str, artists: list[str]) -> boo
         title_ok = True
     artist_ok = True
     if hints.artist and artist:
-        artist_ok = _text_agrees(hints.artist, artist) or artist.casefold() in hints.artist.casefold()
+        mb_names = {normalize_match_text(name) for name in artists}
+        artist_ok = (
+            _text_agrees(hints.artist, artist)
+            or artist.casefold() in hints.artist.casefold()
+            or bool(artist_name_set(hints.artist) & mb_names)
+        )
     if stem and artist and not artist_ok:
         artist_ok = artist.casefold() in stem.casefold()
     return title_ok and artist_ok

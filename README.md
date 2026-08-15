@@ -72,6 +72,8 @@ Open **21/tcp** and **21100–21110/tcp** on the host firewall.
 
 Artist fields use `A, B, C & D`. Genre is `genre | mood | language | instrument`.
 
+Artist, album artist, and composer are compared as name sets, so a list that only differs in order counts as identical and never shows up as a tag difference. `;`, ` / `, and `feat.` / `ft.` / `featuring` in file tags are read as name separators (an unspaced slash like `AC/DC` stays one name). When only the order differs, the online credit order is written, which also keeps album folder names stable.
+
 ## Identification
 
 1. Chromaprint / AcoustID (audio fingerprint)
