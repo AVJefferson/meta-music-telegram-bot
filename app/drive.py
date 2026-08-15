@@ -33,6 +33,16 @@ class DriveChild:
         return self.mime_type == FOLDER_MIME
 
 
+@dataclass
+class DriveReviewItem:
+    file_id: str
+    sidecar_id: str | None
+    name: str
+    relative_path: str
+    size: int | None
+    modified: str | None
+
+
 def _child_from_meta(meta: dict) -> DriveChild:
     size_raw = meta.get("size")
     size = int(size_raw) if size_raw is not None and str(size_raw).isdigit() else None
@@ -270,6 +280,44 @@ class DriveClient:
         while not done:
             _status, done = downloader.next_chunk()
         return buf.getvalue()
+
+    def download_to(self, file_id: str, destination: Path) -> Path:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        request = self._service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        with destination.open("wb") as stream:
+            downloader = MediaIoBaseDownload(stream, request)
+            done = False
+            while not done:
+                _status, done = downloader.next_chunk()
+        return destination
+
+    def list_review_items(self, root_id: str) -> list[DriveReviewItem]:
+        items: list[DriveReviewItem] = []
+
+        def walk(folder_id: str, parts: tuple[str, ...]) -> None:
+            children = self.list_children(folder_id)
+            files = {child.name: child for child in children if not child.is_folder}
+            for child in children:
+                if child.is_folder:
+                    walk(child.id, (*parts, child.name))
+                    continue
+                if not child.name.lower().endswith(".flac"):
+                    continue
+                sidecar = files.get(f"{Path(child.name).stem}.json")
+                items.append(
+                    DriveReviewItem(
+                        file_id=child.id,
+                        sidecar_id=sidecar.id if sidecar else None,
+                        name=child.name,
+                        relative_path="/".join((*parts, child.name)),
+                        size=child.size,
+                        modified=child.modified,
+                    )
+                )
+
+        walk(root_id, ())
+        items.sort(key=lambda item: (item.modified or "", item.relative_path), reverse=True)
+        return items
 
     def create_file(
         self,

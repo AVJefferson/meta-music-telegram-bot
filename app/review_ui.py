@@ -26,7 +26,7 @@ FIELDS: list[tuple[str, str]] = [
     ("year", "Year"),
 ]
 FIELD_KEYS = {key for key, _ in FIELDS}
-_CALLBACK = re.compile(r"^p(\d+):(ok|rev|dr|dk|ds|cv(\d+)|c(\d+)|t:([a-z]+)|uf|ur)$")
+_CALLBACK = re.compile(r"^p(\d+):(ok|rev|cancel|dr|dk|ds|cv(\d+)|c(\d+)|t:([a-z]+)|uf|ur)$")
 
 
 @dataclass
@@ -49,6 +49,8 @@ def parse_callback(data: str | None) -> PendingAction | None:
         return PendingAction(pending_id, "ok")
     if rest == "rev":
         return PendingAction(pending_id, "rev")
+    if rest == "cancel":
+        return PendingAction(pending_id, "cancel")
     if rest == "dr":
         return PendingAction(pending_id, "drive_replace")
     if rest == "dk":
@@ -209,7 +211,12 @@ def review_keyboard(
         )
     for i in range(0, len(toggles), 2):
         rows.append(toggles[i : i + 2])
-    rows.append([InlineKeyboardButton(text="Confirm", callback_data=f"p{pending_id}:ok")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="Confirm", callback_data=f"p{pending_id}:ok"),
+            InlineKeyboardButton(text="Cancel", callback_data=f"p{pending_id}:cancel"),
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -227,6 +234,7 @@ def cover_keyboard(pending_id: int, options: list[dict[str, Any]]) -> InlineKeyb
         if url.startswith("http://") or url.startswith("https://"):
             row.append(InlineKeyboardButton(text="view", url=url))
         rows.append(row)
+    rows.append([InlineKeyboardButton(text="Cancel", callback_data=f"p{pending_id}:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -279,6 +287,7 @@ def conflict_keyboard(pending_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Keep both", callback_data=f"p{pending_id}:dk"),
             ],
             [InlineKeyboardButton(text="Skip", callback_data=f"p{pending_id}:ds")],
+            [InlineKeyboardButton(text="Cancel", callback_data=f"p{pending_id}:cancel")],
         ]
     )
 

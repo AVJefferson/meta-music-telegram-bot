@@ -60,6 +60,22 @@ def hints_to_tagset(hints: TagHints) -> TagSet:
     )
 
 
+def read_tagset(path: Path) -> TagSet:
+    audio = FLAC(path)
+    return TagSet(
+        title=_first(audio, "title", "TITLE"),
+        album=_first(audio, "album", "ALBUM"),
+        artist=_first(audio, "artist", "ARTIST"),
+        albumartist=_first(audio, "albumartist", "ALBUM ARTIST", "ALBUMARTIST"),
+        composer=_first(audio, "composer", "COMPOSER"),
+        genre=_first(audio, "genre", "GENRE"),
+        date=_first(audio, "date", "DATE", "year", "YEAR"),
+        tracknumber=_first(audio, "tracknumber", "TRACKNUMBER", "track"),
+        discnumber=_first(audio, "discnumber", "DISCNUMBER"),
+        lyrics=_first(audio, "lyrics", "LYRICS"),
+    )
+
+
 def read_cover(path: Path) -> tuple[bytes | None, str | None]:
     audio = FLAC(path)
     pictures = audio.pictures or []

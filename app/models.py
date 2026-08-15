@@ -92,6 +92,9 @@ class Job:
     file_id: str
     file_name: str
     status_message_id: int
+    local_path: str | None = None
+    private: bool = False
+    source_pending_id: int | None = None
 
 
 @dataclass
@@ -156,6 +159,8 @@ class PendingReview:
     track_id: int | None
     replace_id: int | None
     old_drive_id: str | None
+    source_drive_file_id: str | None
+    source_drive_sidecar_id: str | None
     created_at: str
     expires_at: str
 

@@ -62,7 +62,7 @@ def quality(bit_depth: int | None, sample_rate: int | None) -> tuple[int, int]:
 
 
 def tag_preview(tags: TagSet) -> str:
-    lyrics = "synced" if tags.lyrics else "none"
+    lyrics = "present" if tags.lyrics else "none"
     return (
         f"<b>{html_esc(tags.title)}</b>\n"
         f"Artist: {html_esc(tags.artist)}\n"
@@ -97,6 +97,7 @@ def _job_from_pending(row: PendingReview) -> Job:
         file_id="",
         file_name=row.file_name,
         status_message_id=row.status_message_id or 0,
+        private=row.chat_id > 0,
     )
 
 
@@ -142,15 +143,70 @@ async def worker(name: str, queue: asyncio.Queue[Job], ctx: Ctx) -> None:
     while True:
         job = await queue.get()
         try:
+            if job.source_pending_id and not ctx.catalog.transition_pending(
+                job.source_pending_id, "queued", "processing"
+            ):
+                log.info("skipping already claimed private job id=%s", job.source_pending_id)
+                continue
             await process_job(job, ctx)
+            if job.source_pending_id:
+                ctx.catalog.transition_pending(
+                    job.source_pending_id, "processing", "done"
+                )
+                if job.local_path:
+                    source = Path(job.local_path)
+                    unlink_quiet(source)
+                    try:
+                        source.parent.rmdir()
+                    except OSError:
+                        pass
         except Exception:
             log.exception("job failed for %s", job.file_name)
+            if job.source_pending_id:
+                ctx.catalog.update_pending_review(job.source_pending_id, status="failed")
             try:
                 await edit_status(ctx, job, f"Failed processing <code>{html_esc(job.file_name)}</code>. Check logs.")
             except Exception:
                 pass
         finally:
             queue.task_done()
+
+
+async def recover_interrupted(ctx: Ctx, jobs: asyncio.Queue[Job]) -> None:
+    rows = ctx.catalog.list_pending_by_status(
+        "queued", "processing", "uploading", "expiring", "cleanup_pending"
+    )
+    for row in rows:
+        try:
+            if row.status == "cleanup_pending":
+                if await _delete_promoted_review_source(ctx, row):
+                    ctx.catalog.update_pending_review(row.id, status="done")
+                continue
+            if row.phase == "dm_topic" and row.status in {"queued", "processing"}:
+                ctx.catalog.update_pending_review(row.id, status="queued")
+                await jobs.put(
+                    Job(
+                        chat_id=row.chat_id,
+                        thread_id=None,
+                        topic_name=row.topic_name,
+                        file_id="",
+                        file_name=row.file_name,
+                        status_message_id=row.status_message_id,
+                        local_path=row.local_path,
+                        private=True,
+                        source_pending_id=row.id,
+                    )
+                )
+                continue
+            if row.status == "uploading":
+                ctx.catalog.update_pending_review(row.id, status="waiting", phase="drive")
+                refreshed = ctx.catalog.get_pending_review(row.id)
+                if refreshed:
+                    await _apply_drive_choice(ctx, refreshed, "replace")
+                continue
+            ctx.catalog.update_pending_review(row.id, status="waiting")
+        except Exception:
+            log.exception("pending recovery failed id=%s status=%s", row.id, row.status)
 
 
 def _build_report(hints: TagHints, identity: Identity, enrichment, tags: TagSet) -> dict:
@@ -166,8 +222,11 @@ async def process_job(job: Job, ctx: Ctx) -> None:
     tmp = work / "source.flac"
     try:
         await edit_status(ctx, job, f"Downloading <code>{html_esc(job.file_name)}</code>…")
-        file = await ctx.bot.get_file(job.file_id)
-        await ctx.bot.download(file, destination=tmp)
+        if job.local_path:
+            await asyncio.to_thread(shutil.copy2, job.local_path, tmp)
+        else:
+            file = await ctx.bot.get_file(job.file_id)
+            await ctx.bot.download(file, destination=tmp)
 
         hints = await asyncio.to_thread(read_hints, tmp, job.file_name)
         file_cover = await asyncio.to_thread(read_cover, tmp)
@@ -215,6 +274,7 @@ async def process_job(job: Job, ctx: Ctx) -> None:
                     old_q=old_q,
                     new_q=new_q,
                     file_cover=file_cover,
+                    pending_id=job.source_pending_id,
                 )
                 return
 
@@ -230,6 +290,7 @@ async def process_job(job: Job, ctx: Ctx) -> None:
             identity=identity,
             report=report,
             file_cover=file_cover,
+            pending_id=job.source_pending_id,
         )
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -249,28 +310,59 @@ async def start_tag_review(
     dest = pending_dir / (sanitize_filename(Path(job.file_name).stem) + ".flac")
     dest = await asyncio.to_thread(place_file, tmp, dest)
     original = hints_to_tagset(hints)
-    pending_id = ctx.catalog.insert_pending_review(
-        phase="tags",
-        local_path=str(dest),
-        sidecar_path=None,
-        relative_path=None,
-        kind="library",
-        original_json=_dumps(asdict(original)),
-        recommended_json=_dumps(asdict(tags)),
-        working_json=_dumps(asdict(tags)),
-        candidates_json=_dumps([asdict(c) for c in identity.candidates]),
-        identity_json=_dumps(asdict(identity)),
-        source_report_json=_dumps(report),
-        chat_id=job.chat_id,
-        thread_id=job.thread_id,
-        status_message_id=job.status_message_id,
-        topic_name=job.topic_name,
-        file_name=job.file_name,
-        expires_at=_expires_at(),
-    )
-    text = format_summary(original, tags, tags, reason=identity.confidence_reason)
-    markup = review_keyboard(pending_id, original, tags, tags)
-    status_id = await edit_status(ctx, job, text, markup)
+    if job.source_pending_id:
+        pending_id = job.source_pending_id
+        ctx.catalog.update_pending_review(
+            pending_id,
+            phase="tags",
+            status="waiting",
+            local_path=str(dest),
+            sidecar_path=None,
+            relative_path=None,
+            kind="library",
+            original_json=_dumps(asdict(original)),
+            recommended_json=_dumps(asdict(tags)),
+            working_json=_dumps(asdict(tags)),
+            candidates_json=_dumps([asdict(c) for c in identity.candidates]),
+            identity_json=_dumps(asdict(identity)),
+            source_report_json=_dumps(report),
+            topic_name=job.topic_name,
+            thread_id=job.thread_id,
+            file_name=job.file_name,
+            expires_at=_expires_at(),
+        )
+    else:
+        pending_id = ctx.catalog.insert_pending_review(
+            phase="tags",
+            local_path=str(dest),
+            sidecar_path=None,
+            relative_path=None,
+            kind="library",
+            original_json=_dumps(asdict(original)),
+            recommended_json=_dumps(asdict(tags)),
+            working_json=_dumps(asdict(tags)),
+            candidates_json=_dumps([asdict(c) for c in identity.candidates]),
+            identity_json=_dumps(asdict(identity)),
+            source_report_json=_dumps(report),
+            chat_id=job.chat_id,
+            thread_id=job.thread_id,
+            status_message_id=job.status_message_id,
+            topic_name=job.topic_name,
+            file_name=job.file_name,
+            expires_at=_expires_at(),
+        )
+    if job.private:
+        ctx.catalog.update_pending_review(pending_id, phase="edit:0")
+        from app.private_ui import show_editor_prompt
+
+        row = ctx.catalog.get_pending_review(pending_id)
+        if row:
+            await show_editor_prompt(ctx, row)
+        status_id = job.status_message_id
+    else:
+        text = format_summary(original, tags, tags, reason=identity.confidence_reason)
+        markup = review_keyboard(pending_id, original, tags, tags)
+        status_id = await edit_status(ctx, job, text, markup)
     ctx.catalog.update_pending_review(pending_id, status_message_id=status_id)
     log.info("review waiting id=%s file=%s reason=%s", pending_id, job.file_name, identity.confidence_reason)
 
@@ -598,6 +690,8 @@ async def maybe_cover_picker(
     album = tags.album
     albumartist = tags.albumartist or tags.artist
     ident = cover_identity(identity, tags)
+    if report.get("manual_cover_final"):
+        return False
     if replaced or old_q is not None or new_q is not None:
         report["quality_replace"] = {
             "replaced": replaced,
@@ -1106,7 +1200,14 @@ async def _commit_upload(
         if old_drive_id and old_drive_id != file_id and conflict_action != "keep_both":
             await asyncio.to_thread(ctx.drive.delete_file, old_drive_id)
         if pending_id is not None:
-            ctx.catalog.update_pending_review(pending_id, status="done")
+            completed = ctx.catalog.get_pending_review(pending_id)
+            if completed:
+                cleaned = await _delete_promoted_review_source(ctx, completed)
+                ctx.catalog.update_pending_review(
+                    pending_id, status="done" if cleaned else "cleanup_pending"
+                )
+            else:
+                ctx.catalog.update_pending_review(pending_id, status="done")
     except Exception as exc:
         ctx.catalog.mark_failed(track_id, str(exc))
         if pending_id is not None:
@@ -1142,6 +1243,19 @@ async def _commit_upload(
     )
     log.info("saved %s kind=%s confidence=%s path=%s", job.file_name, dest_label, identity.confidence, relative)
     return dest
+
+
+async def _delete_promoted_review_source(ctx: Ctx, row: PendingReview) -> bool:
+    if not row.source_drive_file_id:
+        return True
+    try:
+        await asyncio.to_thread(ctx.drive.delete_file, row.source_drive_file_id)
+        if row.source_drive_sidecar_id:
+            await asyncio.to_thread(ctx.drive.delete_file, row.source_drive_sidecar_id)
+        return True
+    except Exception:
+        log.warning("promoted review source cleanup failed", exc_info=True)
+        return False
 
 
 async def _hold_drive_conflict(
@@ -1277,10 +1391,41 @@ async def _refresh_tag_ui(ctx: Ctx, row: PendingReview) -> None:
         ctx.catalog.update_pending_review(row.id, status_message_id=status_id)
 
 
+async def _run_claimed_action(ctx: Ctx, row: PendingReview, action) -> None:
+    try:
+        await action
+    except Exception:
+        log.exception("pending action failed id=%s phase=%s", row.id, row.phase)
+        ctx.catalog.transition_pending(row.id, "processing", "waiting")
+        refreshed = ctx.catalog.get_pending_review(row.id)
+        if refreshed and refreshed.phase == "tags":
+            await _refresh_tag_ui(ctx, refreshed)
+        elif refreshed and refreshed.phase == "cover":
+            report = _loads(refreshed.source_report_json, {})
+            picker = _cover_picker_meta(report)
+            tags = tagset_from_dict(_loads(refreshed.working_json, {}))
+            await edit_status(
+                ctx,
+                _job_from_pending(refreshed),
+                format_cover_prompt(
+                    str(picker.get("album") or tags.album),
+                    str(picker.get("albumartist") or tags.albumartist or tags.artist),
+                    picker.get("options") or [],
+                    refreshed.file_name,
+                    waiting=picker.get("role") == "follower",
+                ),
+                cover_keyboard(refreshed.id, picker.get("options") or []),
+            )
+        elif refreshed and refreshed.phase == "drive":
+            await edit_status(
+                ctx,
+                _job_from_pending(refreshed),
+                "Action failed. Nothing was discarded; retry or cancel.",
+                conflict_keyboard(refreshed.id),
+            )
+
+
 async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMContext) -> None:
-    if callback.message and callback.message.chat.id != ctx.settings.allowed_chat_id:
-        await callback.answer()
-        return
     action = parse_callback(callback.data)
     if action is None:
         await callback.answer()
@@ -1289,34 +1434,70 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
     if row is None or row.status not in {"waiting", "expiring"}:
         await callback.answer("Already handled.")
         return
+    if callback.message and callback.message.chat.id != row.chat_id:
+        await callback.answer()
+        return
+    if row.chat_id > 0 and callback.from_user:
+        try:
+            member = await ctx.bot.get_chat_member(
+                ctx.settings.allowed_chat_id, callback.from_user.id
+            )
+            raw_status = member.status
+            status = str(getattr(raw_status, "value", raw_status))
+            allowed = status in {"creator", "administrator", "member"} or (
+                status == "restricted" and bool(getattr(member, "is_member", False))
+            )
+        except Exception:
+            allowed = False
+        if not allowed:
+            await callback.answer("Access denied.", show_alert=True)
+            return
     if row.status != "waiting":
         await callback.answer("Expired.")
+        return
+    if not ctx.catalog.claim_pending(row.id, "processing"):
+        await callback.answer("Already handled.")
         return
     await callback.answer()
     log.debug("fsm callback id=%s op=%s field=%s", row.id, action.op, action.field)
 
+    if action.op == "cancel":
+        await state.clear()
+        await cancel_pending(ctx, row)
+        return
     if action.op == "ok":
         await state.clear()
-        await _apply_confirm(ctx, row, kind="library")
+        await _run_claimed_action(
+            ctx, row, _apply_confirm(ctx, row, kind="library")
+        )
         return
     if action.op == "rev":
         await state.clear()
-        await _apply_confirm(ctx, row, kind="review")
+        await _run_claimed_action(
+            ctx, row, _apply_confirm(ctx, row, kind="review")
+        )
         return
     if action.op == "cover" and action.index is not None:
         if row.phase != "cover":
+            ctx.catalog.update_pending_review(row.id, status="waiting")
             return
         await state.clear()
-        await _apply_cover_choice(ctx, row, action.index)
+        await _run_claimed_action(
+            ctx, row, _apply_cover_choice(ctx, row, action.index)
+        )
         return
     if action.op == "cand" and action.index is not None:
         await state.clear()
-        await _apply_candidate(ctx, row, action.index)
+        await _run_claimed_action(
+            ctx, row, _apply_candidate(ctx, row, action.index)
+        )
         return
     if action.op == "toggle" and action.field:
         original, recommended, working, _identity, _report, _cands = _load_pending_state(row)
         working = toggle_working_field(original, recommended, working, action.field)
-        ctx.catalog.update_pending_review(row.id, working_json=_dumps(working))
+        ctx.catalog.update_pending_review(
+            row.id, working_json=_dumps(working), status="waiting"
+        )
         row = ctx.catalog.get_pending_review(row.id)
         if row:
             await _refresh_tag_ui(ctx, row)
@@ -1326,14 +1507,48 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
         original, recommended, _working, _identity, _report, _cands = _load_pending_state(row)
         source = original if action.op == "use_file" else recommended
         working = dict(source)
-        ctx.catalog.update_pending_review(row.id, working_json=_dumps(working))
+        ctx.catalog.update_pending_review(
+            row.id, working_json=_dumps(working), status="waiting"
+        )
         row = ctx.catalog.get_pending_review(row.id)
         if row:
             await _refresh_tag_ui(ctx, row)
         return
     if action.op in {"drive_replace", "drive_keep", "drive_skip"}:
         mapping = {"drive_replace": "replace", "drive_keep": "keep_both", "drive_skip": "skip"}
-        await _apply_drive_choice(ctx, row, mapping[action.op])
+        await _run_claimed_action(
+            ctx, row, _apply_drive_choice(ctx, row, mapping[action.op])
+        )
+        return
+    ctx.catalog.update_pending_review(row.id, status="waiting")
+
+
+async def cancel_pending(ctx: Ctx, row: PendingReview) -> None:
+    report = _loads(row.source_report_json, {})
+    picker = _cover_picker_meta(report)
+    if picker:
+        await _delete_cover_gallery(
+            ctx, row.chat_id, list(picker.get("media_message_ids") or [])
+        )
+        _cleanup_cover_option_files(
+            Path(row.local_path),
+            picker.get("options") or [],
+            str(picker.get("album_key") or ""),
+        )
+    local = Path(row.local_path) if row.local_path else None
+    sidecar = Path(row.sidecar_path) if row.sidecar_path else None
+    unlink_quiet(sidecar)
+    if local and row.local_path:
+        unlink_quiet(local.parent / "manual-cover.jpg")
+    if local and local.is_file():
+        unlink_quiet(local)
+    if local and row.local_path:
+        try:
+            local.parent.rmdir()
+        except OSError:
+            pass
+    ctx.catalog.update_pending_review(row.id, status="cancelled")
+    await edit_status(ctx, _job_from_pending(row), "Cancelled.")
 
 
 async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
@@ -1414,10 +1629,12 @@ async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
 async def _apply_candidate(ctx: Ctx, row: PendingReview, index: int) -> None:
     _original, _recommended, _working, identity, report, candidates = _load_pending_state(row)
     if index < 0 or index >= len(candidates):
+        ctx.catalog.update_pending_review(row.id, status="waiting")
         return
     cand = candidates[index]
     mbid = cand.get("mb_recording_id") if isinstance(cand, dict) else cand.mb_recording_id
     if not mbid:
+        ctx.catalog.update_pending_review(row.id, status="waiting")
         return
     job = _job_from_pending(row)
     await edit_status(ctx, job, "Loading that recording…")
@@ -1436,6 +1653,7 @@ async def _apply_candidate(ctx: Ctx, row: PendingReview, index: int) -> None:
     except Exception:
         log.exception("candidate lookup failed")
         await edit_status(ctx, job, "Could not load that candidate. Try another.")
+        ctx.catalog.update_pending_review(row.id, status="waiting")
         row = ctx.catalog.get_pending_review(row.id)
         if row:
             await _refresh_tag_ui(ctx, row)
@@ -1466,6 +1684,7 @@ async def _apply_candidate(ctx: Ctx, row: PendingReview, index: int) -> None:
         working_json=_dumps(asdict(tags)),
         identity_json=_dumps(asdict(new_identity)),
         source_report_json=_dumps(report),
+        status="waiting",
     )
     row = ctx.catalog.get_pending_review(row.id)
     if row:
@@ -1495,6 +1714,9 @@ async def _apply_drive_choice(ctx: Ctx, row: PendingReview, action: str) -> None
 
 
 async def expire_pending(ctx: Ctx) -> None:
+    for cleanup in ctx.catalog.list_pending_by_status("cleanup_pending"):
+        if await _delete_promoted_review_source(ctx, cleanup):
+            ctx.catalog.update_pending_review(cleanup.id, status="done")
     rows = ctx.catalog.claim_expired_pending()
     if not rows:
         return
@@ -1577,7 +1799,14 @@ async def expire_pending(ctx: Ctx) -> None:
                     track_id=row.track_id,
                 )
             else:
+                local = Path(row.local_path) if row.local_path else None
+                if local:
+                    unlink_quiet(local)
+                    unlink_quiet(local.parent / "manual-cover.jpg")
+                if row.sidecar_path:
+                    unlink_quiet(Path(row.sidecar_path))
                 ctx.catalog.update_pending_review(row.id, status="expired")
+                await edit_status(ctx, job, "Expired after 24 hours. Start again.")
         except Exception:
             log.exception("expire pending id=%s failed", row.id)
             ctx.catalog.update_pending_review(row.id, status="failed")

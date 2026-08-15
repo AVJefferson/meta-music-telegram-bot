@@ -60,6 +60,8 @@ def _row_to_pending(row: sqlite3.Row) -> PendingReview:
         track_id=row["track_id"],
         replace_id=row["replace_id"],
         old_drive_id=row["old_drive_id"],
+        source_drive_file_id=row["source_drive_file_id"],
+        source_drive_sidecar_id=row["source_drive_sidecar_id"],
         created_at=row["created_at"],
         expires_at=row["expires_at"],
     )
@@ -129,12 +131,21 @@ class Catalog:
                   track_id INTEGER,
                   replace_id INTEGER,
                   old_drive_id TEXT,
+                  source_drive_file_id TEXT,
+                  source_drive_sidecar_id TEXT,
                   created_at TEXT NOT NULL,
                   expires_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_reviews(status, expires_at);
                 """
             )
+            columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(pending_reviews)").fetchall()
+            }
+            for name in ("source_drive_file_id", "source_drive_sidecar_id"):
+                if name not in columns:
+                    self._conn.execute(f"ALTER TABLE pending_reviews ADD COLUMN {name} TEXT")
             self._conn.commit()
 
     def upsert_topic(self, thread_id: int, name: str) -> None:
@@ -152,6 +163,16 @@ class Catalog:
                 "SELECT name FROM topics WHERE thread_id=?", (thread_id,)
             ).fetchone()
         return row["name"] if row else None
+
+    def list_topics(self) -> list[tuple[int, str]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT thread_id, name FROM topics ORDER BY name COLLATE NOCASE"
+            ).fetchall()
+        topics = [(int(row["thread_id"]), str(row["name"])) for row in rows]
+        if not any(thread_id == 1 for thread_id, _name in topics):
+            topics.insert(0, (1, "General"))
+        return topics
 
     def find_library_by_mbid(self, mb_recording_id: str) -> TrackRecord | None:
         with self._lock:
@@ -319,9 +340,19 @@ class Catalog:
         track_id: int | None = None,
         replace_id: int | None = None,
         old_drive_id: str | None = None,
+        source_drive_file_id: str | None = None,
+        source_drive_sidecar_id: str | None = None,
         expires_at: str,
     ) -> int:
         with self._lock:
+            if chat_id > 0:
+                active = self._conn.execute(
+                    "SELECT id FROM pending_reviews WHERE chat_id=? AND status IN "
+                    "('waiting', 'queued', 'processing', 'uploading', 'expiring') LIMIT 1",
+                    (chat_id,),
+                ).fetchone()
+                if active:
+                    raise RuntimeError("private chat already has a waiting session")
             cur = self._conn.execute(
                 """
                 INSERT INTO pending_reviews (
@@ -329,9 +360,10 @@ class Catalog:
                     original_json, recommended_json, working_json, candidates_json,
                     identity_json, source_report_json, drive_conflicts_json, drive_root_id,
                     chat_id, thread_id, status_message_id, topic_name, file_name,
-                    track_id, replace_id, old_drive_id, created_at, expires_at
+                    track_id, replace_id, old_drive_id, source_drive_file_id,
+                    source_drive_sidecar_id, created_at, expires_at
                 ) VALUES (
-                    ?, 'waiting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, 'waiting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -356,6 +388,8 @@ class Catalog:
                     track_id,
                     replace_id,
                     old_drive_id,
+                    source_drive_file_id,
+                    source_drive_sidecar_id,
                     _utc_now(),
                     expires_at,
                 ),
@@ -396,6 +430,11 @@ class Catalog:
             "track_id",
             "replace_id",
             "old_drive_id",
+            "source_drive_file_id",
+            "source_drive_sidecar_id",
+            "topic_name",
+            "thread_id",
+            "file_name",
             "expires_at",
         }
         cols = []
@@ -418,6 +457,50 @@ class Catalog:
             rows = self._conn.execute(
                 "SELECT * FROM pending_reviews WHERE status='waiting' AND phase=? ORDER BY id",
                 (phase,),
+            ).fetchall()
+        return [_row_to_pending(row) for row in rows]
+
+    def get_waiting_for_chat(self, chat_id: int) -> PendingReview | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM pending_reviews WHERE chat_id=? AND status='waiting' "
+                "ORDER BY id DESC LIMIT 1",
+                (chat_id,),
+            ).fetchone()
+        return _row_to_pending(row) if row else None
+
+    def get_active_for_chat(self, chat_id: int) -> PendingReview | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM pending_reviews WHERE chat_id=? AND status IN "
+                "('waiting', 'queued', 'processing', 'uploading', 'expiring') "
+                "ORDER BY id DESC LIMIT 1",
+                (chat_id,),
+            ).fetchone()
+        return _row_to_pending(row) if row else None
+
+    def claim_pending(self, pending_id: int, target_status: str) -> bool:
+        return self.transition_pending(pending_id, "waiting", target_status)
+
+    def transition_pending(
+        self, pending_id: int, expected_status: str, target_status: str
+    ) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE pending_reviews SET status=? WHERE id=? AND status=?",
+                (target_status, pending_id, expected_status),
+            )
+            self._conn.commit()
+        return bool(cur.rowcount)
+
+    def list_pending_by_status(self, *statuses: str) -> list[PendingReview]:
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM pending_reviews WHERE status IN ({placeholders}) ORDER BY id",
+                statuses,
             ).fetchall()
         return [_row_to_pending(row) for row in rows]
 

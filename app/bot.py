@@ -21,7 +21,8 @@ from app.drive import DriveClient
 from app.genre import GenreMapper
 from app.identify import MBClient
 from app.models import Ctx, Job
-from app.queue import worker
+from app.private_ui import build_private_router
+from app.queue import recover_interrupted, worker
 from app.review_ui import build_review_router
 from app.util import html_esc
 
@@ -209,6 +210,7 @@ async def main() -> None:
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.middleware(CtxMiddleware(ctx))
+    dp.include_router(build_private_router(jobs))
     dp.include_router(build_router(jobs))
     dp.include_router(build_review_router())
 
@@ -220,6 +222,7 @@ async def main() -> None:
     worker_task = asyncio.create_task(worker("main", jobs, ctx), name="tagger-worker")
     try:
         await wait_for_telegram(bot)
+        await recover_interrupted(ctx, jobs)
         log.info("polling allowed_chat_id=%s", settings.allowed_chat_id)
         await dp.start_polling(bot)
     finally:
