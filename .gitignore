@@ -1,0 +1,13 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite-*
+data/
+.python-version
+.idea/
+.vscode/
+*.log
+*.key.json

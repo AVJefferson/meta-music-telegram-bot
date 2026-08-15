@@ -1,0 +1,122 @@
+# Allowlists for GENRE field. Unknown tags are dropped (Last.fm is noisy).
+# Output order: genres | moods | languages | instruments
+
+genres:
+  - alternative
+  - alternative rock
+  - ambient
+  - blues
+  - bollywood
+  - classical
+  - country
+  - dance
+  - disco
+  - downtempo
+  - edm
+  - electronic
+  - filmi
+  - folk
+  - funk
+  - ghazal
+  - gospel
+  - hip hop
+  - hip-hop
+  - house
+  - indie
+  - indie pop
+  - indie rock
+  - indian classical
+  - indian pop
+  - j-pop
+  - jazz
+  - k-pop
+  - carnatic
+  - hindustani
+  - lo-fi
+  - lofi
+  - metal
+  - opm
+  - pop
+  - pop rock
+  - playback
+  - punk
+  - r&b
+  - rnb
+  - rap
+  - reggae
+  - rock
+  - soul
+  - soundtrack
+  - synthpop
+  - techno
+  - trance
+  - world
+
+moods:
+  - acoustic
+  - angry
+  - chill
+  - dark
+  - emotional
+  - energetic
+  - happy
+  - melancholy
+  - melancholic
+  - party
+  - romantic
+  - sad
+  - upbeat
+  - uplifting
+
+languages:
+  - arabic
+  - bengali
+  - english
+  - french
+  - german
+  - hindi
+  - italian
+  - japanese
+  - kannada
+  - korean
+  - malayalam
+  - marathi
+  - portuguese
+  - punjabi
+  - russian
+  - spanish
+  - tamil
+  - telugu
+  - turkish
+  - urdu
+
+instruments:
+  - instrumental
+  - piano
+  - guitar
+  - acoustic guitar
+  - electric guitar
+  - violin
+  - veena
+  - sitar
+  - tabla
+  - flute
+  - saxophone
+  - drums
+  - synthesizer
+  - orchestra
+  - choir
+
+aliases:
+  rnb: r&b
+  "r and b": r&b
+  "hip hop": hip-hop
+  hiphop: hip-hop
+  lo-fi: lofi
+  "lo fi": lofi
+  playback singing: playback
+  ost: soundtrack
+  "original soundtrack": soundtrack
+  malayalam: malayalam
+  "film": filmi
+  "indian film": filmi

@@ -1,0 +1,1 @@
+"""Telegram FLAC tagger bot."""

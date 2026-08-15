@@ -1,0 +1,251 @@
+from __future__ import annotations
+
+import io
+import logging
+
+import httpx
+from PIL import Image
+
+from app.genre import GenreMapper
+from app.models import Enrichment, Identity
+from app.util import is_synced_lrc
+
+log = logging.getLogger(__name__)
+
+MAX_COVER_BYTES = 2_000_000
+MAX_COVER_PX = 1400
+
+
+def _fit_cover(data: bytes) -> tuple[bytes, str]:
+    image = Image.open(io.BytesIO(data))
+    image = image.convert("RGB")
+    image.thumbnail((MAX_COVER_PX, MAX_COVER_PX))
+    quality = 90
+    buf = io.BytesIO()
+    while quality >= 65:
+        buf.seek(0)
+        buf.truncate()
+        image.save(buf, format="JPEG", quality=quality, optimize=True)
+        if buf.tell() <= MAX_COVER_BYTES:
+            return buf.getvalue(), "image/jpeg"
+        quality -= 5
+    return buf.getvalue(), "image/jpeg"
+
+
+async def _download_cover(http: httpx.AsyncClient, url: str) -> tuple[bytes, str] | None:
+    try:
+        response = await http.get(url, follow_redirects=True, timeout=45.0)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        log.debug("cover download failed %s: %s", url, exc)
+        return None
+    data = response.content
+    if not data:
+        return None
+    mime = response.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+    if len(data) > MAX_COVER_BYTES or mime not in {"image/jpeg", "image/png", "image/webp"}:
+        try:
+            return _fit_cover(data)
+        except Exception:
+            log.debug("cover resize failed")
+            return None
+    if mime != "image/jpeg":
+        try:
+            return _fit_cover(data)
+        except Exception:
+            return data, mime
+    return data, mime
+
+
+async def _cover_from_caa(http: httpx.AsyncClient, identity: Identity) -> tuple[bytes, str] | None:
+    for kind, mbid in (
+        ("release", identity.mb_release_id),
+        ("release-group", identity.mb_release_group_id),
+    ):
+        if not mbid:
+            continue
+        url = f"https://coverartarchive.org/{kind}/{mbid}"
+        try:
+            response = await http.get(url, follow_redirects=True, timeout=30.0)
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.HTTPError:
+            continue
+        images = payload.get("images") or []
+        fronts = [img for img in images if img.get("front")] or images
+        if not fronts:
+            continue
+        image = fronts[0]
+        thumbs = image.get("thumbnails") or {}
+        for key in ("1200", "large", "500", "small"):
+            thumb = thumbs.get(key)
+            if thumb:
+                got = await _download_cover(http, thumb)
+                if got:
+                    return got
+        original = image.get("image")
+        if original:
+            got = await _download_cover(http, original)
+            if got:
+                return got
+    return None
+
+
+async def _cover_from_itunes(http: httpx.AsyncClient, identity: Identity) -> tuple[bytes, str] | None:
+    term = " ".join(p for p in [identity.artists[0] if identity.artists else "", identity.title] if p)
+    if not term:
+        return None
+    url = "https://itunes.apple.com/search"
+    try:
+        response = await http.get(
+            url,
+            params={"term": term, "entity": "song", "limit": 5},
+            timeout=20.0,
+        )
+        response.raise_for_status()
+        results = response.json().get("results") or []
+    except httpx.HTTPError:
+        return None
+    title_cf = identity.title.casefold()
+    for item in results:
+        track = str(item.get("trackName") or "").casefold()
+        if title_cf and title_cf not in track and track not in title_cf:
+            continue
+        art = item.get("artworkUrl100") or item.get("artworkUrl60")
+        if not art:
+            continue
+        for size in ("1200x1200bb", "600x600bb"):
+            candidate = art.replace("100x100bb", size).replace("60x60bb", size)
+            got = await _download_cover(http, candidate)
+            if got:
+                return got
+    return None
+
+
+async def _itunes_genre(http: httpx.AsyncClient, identity: Identity) -> str | None:
+    term = " ".join(p for p in [identity.artists[0] if identity.artists else "", identity.title] if p)
+    if not term:
+        return None
+    try:
+        response = await http.get(
+            "https://itunes.apple.com/search",
+            params={"term": term, "entity": "song", "limit": 5},
+            timeout=20.0,
+        )
+        response.raise_for_status()
+        results = response.json().get("results") or []
+    except httpx.HTTPError:
+        return None
+    title_cf = identity.title.casefold()
+    for item in results:
+        track = str(item.get("trackName") or "").casefold()
+        if title_cf and title_cf not in track and track not in title_cf:
+            continue
+        genre = item.get("primaryGenreName")
+        if genre:
+            return str(genre)
+    if results and results[0].get("primaryGenreName"):
+        return str(results[0]["primaryGenreName"])
+    return None
+
+
+async def _lastfm_tags(http: httpx.AsyncClient, api_key: str, identity: Identity) -> list[str]:
+    if not api_key or not identity.title or not identity.artists:
+        return []
+    try:
+        response = await http.get(
+            "https://ws.audioscrobbler.com/2.0/",
+            params={
+                "method": "track.gettoptags",
+                "artist": identity.artists[0],
+                "track": identity.title,
+                "api_key": api_key,
+                "format": "json",
+            },
+            timeout=20.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPError:
+        return []
+    tags = ((payload.get("toptags") or {}).get("tag")) or []
+    out: list[str] = []
+    for tag in tags[:15]:
+        name = tag.get("name") if isinstance(tag, dict) else None
+        try:
+            count = int(tag.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if name and count >= 2:
+            out.append(str(name))
+    return out
+
+
+async def _lrclib(http: httpx.AsyncClient, identity: Identity) -> tuple[str | None, bool]:
+    if not identity.title or not identity.artists:
+        return None, False
+    params = {
+        "track_name": identity.title,
+        "artist_name": identity.artists[0],
+    }
+    if identity.album:
+        params["album_name"] = identity.album
+    if identity.duration:
+        params["duration"] = str(int(round(identity.duration)))
+    try:
+        response = await http.get("https://lrclib.net/api/get", params=params, timeout=20.0)
+        if response.status_code == 404:
+            response = await http.get(
+                "https://lrclib.net/api/search",
+                params={"track_name": identity.title, "artist_name": identity.artists[0]},
+                timeout=20.0,
+            )
+            response.raise_for_status()
+            results = response.json() or []
+            payload = results[0] if results else None
+        else:
+            response.raise_for_status()
+            payload = response.json()
+    except httpx.HTTPError:
+        return None, False
+    if not payload:
+        return None, False
+    if payload.get("instrumental"):
+        return None, True
+    synced = payload.get("syncedLyrics")
+    if is_synced_lrc(synced):
+        return synced, False
+    return None, False
+
+
+async def enrich(
+    http: httpx.AsyncClient,
+    identity: Identity,
+    genre: GenreMapper,
+    lastfm_api_key: str,
+    topic_language: str | None,
+) -> Enrichment:
+    cover = await _cover_from_caa(http, identity)
+    if cover is None:
+        cover = await _cover_from_itunes(http, identity)
+
+    lyrics, instrumental = await _lrclib(http, identity)
+    extra_tags = list(identity.raw_genre_tags)
+    itunes_genre = await _itunes_genre(http, identity)
+    if itunes_genre:
+        extra_tags.insert(0, itunes_genre)
+    extra_tags.extend(await _lastfm_tags(http, lastfm_api_key, identity))
+    if instrumental:
+        extra_tags.append("Instrumental")
+
+    genre_str = genre.classify(extra_tags, extra_language=topic_language)
+    cover_bytes, cover_mime = cover if cover else (None, None)
+    return Enrichment(
+        cover=cover_bytes,
+        cover_mime=cover_mime,
+        lyrics=lyrics,
+        genre=genre_str,
+        instrumental=instrumental,
+    )
