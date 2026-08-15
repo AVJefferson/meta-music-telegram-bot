@@ -155,7 +155,7 @@ async def main() -> None:
         path.mkdir(parents=True, exist_ok=True)
 
     catalog = Catalog(settings.state_db)
-    drive = DriveClient(settings.google_service_account_json)
+    drive = DriveClient.from_settings(settings)
     drive.assert_folders(
         {
             "GDRIVE_FOLDER_ID": settings.gdrive_folder_id,

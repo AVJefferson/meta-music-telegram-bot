@@ -17,7 +17,12 @@ class Settings(BaseSettings):
     musicbrainz_user_agent: str = "telegram-music-bot/1.0 (unknown@example.com)"
     lastfm_api_key: str = ""
 
-    google_service_account_json: str
+    # Personal Drive (OAuth). Preferred — files use YOUR quota.
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_refresh_token: str = ""
+    # Optional: Shared Drive only. Personal My Drive rejects service-account uploads.
+    google_service_account_json: str = ""
     gdrive_folder_id: str
     gdrive_review_folder_id: str
 

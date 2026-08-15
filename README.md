@@ -13,12 +13,17 @@ Audio is never re-encoded. FLAC uses Vorbis comments (not ID3).
 3. Free [AcoustID application key](https://acoustid.org/new-application)
 4. MusicBrainz user-agent with a real contact email
 5. Optional free [Last.fm API key](https://www.last.fm/api/account/create)
-6. Google Cloud project
+6. Google Cloud project (personal Drive)
    - Enable **Google Drive API**
-   - Create a **service account**, download the JSON key
-   - Compact it: `jq -c . path/to/key.json`
-   - Share your music folder and a `review` folder with the service account `client_email` as **Editor**
-   - Folder IDs are the last segment of `https://drive.google.com/drive/folders/<ID>`
+   - OAuth consent: **External**, test user = your Gmail
+   - Scopes to add: `drive.file` and `userinfo.email` (not full `drive` — that needs Google verification)
+   - Credentials → OAuth client ID → **Desktop app**
+   - Put `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` in `.env`
+   - Run `python -m app.drive_auth` (or `--manual`)
+   - Paste printed `GOOGLE_REFRESH_TOKEN`, `GDRIVE_FOLDER_ID`, `GDRIVE_REVIEW_FOLDER_ID`
+   - Script creates **Telegram Music** and **Telegram Music Review**. Move them into your Music folder in Drive if you want; bot keeps access
+   - Old folder IDs from before this app **will not work** (`drive.file` cannot see them)
+   - Do **not** use a service account for personal My Drive
 
 ## Configure
 
@@ -26,15 +31,9 @@ Audio is never re-encoded. FLAC uses Vorbis comments (not ID3).
 cp .env.example .env
 ```
 
-Paste secrets into `.env`. Wrap the service-account JSON in single quotes:
+Paste secrets into `.env`. Service-account JSON is optional (Shared Drive only).
 
-```env
-GOOGLE_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
-```
-
-Or set it to a file path mounted into the container.
-
-Get `ALLOWED_CHAT_ID` by adding the bot and sending `/chatid` in the group. Forum General topic is usually `ALERT_THREAD_ID=1`.
+Get `ALLOWED_CHAT_ID` by adding the bot and sending `/chatid` in the group. Forum General topic is usually `ALERT_THREAD_ID=1`. OAuth apps in **Testing** can expire the refresh token after ~7 days — re-run `python -m app.drive_auth` if uploads start failing with invalid_grant.
 
 ## Run
 

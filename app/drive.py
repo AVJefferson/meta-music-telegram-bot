@@ -1,57 +1,99 @@
 from __future__ import annotations
 
-import json
 import logging
 import time
 from pathlib import Path
 
-from google.oauth2 import service_account
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
-log = logging.getLogger(__name__)
+from app.config import Settings
+from app.drive_scopes import DRIVE_SCOPE
 
-DRIVE_SCOPE = ["https://www.googleapis.com/auth/drive"]
+log = logging.getLogger(__name__)
 FOLDER_MIME = "application/vnd.google-apps.folder"
 _NO_RETRY_STATUS = {400, 401, 403, 404}
 
 
 class DriveAccessError(RuntimeError):
-    """Folder missing or not shared with the service account."""
+    """Folder missing, wrong auth, or Drive rejected the upload."""
 
 
-def _load_sa_info(raw: str) -> dict:
-    raw = raw.strip()
-    if raw.startswith("{"):
-        return json.loads(raw)
-    path = Path(raw)
-    if path.is_file():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return json.loads(raw)
+def _oauth_email(creds: Credentials) -> str:
+    try:
+        info = build("oauth2", "v2", credentials=creds, cache_discovery=False).userinfo().get().execute()
+        return str(info.get("email") or "oauth-user")
+    except Exception:
+        log.debug("oauth2 userinfo failed", exc_info=True)
+        return "oauth-user"
 
 
 def _escape_query(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
+def _quota_error(exc: HttpError) -> bool:
+    text = str(exc)
+    return exc.resp.status == 403 and (
+        "storageQuotaExceeded" in text or "Service Accounts do not have storage quota" in text
+    )
+
+
 class DriveClient:
-    def __init__(self, service_account_json: str) -> None:
-        info = _load_sa_info(service_account_json)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=DRIVE_SCOPE)
-        self.email = info.get("client_email") or getattr(creds, "service_account_email", "")
+    def __init__(self, creds, *, email: str) -> None:
+        self.email = email
+        self._creds = creds
         self._service = build("drive", "v3", credentials=creds, cache_discovery=False)
         self._folder_cache: dict[tuple[str, str], str] = {}
 
+    @classmethod
+    def from_settings(cls, settings: Settings) -> DriveClient:
+        if (
+            settings.google_refresh_token
+            and settings.google_client_id
+            and settings.google_client_secret
+        ):
+            creds = Credentials(
+                token=None,
+                refresh_token=settings.google_refresh_token,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=settings.google_client_id,
+                client_secret=settings.google_client_secret,
+                scopes=DRIVE_SCOPE,
+            )
+            creds.refresh(Request())
+            email = _oauth_email(creds)
+            log.info("drive auth=oauth drive.file user=%s", email)
+            return cls(creds, email=email)
+        if settings.google_service_account_json:
+            raise DriveAccessError(
+                "Service accounts cannot upload to personal My Drive (0 quota). "
+                "Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN "
+                "and run: python -m app.drive_auth"
+            )
+        raise DriveAccessError(
+            "No Drive credentials. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, "
+            "GOOGLE_REFRESH_TOKEN (python -m app.drive_auth)."
+        )
+
     def _wrap_http_error(self, exc: HttpError, folder_id: str | None = None) -> Exception:
+        if _quota_error(exc):
+            return DriveAccessError(
+                "Service accounts have 0 My Drive quota. Upload as your Google user: "
+                "set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN "
+                "(python -m app.drive_auth)."
+            )
         if exc.resp.status != 404:
             return exc
         where = f" id={folder_id}" if folder_id else ""
         return DriveAccessError(
-            f"Drive folder{where} not visible to {self.email}. "
-            f"Share that folder with {self.email} as Editor "
-            f"(Shared Drive: add the service account as a member). "
-            f"Google returns 404 when the account has no access."
+            f"Drive folder{where} not visible with drive.file scope. "
+            f"That scope only sees folders this app created. "
+            f"Run `python -m app.drive_auth` and paste the printed GDRIVE_* IDs. "
+            f"You can then move those folders into Music in the Drive UI."
         )
 
     def assert_folders(self, folders: dict[str, str]) -> None:
@@ -71,6 +113,39 @@ class DriveClient:
             except HttpError as exc:
                 raise self._wrap_http_error(exc, folder_id) from exc
             log.info("drive %s ok name=%s", label, meta.get("name"))
+
+    def create_folder(self, name: str, parent_id: str | None = None) -> tuple[str, str | None]:
+        body: dict = {"name": name, "mimeType": FOLDER_MIME}
+        if parent_id:
+            body["parents"] = [parent_id]
+        meta = (
+            self._service.files()
+            .create(body=body, fields="id,name,webViewLink", supportsAllDrives=True)
+            .execute()
+        )
+        return meta["id"], meta.get("webViewLink")
+
+    def ensure_named_folder(self, name: str) -> tuple[str, str | None]:
+        query = (
+            f"name = '{_escape_query(name)}' and mimeType = '{FOLDER_MIME}' "
+            f"and trashed = false"
+        )
+        resp = (
+            self._service.files()
+            .list(
+                q=query,
+                spaces="drive",
+                fields="files(id, name, webViewLink)",
+                pageSize=5,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
+        files = resp.get("files") or []
+        if files:
+            return files[0]["id"], files[0].get("webViewLink")
+        return self.create_folder(name)
 
     def file_exists(self, file_id: str) -> bool:
         try:
@@ -128,7 +203,7 @@ class DriveClient:
                 raise
             except HttpError as exc:
                 last = self._wrap_http_error(exc, root_folder_id)
-                if exc.resp.status in _NO_RETRY_STATUS:
+                if exc.resp.status in _NO_RETRY_STATUS or isinstance(last, DriveAccessError):
                     raise last from exc
                 log.warning("drive upload attempt %s failed: %s", i + 1, exc)
             except Exception as exc:  # noqa: BLE001 — retry then surface
