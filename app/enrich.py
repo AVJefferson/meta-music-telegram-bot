@@ -329,7 +329,7 @@ async def _lrclib(http: httpx.AsyncClient, identity: Identity) -> tuple[str | No
     if identity.album:
         params["album_name"] = identity.album
     if identity.duration:
-        params["duration"] = str(int(round(identity.duration)))
+        params["duration"] = str(round(identity.duration))
     try:
         response = await http.get("https://lrclib.net/api/get", params=params, timeout=20.0)
         if response.status_code == 404:

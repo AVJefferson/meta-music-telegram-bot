@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -64,6 +65,10 @@ class CtxMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+def intake_expires_at() -> str:
+    return (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(timespec="seconds")
+
+
 def is_flac_message(message: Message) -> bool:
     doc = message.document
     if doc:
@@ -120,12 +125,16 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
 
     @router.message(F.forum_topic_created)
     async def topic_created(message: Message, ctx: Ctx) -> None:
+        if message.chat.id != ctx.settings.allowed_chat_id:
+            return
         created = message.forum_topic_created
         if created and message.message_thread_id:
             ctx.catalog.upsert_topic(message.message_thread_id, created.name)
 
     @router.message(F.forum_topic_edited)
     async def topic_edited(message: Message, ctx: Ctx) -> None:
+        if message.chat.id != ctx.settings.allowed_chat_id:
+            return
         edited = message.forum_topic_edited
         if edited and edited.name and message.message_thread_id:
             ctx.catalog.upsert_topic(message.message_thread_id, edited.name)
@@ -145,6 +154,29 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
             status_id = status.message_id
         except Exception as exc:
             log.warning("queue reply failed: %s", exc)
+        # Recorded before enqueueing so a restart re-drives the job instead of
+        # leaving a permanently stale "Queued…" message.
+        pending_id = ctx.catalog.insert_pending_review(
+            phase="intake",
+            status="queued",
+            local_path="",
+            sidecar_path=None,
+            relative_path=None,
+            kind="library",
+            original_json="{}",
+            recommended_json="{}",
+            working_json="{}",
+            candidates_json="[]",
+            identity_json="{}",
+            source_report_json="{}",
+            chat_id=message.chat.id,
+            thread_id=thread_id,
+            status_message_id=status_id,
+            topic_name=topic_name,
+            file_name=file_name,
+            telegram_file_id=file_id,
+            expires_at=intake_expires_at(),
+        )
         await jobs.put(
             Job(
                 chat_id=message.chat.id,
@@ -153,6 +185,7 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
                 file_id=file_id,
                 file_name=file_name,
                 status_message_id=status_id,
+                source_pending_id=pending_id,
             )
         )
 
@@ -232,6 +265,7 @@ async def main() -> None:
         scheduler.shutdown(wait=False)
         await http.aclose()
         await bot.session.close()
+        catalog.close()
 
 
 if __name__ == "__main__":

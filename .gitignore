@@ -7,7 +7,9 @@ __pycache__/
 *.sqlite-*
 data/
 .python-version
+.ruff_cache/
 .idea/
 .vscode/
 *.log
 *.key.json
+*.pem

@@ -58,6 +58,20 @@ def html_esc(value: object) -> str:
     return html.escape(str(value), quote=False)
 
 
+def safe_link(value: object) -> str:
+    """Escape a URL for use inside an href attribute, or return "" if unusable.
+
+    Cover art URLs come from iTunes and Cover Art Archive, so quotes must be
+    escaped as well to keep them inside the attribute.
+    """
+    url = str(value or "").strip()
+    if not url or "\n" in url or "\r" in url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        return ""
+    return html.escape(url, quote=True)
+
+
 def year_from_date(value: str | None) -> str:
     if not value:
         return ""

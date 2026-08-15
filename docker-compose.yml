@@ -1,3 +1,9 @@
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   telegram-bot-api:
     image: aiogram/telegram-bot-api:latest
@@ -10,6 +16,20 @@ services:
       - bot-api-data:/var/lib/telegram-bot-api
     expose:
       - "8081"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Server starts as root and drops to its own uid, so it keeps the id-change caps.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    pids_limit: 512
+    mem_limit: 1g
+    logging: *logging
 
   bot:
     build: .
@@ -22,23 +42,82 @@ services:
       - bot-data:/data
     depends_on:
       - telegram-bot-api
+    # Entrypoint fixes volume ownership as root, then drops to APP_UID.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    pids_limit: 512
+    mem_limit: 2g
+    logging: *logging
+    healthcheck:
+      test: ["CMD-SHELL", "test -d /data/library && test -d /data/review && test -d /data/covers"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
 
   ftp:
     build: ./ftp
     restart: unless-stopped
-    env_file: .env
+    # Only FTP settings — never the whole .env. This container is the one exposed
+    # to the network; it must not see BOT_TOKEN or the Google credentials.
     environment:
       FTP_ROOT: /data
+      FTP_USER: ${FTP_USER}
+      FTP_PASSWORD: ${FTP_PASSWORD}
+      FTP_PASV_ADDRESS: ${FTP_PASV_ADDRESS}
       FTP_PASV_MIN_PORT: ${FTP_PASV_MIN_PORT:-21100}
       FTP_PASV_MAX_PORT: ${FTP_PASV_MAX_PORT:-21110}
+    # Subpath mounts, so state.sqlite, pending/ and tmp/ are not present in this
+    # container at all. Requires the directories to exist: bot creates them at
+    # startup, hence the service_healthy dependency below.
     volumes:
-      - bot-data:/data:ro
+      - type: volume
+        source: bot-data
+        target: /data/library
+        read_only: true
+        volume:
+          subpath: library
+      - type: volume
+        source: bot-data
+        target: /data/review
+        read_only: true
+        volume:
+          subpath: review
+      - type: volume
+        source: bot-data
+        target: /data/covers
+        read_only: true
+        volume:
+          subpath: covers
       - ftp-certs:/etc/vsftpd/ssl
     ports:
       - "21:21"
       - "${FTP_PASV_MIN_PORT:-21100}-${FTP_PASV_MAX_PORT:-21110}:${FTP_PASV_MIN_PORT:-21100}-${FTP_PASV_MAX_PORT:-21110}"
     depends_on:
-      - bot
+      bot:
+        condition: service_healthy
+    # No no-new-privileges here: PAM may fall back to the setuid unix_chkpwd helper.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - NET_BIND_SERVICE
+      - SETGID
+      - SETUID
+      - SYS_CHROOT
+    pids_limit: 256
+    mem_limit: 512m
+    logging: *logging
 
 volumes:
   bot-api-data:

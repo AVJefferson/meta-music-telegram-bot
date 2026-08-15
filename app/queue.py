@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import shutil
@@ -13,6 +14,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, InputMediaPhoto
 
+from app.botapi import discard_download
 from app.cleanup import alert_general
 from app.covers import (
     CoverHit,
@@ -29,6 +31,7 @@ from app.covers import (
 from app.enrich import enrich
 from app.identify import identify_file, identity_from_mbid
 from app.library import library_relative, place_file, review_relative, unlink_quiet, write_sidecar
+from app.membership import is_forum_member
 from app.models import (
     Ctx,
     Identity,
@@ -53,7 +56,7 @@ from app.review_ui import (
 )
 from app.songlog import apply_chosen, merge_enrichment, render_songlog, seed_report
 from app.tags import hints_to_tagset, identity_to_tags, read_cover, read_hints, write_tags
-from app.util import html_esc, sanitize_filename
+from app.util import html_esc, safe_link, sanitize_filename
 
 log = logging.getLogger(__name__)
 
@@ -157,18 +160,14 @@ async def worker(name: str, queue: asyncio.Queue[Job], ctx: Ctx) -> None:
                 if job.local_path:
                     source = Path(job.local_path)
                     unlink_quiet(source)
-                    try:
+                    with contextlib.suppress(OSError):
                         source.parent.rmdir()
-                    except OSError:
-                        pass
         except Exception:
             log.exception("job failed for %s", job.file_name)
             if job.source_pending_id:
                 ctx.catalog.update_pending_review(job.source_pending_id, status="failed")
-            try:
+            with contextlib.suppress(Exception):
                 await edit_status(ctx, job, f"Failed processing <code>{html_esc(job.file_name)}</code>. Check logs.")
-            except Exception:
-                pass
         finally:
             queue.task_done()
 
@@ -199,15 +198,45 @@ async def recover_interrupted(ctx: Ctx, jobs: asyncio.Queue[Job]) -> None:
                     )
                 )
                 continue
+            if row.phase == "intake" and row.status in {"queued", "processing"}:
+                if not row.telegram_file_id:
+                    log.warning("intake row id=%s has no file id, dropping", row.id)
+                    ctx.catalog.update_pending_review(row.id, status="failed")
+                    continue
+                ctx.catalog.update_pending_review(row.id, status="queued")
+                await jobs.put(
+                    Job(
+                        chat_id=row.chat_id,
+                        thread_id=row.thread_id,
+                        topic_name=row.topic_name,
+                        file_id=row.telegram_file_id,
+                        file_name=row.file_name,
+                        status_message_id=row.status_message_id,
+                        source_pending_id=row.id,
+                    )
+                )
+                log.info("re-queued interrupted group job id=%s file=%s", row.id, row.file_name)
+                continue
             if row.status == "uploading":
                 ctx.catalog.update_pending_review(row.id, status="waiting", phase="drive")
                 refreshed = ctx.catalog.get_pending_review(row.id)
                 if refreshed:
                     await _apply_drive_choice(ctx, refreshed, "replace")
                 continue
+            if row.phase == "cover" and row.status in {"queued", "processing"}:
+                ctx.catalog.update_pending_review(row.id, status="waiting")
+                continue
             ctx.catalog.update_pending_review(row.id, status="waiting")
         except Exception:
             log.exception("pending recovery failed id=%s status=%s", row.id, row.status)
+    # Waiting cover rows keep their buttons, but a crash after posting photos
+    # can leave a gallery with no recorded ids. Drop what we know about and
+    # fall back to preview links so a restart does not post another 10 photos.
+    for row in ctx.catalog.list_waiting_by_phase("cover"):
+        try:
+            await _restore_cover_prompt(ctx, row)
+        except Exception:
+            log.exception("cover prompt restore failed id=%s", row.id)
 
 
 def _build_report(hints: TagHints, identity: Identity, enrichment, tags: TagSet) -> dict:
@@ -228,6 +257,7 @@ async def process_job(job: Job, ctx: Ctx) -> None:
         else:
             file = await ctx.bot.get_file(job.file_id)
             await ctx.bot.download(file, destination=tmp)
+            await asyncio.to_thread(discard_download, file.file_path)
 
         hints = await asyncio.to_thread(read_hints, tmp, job.file_name)
         file_cover = await asyncio.to_thread(read_cover, tmp)
@@ -246,7 +276,9 @@ async def process_job(job: Job, ctx: Ctx) -> None:
         if not tags.title:
             tags.title = Path(job.file_name).stem
 
-        await asyncio.to_thread(write_tags, tmp, tags, file_cover[0], file_cover[1])
+        # No tag write here: every path out of this function either writes tags
+        # itself (cover resolution, review confirm, expiry) or discards the file.
+        # Writing now would only add a full mutagen rewrite of a large FLAC.
         report = _build_report(hints, identity, enrichment, tags)
 
         if identity.confidence == "high" and identity.mb_recording_id:
@@ -412,8 +444,10 @@ async def _apply_resolved_cover(
     report: dict,
     hit: CoverHit,
 ) -> None:
+    # Writes unconditionally: for library commits that never pause for a cover
+    # pick, this is the one and only tag write before upload.
+    await _embed_cover(local, tags, hit.data, hit.mime)
     if hit.data:
-        await _embed_cover(local, tags, hit.data, hit.mime)
         _set_cover_report(report, hit.source, hit.caa_release)
 
 
@@ -447,22 +481,10 @@ def _read_cover_option(local: Path, option: dict) -> tuple[bytes, str, str, str 
     return data, "image/jpeg", source, caa
 
 
-_API_COVER_ROOT = Path("/var/lib/telegram-bot-api/cover-picker")
-
-
-def _cleanup_staged_covers(album_key: str) -> None:
-    if not album_key:
-        return
-    path = _API_COVER_ROOT / album_key
-    if path.is_dir():
-        shutil.rmtree(path, ignore_errors=True)
-
-
-def _cleanup_cover_option_files(local: Path, options: list, album_key: str = "") -> None:
+def _cleanup_cover_option_files(local: Path, options: list) -> None:
     for option in options:
         if isinstance(option, dict):
             unlink_quiet(local.parent / str(option.get("path") or ""))
-    _cleanup_staged_covers(album_key)
 
 
 def _cover_caption(index: int, option: dict, album: str, albumartist: str) -> str:
@@ -536,9 +558,7 @@ async def _send_cover_gallery(
     options: list[dict],
     album: str,
     albumartist: str,
-    album_key: str,
 ) -> list[int]:
-    del album_key
     ready: list[tuple[int, dict, Path]] = []
     for index, option in enumerate(options):
         src = pending_dir / str(option.get("path") or "")
@@ -586,7 +606,6 @@ async def _ensure_leader_gallery(
     leader: PendingReview,
     album: str,
     albumartist: str,
-    album_k: str,
 ) -> list[int]:
     report = _loads(leader.source_report_json, {})
     picker = _cover_picker_meta(report)
@@ -598,7 +617,7 @@ async def _ensure_leader_gallery(
         return []
     job = _job_from_pending(leader)
     media_ids = await _send_cover_gallery(
-        ctx, job, Path(leader.local_path).parent, options, album, albumartist, album_k
+        ctx, job, Path(leader.local_path).parent, options, album, albumartist
     )
     picker["media_message_ids"] = media_ids
     report["cover_picker"] = picker
@@ -616,6 +635,49 @@ async def _delete_cover_gallery(ctx: Ctx, chat_id: int, message_ids: list) -> No
             await ctx.bot.delete_message(chat_id=chat_id, message_id=int(message_id))
         except Exception:
             log.debug("cover gallery delete failed id=%s", message_id)
+
+
+async def _clear_cover_artifacts(ctx: Ctx, row: PendingReview) -> None:
+    """Drop the posted photos and the staged cover-N.jpg files for a pending row."""
+    picker = _cover_picker_meta(_loads(row.source_report_json, {}))
+    if not picker:
+        return
+    await _delete_cover_gallery(ctx, row.chat_id, list(picker.get("media_message_ids") or []))
+    if row.local_path:
+        _cleanup_cover_option_files(Path(row.local_path), picker.get("options") or [])
+
+
+async def _restore_cover_prompt(ctx: Ctx, row: PendingReview) -> None:
+    """Re-render the picker after a restart without posting a new photo gallery.
+
+    Photos already in the topic are deleted when we still have their ids.
+    The status message falls back to preview links so a crash cannot stack
+    another media group on top of the old one.
+    """
+    report = _loads(row.source_report_json, {})
+    picker = _cover_picker_meta(report)
+    await _delete_cover_gallery(ctx, row.chat_id, list(picker.get("media_message_ids") or []))
+    if picker.get("media_message_ids"):
+        picker["media_message_ids"] = []
+        report["cover_picker"] = picker
+        ctx.catalog.update_pending_review(row.id, source_report_json=_dumps(report))
+    tags = tagset_from_dict(_loads(row.working_json, {}))
+    album = str(picker.get("album") or tags.album)
+    albumartist = str(picker.get("albumartist") or tags.albumartist or tags.artist)
+    options = list(picker.get("options") or [])
+    waiting = picker.get("role") != "leader"
+    text = format_cover_prompt(
+        album,
+        albumartist,
+        options,
+        row.file_name,
+        waiting=waiting,
+        rights_warning=not waiting and bool(options),
+    )
+    markup = None if waiting else cover_keyboard(row.id, options)
+    status_id = await edit_status(ctx, _job_from_pending(row), text, markup)
+    if status_id != row.status_message_id:
+        ctx.catalog.update_pending_review(row.id, status_message_id=status_id)
 
 
 def _upsert_cover_pending(
@@ -725,7 +787,7 @@ async def maybe_cover_picker(
         track_id=track_id,
     )
     if leader:
-        await _ensure_leader_gallery(ctx, leader, album, albumartist, album_k)
+        await _ensure_leader_gallery(ctx, leader, album, albumartist)
         dest = await _park_pending_flac(ctx, job, local)
         parked = dict(report)
         parked["cover_picker"] = {
@@ -755,9 +817,9 @@ async def maybe_cover_picker(
     await edit_status(ctx, job, "Fetching album cover options…")
     options = await list_cover_candidates(ctx, ident, cover_tuple)
     if len(options) <= 1:
-        if options:
-            opt = options[0]
-            await _embed_cover(local, tags, opt.data, opt.mime)
+        opt = options[0] if options else None
+        await _embed_cover(local, tags, opt.data if opt else None, opt.mime if opt else None)
+        if opt:
             cache_album_cover(ctx, album, albumartist, opt.data)
             _set_cover_report(report, opt.source, opt.caa_release)
         return False
@@ -778,7 +840,7 @@ async def maybe_cover_picker(
     status_id = await edit_status(ctx, job, text, cover_keyboard(new_id, option_meta))
     ctx.catalog.update_pending_review(new_id, status_message_id=status_id)
     media_ids = await _send_cover_gallery(
-        ctx, job, dest.parent, option_meta, album, albumartist, album_k
+        ctx, job, dest.parent, option_meta, album, albumartist
     )
     parked["cover_picker"]["media_message_ids"] = media_ids
     if not media_ids:
@@ -893,6 +955,7 @@ async def _apply_cover_to_waiter(
     report = _loads(row.source_report_json, {})
     local = Path(row.local_path)
     if not local.exists():
+        await _clear_cover_artifacts(ctx, row)
         ctx.catalog.update_pending_review(row.id, status="failed")
         return
     await _embed_cover(local, working, data, mime)
@@ -912,11 +975,13 @@ async def _apply_cover_choice(ctx: Ctx, row: PendingReview, index: int) -> None:
     local = Path(row.local_path)
     job = _job_from_pending(row)
     if not local.exists():
+        await _clear_cover_artifacts(ctx, row)
         await edit_status(ctx, job, "Local file missing. Cannot continue.")
         ctx.catalog.update_pending_review(row.id, status="failed")
         return
     chosen = _read_cover_option(local, options[index])
     if not chosen:
+        await _clear_cover_artifacts(ctx, row)
         await edit_status(ctx, job, "Cover file missing. Cannot continue.")
         ctx.catalog.update_pending_review(row.id, status="failed")
         return
@@ -928,7 +993,7 @@ async def _apply_cover_choice(ctx: Ctx, row: PendingReview, index: int) -> None:
     cache_album_cover(ctx, album, albumartist, data)
     _set_cover_report(report, source, caa_release)
     await _delete_cover_gallery(ctx, row.chat_id, list(picker.get("media_message_ids") or []))
-    _cleanup_cover_option_files(local, options, str(picker.get("album_key") or ""))
+    _cleanup_cover_option_files(local, options)
     album_k = picker.get("album_key")
     report.pop("cover_picker", None)
     ctx.catalog.update_pending_review(row.id, source_report_json=_dumps(report))
@@ -939,7 +1004,15 @@ async def _apply_cover_choice(ctx: Ctx, row: PendingReview, index: int) -> None:
         other_picker = _cover_picker_meta(_loads(other.source_report_json, {}))
         if other_picker.get("album_key") != album_k:
             continue
-        await _apply_cover_to_waiter(ctx, other, data, mime, source, caa_release)
+        # Claim first: the 15-minute expiry sweep looks at the same waiting rows.
+        if not ctx.catalog.claim_pending(other.id, "processing"):
+            log.info("cover follower id=%s already claimed elsewhere", other.id)
+            continue
+        try:
+            await _apply_cover_to_waiter(ctx, other, data, mime, source, caa_release)
+        except Exception:
+            log.exception("cover follower id=%s failed", other.id)
+            ctx.catalog.transition_pending(other.id, "processing", "waiting")
 
 
 async def _cover_choice_from_pending(
@@ -1171,6 +1244,9 @@ async def _commit_upload(
         )
 
     if pending_id is not None:
+        # Tags and identity are persisted here too: if the process dies mid-upload,
+        # recover_interrupted replays this row and needs the real state, not the
+        # empty JSON an intake row starts with.
         ctx.catalog.update_pending_review(
             pending_id,
             local_path=str(dest),
@@ -1178,6 +1254,10 @@ async def _commit_upload(
             relative_path=relative.as_posix(),
             kind=kind,
             track_id=track_id,
+            working_json=_dumps(asdict(tags)),
+            identity_json=_dumps(asdict(identity)),
+            source_report_json=_dumps(source_report),
+            drive_root_id=root_id,
             status="uploading",
         )
 
@@ -1235,7 +1315,8 @@ async def _commit_upload(
     extra = ""
     if replaced and old_q and new_q:
         extra = f"\nReplaced lower-quality copy ({old_q[0]}/{old_q[1]} → {new_q[0]}/{new_q[1]})."
-    link = f'\nDrive: <a href="{html_esc(url)}">open</a>' if url else ""
+    href = safe_link(url)
+    link = f'\nDrive: <a href="{href}">open</a>' if href else ""
     await edit_status(
         ctx,
         job,
@@ -1439,21 +1520,13 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
     if callback.message and callback.message.chat.id != row.chat_id:
         await callback.answer()
         return
-    if row.chat_id > 0 and callback.from_user:
-        try:
-            member = await ctx.bot.get_chat_member(
-                ctx.settings.allowed_chat_id, callback.from_user.id
-            )
-            raw_status = member.status
-            status = str(getattr(raw_status, "value", raw_status))
-            allowed = status in {"creator", "administrator", "member"} or (
-                status == "restricted" and bool(getattr(member, "is_member", False))
-            )
-        except Exception:
-            allowed = False
-        if not allowed:
-            await callback.answer("Access denied.", show_alert=True)
-            return
+    if (
+        row.chat_id > 0
+        and callback.from_user
+        and not await is_forum_member(ctx, callback.from_user.id)
+    ):
+        await callback.answer("Access denied.", show_alert=True)
+        return
     if row.status != "waiting":
         await callback.answer("Expired.")
         return
@@ -1525,17 +1598,7 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
 
 
 async def cancel_pending(ctx: Ctx, row: PendingReview) -> None:
-    report = _loads(row.source_report_json, {})
-    picker = _cover_picker_meta(report)
-    if picker:
-        await _delete_cover_gallery(
-            ctx, row.chat_id, list(picker.get("media_message_ids") or [])
-        )
-        _cleanup_cover_option_files(
-            Path(row.local_path),
-            picker.get("options") or [],
-            str(picker.get("album_key") or ""),
-        )
+    await _clear_cover_artifacts(ctx, row)
     local = Path(row.local_path) if row.local_path else None
     sidecar = Path(row.sidecar_path) if row.sidecar_path else None
     unlink_quiet(sidecar)
@@ -1544,10 +1607,8 @@ async def cancel_pending(ctx: Ctx, row: PendingReview) -> None:
     if local and local.is_file():
         unlink_quiet(local)
     if local and row.local_path:
-        try:
+        with contextlib.suppress(OSError):
             local.parent.rmdir()
-        except OSError:
-            pass
     ctx.catalog.update_pending_review(row.id, status="cancelled")
     await edit_status(ctx, _job_from_pending(row), "Cancelled.")
 
@@ -1561,7 +1622,10 @@ async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
         ctx.catalog.update_pending_review(row.id, status="failed")
         return
     cover, mime = await asyncio.to_thread(read_cover, local)
-    await asyncio.to_thread(write_tags, local, tags, cover, mime)
+    if kind != "library":
+        # Review uploads go straight to _commit_upload, so they must be written here.
+        # Library uploads are written once by the cover step instead.
+        await asyncio.to_thread(write_tags, local, tags, cover, mime)
     report = apply_chosen(report, tags, identity)
 
     job = _job_from_pending(row)
@@ -1676,7 +1740,8 @@ async def _apply_candidate(ctx: Ctx, row: PendingReview, index: int) -> None:
         cover_source="file" if cover else "none",
     )
     tags = identity_to_tags(new_identity, enrichment)
-    await asyncio.to_thread(write_tags, local, tags, cover, mime)
+    # Not written to disk yet — the file is still under review, and confirm or
+    # expiry will write the final tags.
     report = merge_enrichment(report, enrichment)
     report = apply_chosen(report, tags, new_identity)
     ctx.catalog.update_pending_review(
@@ -1768,15 +1833,13 @@ async def expire_pending(ctx: Ctx) -> None:
                         data,
                     )
                     _set_cover_report(report, source, caa_release)
+                else:
+                    await _embed_cover(local, working, None, None)
                 if picker.get("role") == "leader":
                     await _delete_cover_gallery(
                         ctx, row.chat_id, list(picker.get("media_message_ids") or [])
                     )
-                    _cleanup_cover_option_files(
-                        local,
-                        picker.get("options") or [],
-                        str(picker.get("album_key") or ""),
-                    )
+                    _cleanup_cover_option_files(local, picker.get("options") or [])
                 await edit_status(ctx, job, "Timed out (24h). Using first cover option…")
                 report.pop("cover_picker", None)
                 await _resume_library_after_cover(ctx, row, working, identity, report)

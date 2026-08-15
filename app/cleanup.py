@@ -5,6 +5,7 @@ import logging
 import shutil
 from pathlib import Path
 
+from app.botapi import sweep_downloads
 from app.covers import purge_stale_covers, upload_album_cover_if_missing
 from app.library import rmdir_empty, unlink_quiet
 from app.models import Ctx, TrackRecord
@@ -128,7 +129,26 @@ async def run_cleanup(ctx: Ctx) -> None:
     removed = purge_stale_covers(ctx.settings.covers_root)
     if removed:
         log.info("purged %s stale album cover(s)", removed)
+    leftovers = await asyncio.to_thread(sweep_downloads)
+    if leftovers:
+        log.info("removed %s leftover Bot API download(s)", leftovers)
+    pruned = ctx.catalog.prune_finished_pending()
+    if pruned:
+        log.info("pruned %s finished pending row(s)", pruned)
+    await _prune_drive_review_folders(ctx)
     log.info("weekly cleanup done")
+
+
+async def _prune_drive_review_folders(ctx: Ctx) -> None:
+    try:
+        removed = await asyncio.to_thread(
+            ctx.drive.prune_empty_folders, ctx.settings.gdrive_review_folder_id
+        )
+    except Exception:
+        log.warning("drive review folder prune failed", exc_info=True)
+        return
+    if removed:
+        log.info("removed %s empty Drive review folder(s)", removed)
 
 
 async def run_expire_pending(ctx: Ctx) -> None:

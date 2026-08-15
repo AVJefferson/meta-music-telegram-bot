@@ -1,0 +1,27 @@
+[tool.ruff]
+# Matches the existing style in app/, which favours long descriptive lines.
+line-length = 130
+target-version = "py312"
+exclude = [".venv", "venv", "data"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "W",    # warnings
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "SIM",  # simplify
+    "RUF",
+]
+ignore = [
+    "UP017",  # datetime.timezone.utc is used consistently; the alias is cosmetic
+    "SIM108", # ternaries are not always clearer here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]

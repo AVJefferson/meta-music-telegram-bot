@@ -25,6 +25,8 @@ from aiogram.types import (
 )
 from PIL import Image
 
+from app.botapi import discard_download
+from app.membership import is_forum_member
 from app.models import Ctx, Identity, Job, PendingReview, tagset_from_dict
 from app.tags import audio_info, read_cover, read_tagset, write_tags
 from app.util import format_bytes, html_esc, sanitize_filename
@@ -68,11 +70,6 @@ def _dumps(value: object) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _member_status(member) -> str:
-    status = member.status
-    return str(getattr(status, "value", status))
-
-
 def _next_editor_phase(index: int) -> str:
     next_index = index + 1
     return f"edit:{next_index}" if next_index < len(EDITOR_FIELDS) else "edit:cover"
@@ -101,17 +98,7 @@ def _control_keyboard(
 async def is_authorized_private(message: Message, ctx: Ctx) -> bool:
     if message.chat.type != "private" or not message.from_user:
         return False
-    try:
-        member = await ctx.bot.get_chat_member(
-            ctx.settings.allowed_chat_id, message.from_user.id
-        )
-    except Exception:
-        log.warning("private membership check failed user=%s", message.from_user.id)
-        return False
-    status = _member_status(member)
-    if status in {"creator", "administrator", "member"}:
-        return True
-    return status == "restricted" and bool(getattr(member, "is_member", False))
+    return await is_forum_member(ctx, message.from_user.id)
 
 
 async def _require_private(message: Message, ctx: Ctx) -> bool:
@@ -294,7 +281,11 @@ async def _public_addresses(host: str) -> list[str]:
         return []
     addresses: list[str] = []
     for info in infos:
-        address = ipaddress.ip_address(info[4][0])
+        try:
+            # Strips any IPv6 scope id, which ip_address rejects.
+            address = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+        except ValueError:
+            return []
         if not address.is_global:
             return []
         text = str(address)
@@ -389,10 +380,12 @@ async def _fetch_image(url: str) -> bytes:
     raise ValueError("Too many image redirects.")
 
 
-async def _store_manual_cover(ctx: Ctx, row: PendingReview, data: bytes) -> None:
-    normalized = await asyncio.to_thread(_normalize_image, data)
+async def _store_manual_cover(
+    ctx: Ctx, row: PendingReview, data: bytes, *, normalized: bool = False
+) -> None:
+    payload = data if normalized else await asyncio.to_thread(_normalize_image, data)
     path = Path(row.local_path).parent / "manual-cover.jpg"
-    path.write_bytes(normalized)
+    path.write_bytes(payload)
     report = _loads(row.source_report_json, {})
     report["manual_cover"] = {"mode": "replace", "path": path.name}
     ctx.catalog.update_pending_review(
@@ -581,6 +574,7 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
         try:
             telegram_file = await ctx.bot.get_file(file_id)
             await ctx.bot.download(telegram_file, destination=local)
+            await asyncio.to_thread(discard_download, telegram_file.file_path)
         except Exception:
             shutil.rmtree(pending_dir, ignore_errors=True)
             log.exception("private FLAC download failed")
@@ -629,17 +623,7 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
         if not callback.from_user:
             await callback.answer()
             return
-        try:
-            member = await ctx.bot.get_chat_member(
-                ctx.settings.allowed_chat_id, callback.from_user.id
-            )
-            status = _member_status(member)
-            allowed = status in {"creator", "administrator", "member"} or (
-                status == "restricted" and bool(getattr(member, "is_member", False))
-            )
-        except Exception:
-            allowed = False
-        if not allowed:
+        if not await is_forum_member(ctx, callback.from_user.id):
             await callback.answer("Access denied.", show_alert=True)
             return
         mutates = (
@@ -742,6 +726,7 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
             file = await ctx.bot.get_file(media.file_id)
             buffer = BytesIO()
             await ctx.bot.download(file, destination=buffer)
+            await asyncio.to_thread(discard_download, file.file_path)
             if buffer.tell() > 15 * 1024 * 1024:
                 raise ValueError("Image exceeds 15 MB.")
             await _store_manual_cover(ctx, row, buffer.getvalue())
@@ -783,7 +768,7 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
             elif text.startswith(("http://", "https://")):
                 try:
                     data = await _fetch_image(text.strip())
-                    await _store_manual_cover(ctx, row, data)
+                    await _store_manual_cover(ctx, row, data, normalized=True)
                 except Exception as exc:
                     ctx.catalog.update_pending_review(row.id, status="waiting")
                     await message.reply(f"Could not load image: {html_esc(exc)}", parse_mode="HTML")

@@ -104,6 +104,12 @@ class MBClient:
 
 
 def _score_release(rel: dict) -> int:
+    """Rank a release before deciding which one to fetch in full.
+
+    The recording endpoint's release list carries no release-group ("release-groups"
+    is not a valid include for recordings), so the type bonus only applies to the
+    full releases fetched later. Thin entries are ranked on status and date.
+    """
     score = 0
     status = str(rel.get("status") or "").lower()
     if status == "official":

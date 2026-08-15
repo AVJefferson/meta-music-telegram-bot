@@ -13,7 +13,7 @@ from aiogram.types import (
 )
 
 from app.models import Ctx, TagSet
-from app.util import format_bytes, format_quality, html_esc, same_artist_names
+from app.util import format_bytes, format_quality, html_esc, safe_link, same_artist_names
 
 TG_LIMIT = 4000
 FIELDS: list[tuple[str, str]] = [
@@ -292,9 +292,9 @@ def format_cover_prompt(
     ]
     for index, option in enumerate(options):
         label = html_esc(str(option.get("label") or ""))
-        url = str(option.get("url") or "")
-        if url.startswith("http://") or url.startswith("https://"):
-            lines.append(f'{index + 1}. {label} — <a href="{html_esc(url)}">preview</a>')
+        href = safe_link(option.get("url"))
+        if href:
+            lines.append(f'{index + 1}. {label} — <a href="{href}">preview</a>')
         else:
             lines.append(f"{index + 1}. {label}")
     lines.append("")

@@ -32,9 +32,11 @@ Audio is never re-encoded. FLAC uses Vorbis comments (not ID3).
 cp .env.example .env
 ```
 
-Paste secrets into `.env`. Service-account JSON is optional (Shared Drive only).
+Paste secrets into `.env`. Service accounts are not supported — they have 0 My Drive quota.
 
 Get `ALLOWED_CHAT_ID` by adding the bot and sending `/chatid` in the group. Forum General topic is usually `ALERT_THREAD_ID=1`. OAuth apps in **Testing** can expire the refresh token after ~7 days — re-run `python -m app.drive_auth` if uploads start failing with invalid_grant.
+
+Only `FTP_USER`, `FTP_PASSWORD`, `FTP_PASV_ADDRESS` and the passive port range reach the ftp container. The rest of `.env` stays in the bot container.
 
 ## Run
 
@@ -49,22 +51,69 @@ Data:
 
 - `/data/library` and `/data/review` — staging until weekly cleanup
 - `/data/covers` — album art shortcut, deleted after 7 days
+- `/data/pending` — FLACs parked while waiting on a review, cover pick, or Drive conflict
+- `/data/tmp` — scratch space during tagging, wiped weekly
 - `/data/state.sqlite` — catalog (survives wipes; used for dedup)
 - Drive music folder — library layout `{Language}/{AlbumArtist}/{Album}/{AlbumArtist} - {Track} - {Title}.flac`
 - Drive album folder also stores `cover.jpg`. First library track of an album sends a photo picker (file art, Cover Art Archive fronts, iTunes). Later tracks reuse that pick. Local copy expires after a week.
 - Drive review folder — low-confidence matches plus a `.json` sidecar
 
-Sunday 03:00 UTC (`CLEANUP_CRON`): retry failed uploads, alert General topic if still failing, delete locals that are confirmed on Drive.
+Sunday 03:00 UTC (`CLEANUP_CRON`): retry failed uploads, alert General topic if still failing, delete locals that are confirmed on Drive, sweep leftover Bot API downloads, prune emptied Drive review folders, and drop finished rows older than 30 days.
+
+The local Bot API server keeps every file it downloads. The bot deletes each one right after reading it, and the weekly sweep clears anything a crash left behind. Without that the volume grows by the full size of every FLAC ever posted.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Forum[Forum topic FLAC] --> Intake
+    DM[Private chat FLAC] --> TopicPick[Pick library topic]
+    TopicPick --> Intake
+    Intake[Intake row + queue] --> Identify
+    Identify[fpcalc, AcoustID, MusicBrainz] --> Enrich
+    Enrich[LRCLIB, iTunes, Last.fm, genre map] --> Confidence{Confidence}
+    Confidence -->|high| Dedup{Already in catalog}
+    Confidence -->|low| Review[Tag review or typed editor]
+    Dedup -->|"same or worse quality"| Skip[Skip]
+    Dedup -->|"better or new"| Cover
+    Review -->|confirm| Cover
+    Review -->|send to review| Upload
+    Cover[Cover reuse or picker] --> Upload
+    Upload[Write tags once, then Drive] --> Done[Catalog marked uploaded]
+```
+
+Every pause is a row in `pending_reviews`. `phase` says what the bot is waiting for and `status` says who owns the row:
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued
+    queued --> processing: worker picks it up
+    processing --> waiting: needs a decision
+    waiting --> processing: button pressed
+    waiting --> expiring: 24h sweep
+    expiring --> done
+    processing --> uploading: sending to Drive
+    uploading --> done
+    processing --> failed
+    waiting --> cancelled: Cancel
+    done --> [*]
+    failed --> [*]
+    cancelled --> [*]
+```
+
+Rows in `queued`, `processing` or `uploading` at startup are re-driven by `recover_interrupted`, so a restart mid-job does not lose the file.
 
 ## Library FTPS
 
-Read-only explicit FTPS of `/data` (library, review, covers). Not SFTP.
+Read-only explicit FTPS of `library`, `review` and `covers`. Not SFTP.
+
+Those three are mounted individually, so `state.sqlite` and `pending/` are not present in the ftp container at all.
 
 Set `FTP_USER`, `FTP_PASSWORD`, and `FTP_PASV_ADDRESS` (the IP/DNS clients use to reach this host) in `.env`. The ftp container refuses to start if any of those are empty.
 
-FileZilla: protocol **FTP**, encryption **explicit FTP over TLS**. Trust the self-signed cert on first connect.
+FileZilla: protocol **FTP**, encryption **explicit FTP over TLS**. Trust the self-signed cert on first connect. TLS 1.2 is the floor; very old clients will not connect.
 
-Open **21/tcp** and **21100–21110/tcp** on the host firewall.
+Open **21/tcp** and the `FTP_PASV_MIN_PORT`–`FTP_PASV_MAX_PORT` range (default **21100–21110/tcp**) on the host firewall.
 
 ## Tags written
 
@@ -95,3 +144,38 @@ Current forum members can chat directly with the bot:
 Typed editing asks for title, artist, album, album artist, composer, genre, date, track/disc numbers, lyrics, and album art. Type replacement content directly. `/keep` preserves a value, `/clear` empties it, and `/back` returns to the prior field. Album art accepts a Telegram photo/image document or a public HTTP(S) image URL; `/remove` removes it.
 
 Every private step has a **Cancel** button. Forum tag review, cover selection, and Drive-conflict prompts also have **Cancel**. Cancelling deletes only pending local files. A recalled Drive review remains untouched unless library upload succeeds; successful promotion then removes its review FLAC and JSON sidecar from Drive.
+
+## Development
+
+Tests are stdlib `unittest` and need the runtime dependencies:
+
+```bash
+python -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -t .
+```
+
+Or inside the built image, which already has them:
+
+```bash
+docker compose run --rm --entrypoint python bot -m unittest discover -s tests -t .
+```
+
+Lint with `ruff check .` (config in `pyproject.toml`). Push and pull requests run the same lint + tests on GitHub Actions.
+
+## Troubleshooting
+
+**FTPS login works, then directory listing hangs.** `FTP_PASV_ADDRESS` is wrong or the passive port range is closed. It must be the address the *client* uses, not the container IP.
+
+**ftp container restarts on a fresh install.** It mounts `library`, `review` and `covers` as volume subpaths, which must exist first. The bot creates them at startup and `ftp` waits on the bot's healthcheck, so this resolves itself; if it persists, check that the bot started.
+
+**Uploads fail with `invalid_grant`.** The OAuth refresh token expired — apps left in **Testing** on the consent screen expire it after ~7 days. Re-run `python -m app.drive_auth`.
+
+**Drive folder not visible.** `drive.file` only sees folders this app created. Old folder IDs will not work; run `python -m app.drive_auth --setup-folders` and paste the printed IDs.
+
+**Cover picker shows no images.** The bot lacks permission to send photos in the group. Make it admin or enable Photos and Files, then use the preview links in the meantime.
+
+**Bot API volume growing.** Should not happen anymore, but `docker compose exec bot du -sh /var/lib/telegram-bot-api` confirms it. The weekly cleanup sweeps anything older than a day.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

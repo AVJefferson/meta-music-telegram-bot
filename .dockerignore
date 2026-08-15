@@ -6,5 +6,9 @@ __pycache__
 .env
 data
 *.sqlite
+*.key.json
+*.pem
 README.md
 .cursor
+.github
+tests

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -44,16 +45,12 @@ def rmdir_empty(root: Path) -> None:
         current = Path(dirpath)
         if current == root:
             continue
-        try:
+        with contextlib.suppress(OSError):
             current.rmdir()
-        except OSError:
-            pass
 
 
 def unlink_quiet(path: Path | None) -> None:
     if path is None:
         return
-    try:
+    with contextlib.suppress(OSError):
         path.unlink(missing_ok=True)
-    except OSError:
-        pass

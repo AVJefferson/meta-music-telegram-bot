@@ -21,8 +21,8 @@ if ! grep -qx '/usr/sbin/nologin' /etc/shells; then
     echo '/usr/sbin/nologin' >> /etc/shells
 fi
 
-echo "ftp: waiting for ${FTP_ROOT}"
-until [[ -d "$FTP_ROOT" ]]; do
+echo "ftp: waiting for ${FTP_ROOT} contents"
+until [[ -d "$FTP_ROOT/library" && -d "$FTP_ROOT/review" && -d "$FTP_ROOT/covers" ]]; do
     sleep 1
 done
 
@@ -77,6 +77,7 @@ require_ssl_reuse=NO
 ssl_tlsv1=YES
 ssl_sslv2=NO
 ssl_sslv3=NO
+ssl_ciphers=HIGH:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!EXPORT
 rsa_cert_file=${CERT}
 rsa_private_key_file=${CERT}
 pasv_enable=YES
@@ -85,6 +86,12 @@ pasv_max_port=${FTP_PASV_MAX_PORT}
 pasv_address=${FTP_PASV_ADDRESS}
 pasv_addr_resolve=${PASV_RESOLVE}
 cmds_denied=DELE,RMD,MKD,RNFR,RNTO,APPE,STOR,STOU
+max_login_fails=3
+delay_failed_login=5
+idle_session_timeout=300
+data_connection_timeout=120
+max_clients=10
+max_per_ip=4
 xferlog_enable=YES
 log_ftp_protocol=YES
 vsftpd_log_file=/var/log/vsftpd.log

@@ -84,7 +84,7 @@ def render_songlog(report: dict[str, Any]) -> str:
     bit_depth = report.get("bit_depth") or "?"
     sample_rate = report.get("sample_rate") or "?"
     try:
-        duration_s = f"{int(round(float(duration)))}s"
+        duration_s = f"{round(float(duration))}s"
     except (TypeError, ValueError):
         duration_s = f"{duration}s"
 

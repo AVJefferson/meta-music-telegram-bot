@@ -73,10 +73,7 @@ def _escape_query(value: str) -> str:
 
 
 def _quota_error(exc: HttpError) -> bool:
-    text = str(exc)
-    return exc.resp.status == 403 and (
-        "storageQuotaExceeded" in text or "Service Accounts do not have storage quota" in text
-    )
+    return exc.resp.status == 403 and "storageQuotaExceeded" in str(exc)
 
 
 class DriveClient:
@@ -105,12 +102,6 @@ class DriveClient:
             email = _oauth_email(creds)
             log.info("drive auth=oauth drive.file user=%s", email)
             return cls(creds, email=email)
-        if settings.google_service_account_json:
-            raise DriveAccessError(
-                "Service accounts cannot upload to personal My Drive (0 quota). "
-                "Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN "
-                "and run: python -m app.drive_auth"
-            )
         raise DriveAccessError(
             "No Drive credentials. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, "
             "GOOGLE_REFRESH_TOKEN (python -m app.drive_auth)."
@@ -119,9 +110,8 @@ class DriveClient:
     def _wrap_http_error(self, exc: HttpError, folder_id: str | None = None) -> Exception:
         if _quota_error(exc):
             return DriveAccessError(
-                "Service accounts have 0 My Drive quota. Upload as your Google user: "
-                "set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN "
-                "(python -m app.drive_auth)."
+                f"Google Drive storage quota exceeded for {self.email}. "
+                "Free up space in that account, then retry."
             )
         if exc.resp.status != 404:
             return exc
@@ -163,9 +153,10 @@ class DriveClient:
         return meta["id"], meta.get("webViewLink")
 
     def ensure_named_folder(self, name: str) -> tuple[str, str | None]:
+        # 'me' in owners keeps this from matching a same-named folder shared with you.
         query = (
             f"name = '{_escape_query(name)}' and mimeType = '{FOLDER_MIME}' "
-            f"and trashed = false"
+            f"and trashed = false and 'me' in owners"
         )
         resp = (
             self._service.files()
@@ -208,21 +199,50 @@ class DriveClient:
                 break
         return out
 
+    def find_by_name(
+        self, parent_id: str, name: str, *, folders_only: bool = False
+    ) -> list[DriveChild]:
+        """Look up one name in one folder.
+
+        Much cheaper than listing the whole folder, which is what every name
+        check used to do. Drive name matching is not reliably case-sensitive, so
+        results are filtered again locally.
+        """
+        query = f"name = '{_escape_query(name)}' and '{parent_id}' in parents and trashed = false"
+        if folders_only:
+            query += f" and mimeType = '{FOLDER_MIME}'"
+        resp = (
+            self._service.files()
+            .list(
+                q=query,
+                spaces="drive",
+                fields="files(id, name, mimeType, size, modifiedTime)",
+                pageSize=100,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
+        return [
+            child
+            for child in (_child_from_meta(meta) for meta in resp.get("files") or [])
+            if child.name == name
+        ]
+
     def find_name_conflicts(self, parent_id: str, filename: str) -> list[DriveChild]:
-        hits = [c for c in self.list_children(parent_id) if c.name == filename and not c.is_folder]
+        hits = [c for c in self.find_by_name(parent_id, filename) if not c.is_folder]
         hits.sort(key=lambda c: c.modified or "", reverse=True)
         return hits
 
     def unused_name(self, parent_id: str, filename: str) -> str:
-        names = {c.name for c in self.list_children(parent_id)}
-        if filename not in names:
+        if not self.find_by_name(parent_id, filename):
             return filename
         stem = Path(filename).stem
         suffix = Path(filename).suffix
         n = 2
         while True:
             candidate = f"{stem} ({n}){suffix}"
-            if candidate not in names:
+            if not self.find_by_name(parent_id, candidate):
                 return candidate
             n += 1
 
@@ -262,10 +282,7 @@ class DriveClient:
             if cached:
                 parent = cached
                 continue
-            found = next(
-                (c for c in self.list_children(parent) if c.name == name and c.is_folder),
-                None,
-            )
+            found = next(iter(self.find_by_name(parent, name, folders_only=True)), None)
             if not found:
                 return None
             self._folder_cache[key] = found.id
@@ -409,6 +426,38 @@ class DriveClient:
                 return
             raise
 
+    def prune_empty_folders(self, root_id: str) -> int:
+        """Delete folders under root that hold nothing, deepest first.
+
+        Promotion removes a review FLAC and its sidecar but leaves the dated
+        folder behind, so these accumulate one per day.
+        """
+        removed = 0
+
+        def walk(folder_id: str) -> bool:
+            nonlocal removed
+            children = self.list_children(folder_id)
+            empty = True
+            for child in children:
+                if not child.is_folder:
+                    empty = False
+                    continue
+                if walk(child.id):
+                    self.delete_file(child.id)
+                    self._forget_folder(child.id)
+                    removed += 1
+                else:
+                    empty = False
+            return empty
+
+        walk(root_id)
+        return removed
+
+    def _forget_folder(self, folder_id: str) -> None:
+        for key, value in list(self._folder_cache.items()):
+            if value == folder_id:
+                self._folder_cache.pop(key, None)
+
     def upload_tree(
         self,
         local_file: Path,
@@ -447,7 +496,7 @@ class DriveClient:
                 if exc.resp.status in _NO_RETRY_STATUS or isinstance(last, DriveAccessError):
                     raise last from exc
                 log.warning("drive upload attempt %s failed: %s", i + 1, exc)
-            except Exception as exc:  # noqa: BLE001 — retry then surface
+            except Exception as exc:
                 last = exc
                 log.warning("drive upload attempt %s failed: %s", i + 1, exc)
             time.sleep(2**i)
@@ -459,7 +508,7 @@ class DriveClient:
         cached = self._folder_cache.get(key)
         if cached:
             return cached
-        found = next((c for c in self.list_children(parent_id) if c.name == name and c.is_folder), None)
+        found = next(iter(self.find_by_name(parent_id, name, folders_only=True)), None)
         if found:
             self._folder_cache[key] = found.id
             return found.id

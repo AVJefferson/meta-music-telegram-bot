@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.models import PendingReview, TrackRecord
@@ -62,6 +62,7 @@ def _row_to_pending(row: sqlite3.Row) -> PendingReview:
         old_drive_id=row["old_drive_id"],
         source_drive_file_id=row["source_drive_file_id"],
         source_drive_sidecar_id=row["source_drive_sidecar_id"],
+        telegram_file_id=row["telegram_file_id"],
         created_at=row["created_at"],
         expires_at=row["expires_at"],
     )
@@ -133,17 +134,20 @@ class Catalog:
                   old_drive_id TEXT,
                   source_drive_file_id TEXT,
                   source_drive_sidecar_id TEXT,
+                  telegram_file_id TEXT,
                   created_at TEXT NOT NULL,
                   expires_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_reviews(status, expires_at);
+                CREATE INDEX IF NOT EXISTS idx_pending_chat ON pending_reviews(chat_id, status);
+                CREATE INDEX IF NOT EXISTS idx_pending_phase ON pending_reviews(status, phase);
                 """
             )
             columns = {
                 row["name"]
                 for row in self._conn.execute("PRAGMA table_info(pending_reviews)").fetchall()
             }
-            for name in ("source_drive_file_id", "source_drive_sidecar_id"):
+            for name in ("source_drive_file_id", "source_drive_sidecar_id", "telegram_file_id"):
                 if name not in columns:
                     self._conn.execute(f"ALTER TABLE pending_reviews ADD COLUMN {name} TEXT")
             self._conn.commit()
@@ -320,6 +324,7 @@ class Catalog:
         self,
         *,
         phase: str,
+        status: str = "waiting",
         local_path: str,
         sidecar_path: str | None,
         relative_path: str | None,
@@ -342,6 +347,7 @@ class Catalog:
         old_drive_id: str | None = None,
         source_drive_file_id: str | None = None,
         source_drive_sidecar_id: str | None = None,
+        telegram_file_id: str | None = None,
         expires_at: str,
     ) -> int:
         with self._lock:
@@ -361,13 +367,14 @@ class Catalog:
                     identity_json, source_report_json, drive_conflicts_json, drive_root_id,
                     chat_id, thread_id, status_message_id, topic_name, file_name,
                     track_id, replace_id, old_drive_id, source_drive_file_id,
-                    source_drive_sidecar_id, created_at, expires_at
+                    source_drive_sidecar_id, telegram_file_id, created_at, expires_at
                 ) VALUES (
-                    ?, 'waiting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
                     phase,
+                    status,
                     local_path,
                     sidecar_path,
                     relative_path,
@@ -390,6 +397,7 @@ class Catalog:
                     old_drive_id,
                     source_drive_file_id,
                     source_drive_sidecar_id,
+                    telegram_file_id,
                     _utc_now(),
                     expires_at,
                 ),
@@ -432,6 +440,7 @@ class Catalog:
             "old_drive_id",
             "source_drive_file_id",
             "source_drive_sidecar_id",
+            "telegram_file_id",
             "topic_name",
             "thread_id",
             "file_name",
@@ -521,6 +530,23 @@ class Catalog:
                     claimed.append(_row_to_pending(row))
             self._conn.commit()
         return claimed
+
+    def prune_finished_pending(self, keep_days: int = 30) -> int:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat(
+            timespec="seconds"
+        )
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM pending_reviews WHERE created_at < ? AND status IN "
+                "('done', 'cancelled', 'expired', 'skipped')",
+                (cutoff,),
+            )
+            self._conn.commit()
+        return cur.rowcount or 0
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
 
     def update_quality_and_local(
         self,

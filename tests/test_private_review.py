@@ -7,23 +7,23 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
-from PIL import Image
 from aiogram.enums import ChatMemberStatus
+from PIL import Image
 
 from app.catalog import Catalog
 from app.drive import DriveChild, DriveClient
+from app.membership import member_status
 from app.private_ui import (
     EDITOR_FIELDS,
     _next_editor_phase,
-    _member_status,
     _normalize_image,
-    _public_addresses,
     _previous_editor_phase,
+    _public_addresses,
     _review_keyboard,
     _topic_keyboard,
 )
-from app.review_ui import conflict_keyboard, cover_keyboard, parse_callback, review_keyboard
 from app.queue import _delete_promoted_review_source, recover_interrupted
+from app.review_ui import conflict_keyboard, cover_keyboard, parse_callback, review_keyboard
 
 
 class CatalogSessionTests(unittest.TestCase):
@@ -234,7 +234,7 @@ class UiTests(unittest.TestCase):
 
     def test_membership_enum_normalizes_to_api_value(self) -> None:
         member = SimpleNamespace(status=ChatMemberStatus.MEMBER)
-        self.assertEqual(_member_status(member), "member")
+        self.assertEqual(member_status(member), "member")
 
 
 class UrlSafetyTests(unittest.IsolatedAsyncioTestCase):

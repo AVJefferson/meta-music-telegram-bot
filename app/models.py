@@ -4,7 +4,6 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal
 
-
 Confidence = Literal["high", "low"]
 Kind = Literal["library", "review"]
 
@@ -161,6 +160,7 @@ class PendingReview:
     old_drive_id: str | None
     source_drive_file_id: str | None
     source_drive_sidecar_id: str | None
+    telegram_file_id: str | None
     created_at: str
     expires_at: str
 
