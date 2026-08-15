@@ -18,7 +18,6 @@ from app.enrich import enrich
 from app.identify import identify_file, identity_from_mbid
 from app.library import library_relative, place_file, review_relative, unlink_quiet, write_sidecar
 from app.models import (
-    Candidate,
     Ctx,
     Identity,
     Job,
@@ -258,7 +257,7 @@ async def start_tag_review(
         expires_at=_expires_at(),
     )
     text = format_summary(original, tags, tags, reason=identity.confidence_reason)
-    markup = review_keyboard(pending_id, identity.candidates)
+    markup = review_keyboard(pending_id)
     status_id = await edit_status(ctx, job, text, markup)
     ctx.catalog.update_pending_review(pending_id, status_message_id=status_id)
     log.info("review waiting id=%s file=%s reason=%s", pending_id, job.file_name, identity.confidence_reason)
@@ -649,21 +648,10 @@ def _load_pending_state(row: PendingReview) -> tuple[dict, dict, dict, Identity,
 
 
 async def _refresh_tag_ui(ctx: Ctx, row: PendingReview) -> None:
-    original, recommended, working, identity, _report, candidates = _load_pending_state(row)
+    original, recommended, working, identity, _report, _candidates = _load_pending_state(row)
     job = _job_from_pending(row)
     text = format_summary(original, recommended, working, reason=identity.confidence_reason)
-    cand_objs = [
-        Candidate(
-            mb_recording_id=c.get("mb_recording_id") or "",
-            title=c.get("title") or "",
-            artist=c.get("artist") or "",
-            score=c.get("score"),
-        )
-        if isinstance(c, dict)
-        else c
-        for c in candidates
-    ]
-    status_id = await edit_status(ctx, job, text, review_keyboard(row.id, cand_objs))
+    status_id = await edit_status(ctx, job, text, review_keyboard(row.id))
     if status_id != row.status_message_id:
         ctx.catalog.update_pending_review(row.id, status_message_id=status_id)
 
@@ -711,14 +699,17 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
         status_id = await edit_status(ctx, job, text, field_keyboard(row.id, action.field))
         ctx.catalog.update_pending_review(row.id, status_message_id=status_id)
         return
-    if action.op in {"use_file", "use_rec"} and action.field:
+    if action.op in {"use_file", "use_rec"}:
         await state.clear()
         original, recommended, working, _identity, _report, _cands = _load_pending_state(row)
         source = original if action.op == "use_file" else recommended
-        value = source.get("date") if action.field == "year" else source.get(action.field) or ""
-        if action.field == "year":
-            value = source.get("date") or source.get("year") or ""
-        working = set_field(working, action.field, str(value or ""))
+        if action.field:
+            value = source.get("date") if action.field == "year" else source.get(action.field) or ""
+            if action.field == "year":
+                value = source.get("date") or source.get("year") or ""
+            working = set_field(working, action.field, str(value or ""))
+        else:
+            working = dict(source)
         ctx.catalog.update_pending_review(row.id, working_json=_dumps(working))
         row = ctx.catalog.get_pending_review(row.id)
         if row:

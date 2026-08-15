@@ -14,9 +14,7 @@ from app.util import sanitize_filename
 def library_relative(topic: str, tags: TagSet) -> Path:
     album_artist = sanitize_filename(tags.albumartist or tags.artist or "Unknown Artist")
     album = sanitize_filename(tags.album or "Unknown Album")
-    year = tags.date or "0000"
-    folder = f"{year} - {album}"
-    return Path(sanitize_filename(topic or "General")) / album_artist / folder / build_filename(tags)
+    return Path(sanitize_filename(topic or "General")) / album_artist / album / build_filename(tags)
 
 
 def review_relative(original_name: str) -> Path:

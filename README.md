@@ -48,7 +48,7 @@ Data:
 
 - `/data/library` and `/data/review` — staging until weekly cleanup
 - `/data/state.sqlite` — catalog (survives wipes; used for dedup)
-- Drive music folder — library layout `{Topic}/{AlbumArtist}/{Year} - {Album}/{Track} - {Title}.flac`
+- Drive music folder — library layout `{Language}/{AlbumArtist}/{Album}/{AlbumArtist} - {Track} - {Title}.flac`
 - Drive review folder — low-confidence matches plus a `.json` sidecar
 
 Sunday 03:00 UTC (`CLEANUP_CRON`): retry failed uploads, alert General topic if still failing, delete locals that are confirmed on Drive.

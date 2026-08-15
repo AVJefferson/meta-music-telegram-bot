@@ -14,7 +14,7 @@ from aiogram.types import (
     Message,
 )
 
-from app.models import Candidate, Ctx, TagSet
+from app.models import Ctx, TagSet
 from app.util import format_bytes, format_quality, html_esc
 
 TG_LIMIT = 4000
@@ -27,9 +27,17 @@ FIELDS: list[tuple[str, str]] = [
     ("genre", "Genre"),
     ("year", "Year"),
 ]
+EDIT_FIELDS: list[tuple[str, str]] = [
+    ("title", "Title"),
+    ("artist", "Artist"),
+    ("album", "Album"),
+    ("albumartist", "Album artist"),
+    ("genre", "Genre"),
+    ("year", "Year"),
+]
 FIELD_KEYS = {key for key, _ in FIELDS}
 _CALLBACK = re.compile(
-    r"^p(\d+):(ok|rev|back|dr|dk|ds|c(\d+)|e:([a-z]+)|uf:([a-z]+)|ur:([a-z]+))$"
+    r"^p(\d+):(ok|rev|back|dr|dk|ds|c(\d+)|e:([a-z]+)|uf:([a-z]+)|ur:([a-z]+)|uf|ur)$"
 )
 
 
@@ -65,6 +73,10 @@ def parse_callback(data: str | None) -> PendingAction | None:
         return PendingAction(pending_id, "drive_keep")
     if rest == "ds":
         return PendingAction(pending_id, "drive_skip")
+    if rest == "uf":
+        return PendingAction(pending_id, "use_file")
+    if rest == "ur":
+        return PendingAction(pending_id, "use_rec")
     if rest.startswith("c") and match.group(3) is not None:
         return PendingAction(pending_id, "cand", index=int(match.group(3)))
     if rest.startswith("e:") and match.group(4) in FIELD_KEYS:
@@ -98,6 +110,15 @@ def _clip(text: str) -> str:
     return text[: TG_LIMIT - 20] + "\n…"
 
 
+def _choice_line(kind: str, value: str, *, selected: bool, strike: bool) -> str:
+    text = html_esc(value) or "—"
+    if selected:
+        return f"  <b>{kind}:</b> {text}"
+    if strike:
+        return f"  <s>{kind}: {text}</s>"
+    return f"  {kind}: {text}"
+
+
 def format_summary(
     original: dict[str, Any] | TagSet,
     recommended: dict[str, Any] | TagSet,
@@ -119,13 +140,15 @@ def format_summary(
                 line += f"\n  now: {html_esc(now_val) or '—'}"
             lines.append(line)
         else:
+            file_sel = now_val == file_val
+            rec_sel = now_val == rec_val
             block = (
                 f"<b>{label}</b>\n"
-                f"  file: {html_esc(file_val) or '—'}\n"
-                f"  rec:  {html_esc(rec_val) or '—'}"
+                f"{_choice_line('file', file_val, selected=file_sel, strike=rec_sel)}\n"
+                f"{_choice_line('rec', rec_val, selected=rec_sel, strike=file_sel)}"
             )
             if now_val not in {file_val, rec_val}:
-                block += f"\n  now:  {html_esc(now_val) or '—'}"
+                block += f"\n  now: {html_esc(now_val) or '—'}"
             lines.append(block)
     return _clip("\n".join(lines))
 
@@ -173,24 +196,20 @@ def format_conflict(
     return _clip("\n".join(lines))
 
 
-def review_keyboard(pending_id: int, candidates: list[Candidate] | list[dict[str, Any]]) -> InlineKeyboardMarkup:
+def review_keyboard(pending_id: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(text="Confirm", callback_data=f"p{pending_id}:ok")]
+        [
+            InlineKeyboardButton(text="Use File", callback_data=f"p{pending_id}:uf"),
+            InlineKeyboardButton(text="Use recommended", callback_data=f"p{pending_id}:ur"),
+        ]
     ]
-    for i, cand in enumerate(candidates[:5]):
-        if isinstance(cand, Candidate):
-            title, artist = cand.title, cand.artist
-        else:
-            title = str(cand.get("title") or "")
-            artist = str(cand.get("artist") or "")
-        label = f"{title} — {artist}".strip(" —")[:64] or f"Candidate {i + 1}"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"p{pending_id}:c{i}")])
     field_buttons = [
         InlineKeyboardButton(text=f"Edit {label.lower()}", callback_data=f"p{pending_id}:e:{key}")
-        for key, label in FIELDS
+        for key, label in EDIT_FIELDS
     ]
     for i in range(0, len(field_buttons), 2):
         rows.append(field_buttons[i : i + 2])
+    rows.append([InlineKeyboardButton(text="Confirm", callback_data=f"p{pending_id}:ok")])
     rows.append([InlineKeyboardButton(text="Send to review", callback_data=f"p{pending_id}:rev")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

@@ -137,7 +137,8 @@ def padded_track(tracknumber: str) -> str:
 
 def build_filename(tags: TagSet) -> str:
     title = sanitize_filename(tags.title or "Unknown Title")
+    album_artist = sanitize_filename(tags.albumartist or tags.artist or "Unknown Artist")
     track = padded_track(tags.tracknumber)
     if track:
-        return f"{track} - {title}.flac"
-    return f"{title}.flac"
+        return f"{album_artist} - {track} - {title}.flac"
+    return f"{album_artist} - {title}.flac"

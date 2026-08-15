@@ -308,7 +308,7 @@ class DriveClient:
                 fields="id,webViewLink",
                 supportsAllDrives=True,
             )
-        if getattr(media, "resumable", False):
+        if media.resumable():
             response = None
             while response is None:
                 _status, response = request.next_chunk()

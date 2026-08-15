@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any
@@ -250,8 +252,26 @@ def _identity_from_recording(
     return identity
 
 
+def _fpcalc_stderr(path: Path) -> str:
+    fpcalc = os.environ.get("FPCALC", "fpcalc")
+    try:
+        proc = subprocess.run(
+            [fpcalc, "-length", "120", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except FileNotFoundError:
+        return "fpcalc not found"
+    except subprocess.TimeoutExpired:
+        return "fpcalc timed out"
+    err = (proc.stderr or "").strip().replace("\n", " | ")[:500]
+    has_fp = "FINGERPRINT=" in (proc.stdout or "")
+    return f"exit={proc.returncode} fingerprint={'yes' if has_fp else 'no'} stderr={err or '(empty)'}"
+
+
 def _acoustid_lookup(path: Path, api_key: str) -> dict | None:
-    duration, fingerprint = acoustid.fingerprint_file(str(path))
+    duration, fingerprint = acoustid.fingerprint_file(str(path), force_fpcalc=True)
     response = acoustid.lookup(api_key, fingerprint, duration, meta=ACOUSTID_META)
     if response.get("status") != "ok":
         return None
@@ -525,8 +545,8 @@ def identify_file(path: Path, hints: TagHints, settings: Settings, mb: MBClient)
         ac_result = _acoustid_lookup(path, settings.acoustid_api_key)
     except acoustid.NoBackendError:
         log.error("fpcalc not found — install libchromaprint-tools")
-    except acoustid.FingerprintGenerationError:
-        log.warning("chromaprint failed for %s", path)
+    except acoustid.FingerprintGenerationError as exc:
+        log.warning("chromaprint failed for %s: %s (%s)", path, exc, _fpcalc_stderr(path))
     except acoustid.WebServiceError as exc:
         log.warning("acoustid lookup failed: %s", exc)
     except FileNotFoundError:
