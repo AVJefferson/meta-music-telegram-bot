@@ -55,6 +55,16 @@ Data:
 
 Sunday 03:00 UTC (`CLEANUP_CRON`): retry failed uploads, alert General topic if still failing, delete locals that are confirmed on Drive.
 
+## Library FTPS
+
+Read-only explicit FTPS of `/data` (library, review, covers). Not SFTP.
+
+Set `FTP_USER`, `FTP_PASSWORD`, and `FTP_PASV_ADDRESS` (the IP/DNS clients use to reach this host) in `.env`. The ftp container refuses to start if any of those are empty.
+
+FileZilla: protocol **FTP**, encryption **explicit FTP over TLS**. Trust the self-signed cert on first connect.
+
+Open **21/tcp** and **21100–21110/tcp** on the host firewall.
+
 ## Tags written
 
 `TITLE`, `ALBUM`, `ARTIST`, `ALBUMARTIST`, `COMPOSER`, `GENRE`, `DATE`, `TRACKNUMBER`, `DISCNUMBER`, `LYRICS` (synced LRC only), one front cover. Everything else is stripped.
