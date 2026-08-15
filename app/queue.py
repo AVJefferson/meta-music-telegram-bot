@@ -11,10 +11,21 @@ from pathlib import Path
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery
+from aiogram.types import BufferedInputFile, CallbackQuery, InputMediaPhoto
 
 from app.cleanup import alert_general
-from app.covers import album_changed, cover_identity, resolve_album_cover, upload_album_cover_if_missing
+from app.covers import (
+    CoverHit,
+    CoverOption,
+    cache_album_cover,
+    cover_album_key,
+    cover_identity,
+    existing_album_cover,
+    is_shareable_album,
+    list_cover_candidates,
+    resolve_album_cover,
+    upload_album_cover_if_missing,
+)
 from app.enrich import enrich
 from app.identify import identify_file, identity_from_mbid
 from app.library import library_relative, place_file, review_relative, unlink_quiet, write_sidecar
@@ -30,8 +41,10 @@ from app.models import (
 )
 from app.review_ui import (
     conflict_keyboard,
+    cover_keyboard,
     empty_markup,
     format_conflict,
+    format_cover_prompt,
     format_summary,
     parse_callback,
     review_keyboard,
@@ -157,27 +170,23 @@ async def process_job(job: Job, ctx: Ctx) -> None:
         await ctx.bot.download(file, destination=tmp)
 
         hints = await asyncio.to_thread(read_hints, tmp, job.file_name)
+        file_cover = await asyncio.to_thread(read_cover, tmp)
         await edit_status(ctx, job, "Fingerprinting / identifying…")
         identity = await asyncio.to_thread(identify_file, tmp, hints, settings, ctx.mb)
 
-        await edit_status(ctx, job, "Fetching cover, lyrics, genre…")
-        cover_hit = await resolve_album_cover(ctx, identity, job.topic_name)
+        await edit_status(ctx, job, "Fetching lyrics, genre…")
         enrichment = await enrich(
             ctx.http,
             identity,
             ctx.genre,
             settings.lastfm_api_key,
             job.topic_name,
-            cover=cover_hit.data,
-            cover_mime=cover_hit.mime,
-            cover_source=cover_hit.source,
-            caa_release=cover_hit.caa_release,
         )
         tags = identity_to_tags(identity, enrichment)
         if not tags.title:
             tags.title = Path(job.file_name).stem
 
-        await asyncio.to_thread(write_tags, tmp, tags, enrichment.cover, enrichment.cover_mime)
+        await asyncio.to_thread(write_tags, tmp, tags, file_cover[0], file_cover[1])
         report = _build_report(hints, identity, enrichment, tags)
 
         if identity.confidence == "high" and identity.mb_recording_id:
@@ -193,19 +202,19 @@ async def process_job(job: Job, ctx: Ctx) -> None:
                         f"({old_q[0]}/{old_q[1]}). Skipped.\n\n{tag_preview(tags)}",
                     )
                     return
-                await _commit_upload(
+                await _library_commit_with_cover(
                     ctx,
                     job=job,
                     local=tmp,
                     tags=tags,
                     identity=identity,
-                    kind="library",
-                    source_report=report,
+                    report=report,
                     replace_id=existing.id,
                     old_drive_id=existing.drive_file_id,
                     replaced=existing.status == "uploaded" and new_q > old_q,
                     old_q=old_q,
                     new_q=new_q,
+                    file_cover=file_cover,
                 )
                 return
 
@@ -213,14 +222,14 @@ async def process_job(job: Job, ctx: Ctx) -> None:
             await start_tag_review(ctx, job, tmp, hints, tags, identity, report)
             return
 
-        await _commit_upload(
+        await _library_commit_with_cover(
             ctx,
             job=job,
             local=tmp,
             tags=tags,
             identity=identity,
-            kind="library",
-            source_report=report,
+            report=report,
+            file_cover=file_cover,
         )
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -264,6 +273,462 @@ async def start_tag_review(
     status_id = await edit_status(ctx, job, text, markup)
     ctx.catalog.update_pending_review(pending_id, status_message_id=status_id)
     log.info("review waiting id=%s file=%s reason=%s", pending_id, job.file_name, identity.confidence_reason)
+
+
+def _set_cover_report(report: dict, source: str, caa_release: str | None = None) -> None:
+    report["cover_source"] = source
+    caa = report.get("coverartarchive") or {}
+    caa["used"] = source == "caa"
+    caa["release"] = caa_release or ""
+    report["coverartarchive"] = caa
+
+
+def _cover_picker_meta(report: dict) -> dict:
+    raw = report.get("cover_picker")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _find_cover_leader(ctx: Ctx, album_key: str) -> PendingReview | None:
+    for row in ctx.catalog.list_waiting_by_phase("cover"):
+        picker = _cover_picker_meta(_loads(row.source_report_json, {}))
+        if picker.get("album_key") == album_key and picker.get("role") == "leader":
+            return row
+    return None
+
+
+async def _park_pending_flac(ctx: Ctx, job: Job, local: Path) -> Path:
+    pending_root = ctx.settings.pending_root.resolve()
+    try:
+        local.resolve().relative_to(pending_root)
+        return local
+    except ValueError:
+        pass
+    pending_dir = ctx.settings.pending_root / str(uuid.uuid4())
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    dest = pending_dir / (sanitize_filename(Path(job.file_name).stem) + ".flac")
+    return await asyncio.to_thread(place_file, local, dest)
+
+
+async def _embed_cover(local: Path, tags: TagSet, data: bytes | None, mime: str | None) -> None:
+    await asyncio.to_thread(write_tags, local, tags, data, mime)
+
+
+async def _apply_resolved_cover(
+    local: Path,
+    tags: TagSet,
+    report: dict,
+    hit: CoverHit,
+) -> None:
+    if hit.data:
+        await _embed_cover(local, tags, hit.data, hit.mime)
+        _set_cover_report(report, hit.source, hit.caa_release)
+
+
+def _write_cover_option_files(options: list[CoverOption], pending_dir: Path) -> list[dict]:
+    meta: list[dict] = []
+    for index, option in enumerate(options):
+        name = f"cover-{index}.jpg"
+        (pending_dir / name).write_bytes(option.data)
+        meta.append(
+            {
+                "path": name,
+                "source": option.source,
+                "label": option.label,
+                "digest": option.digest,
+                "caa_release": option.caa_release or "",
+            }
+        )
+    return meta
+
+
+def _read_cover_option(local: Path, option: dict) -> tuple[bytes, str, str, str | None] | None:
+    path = local.parent / str(option.get("path") or "")
+    if not path.is_file():
+        return None
+    data = path.read_bytes()
+    if not data:
+        return None
+    source = str(option.get("source") or "none")
+    caa = str(option.get("caa_release") or "") or None
+    return data, "image/jpeg", source, caa
+
+
+def _cleanup_cover_option_files(local: Path, options: list) -> None:
+    for option in options:
+        if isinstance(option, dict):
+            unlink_quiet(local.parent / str(option.get("path") or ""))
+
+
+async def _send_cover_gallery(
+    ctx: Ctx,
+    job: Job,
+    options: list[CoverOption],
+    album: str,
+    albumartist: str,
+) -> list[int]:
+    caption = f"Pick cover\n{albumartist} — {album}"
+    if len(caption) > 1000:
+        caption = caption[:1000]
+    media = [
+        InputMediaPhoto(
+            media=BufferedInputFile(option.data, filename=f"cover-{index}.jpg"),
+            caption=caption if index == 0 else None,
+        )
+        for index, option in enumerate(options)
+    ]
+    kwargs: dict = {"chat_id": job.chat_id, "media": media}
+    if job.thread_id:
+        kwargs["message_thread_id"] = job.thread_id
+    try:
+        messages = await ctx.bot.send_media_group(**kwargs)
+    except Exception:
+        log.debug("cover gallery send failed", exc_info=True)
+        return []
+    return [msg.message_id for msg in messages]
+
+
+async def _delete_cover_gallery(ctx: Ctx, chat_id: int, message_ids: list) -> None:
+    for message_id in message_ids:
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=int(message_id))
+        except Exception:
+            log.debug("cover gallery delete failed id=%s", message_id)
+
+
+def _upsert_cover_pending(
+    ctx: Ctx,
+    *,
+    job: Job,
+    dest: Path,
+    tags: TagSet,
+    identity: Identity,
+    report: dict,
+    pending_id: int | None,
+    replace_id: int | None,
+    old_drive_id: str | None,
+    track_id: int | None,
+) -> int:
+    if pending_id is None:
+        return ctx.catalog.insert_pending_review(
+            phase="cover",
+            local_path=str(dest),
+            sidecar_path=None,
+            relative_path=None,
+            kind="library",
+            original_json=_dumps(asdict(tags)),
+            recommended_json=_dumps(asdict(tags)),
+            working_json=_dumps(asdict(tags)),
+            candidates_json=_dumps([asdict(c) for c in identity.candidates]),
+            identity_json=_dumps(asdict(identity)),
+            source_report_json=_dumps(report),
+            chat_id=job.chat_id,
+            thread_id=job.thread_id,
+            status_message_id=job.status_message_id,
+            topic_name=job.topic_name,
+            file_name=job.file_name,
+            track_id=track_id,
+            replace_id=replace_id,
+            old_drive_id=old_drive_id,
+            expires_at=_expires_at(),
+        )
+    ctx.catalog.update_pending_review(
+        pending_id,
+        phase="cover",
+        status="waiting",
+        local_path=str(dest),
+        kind="library",
+        working_json=_dumps(asdict(tags)),
+        recommended_json=_dumps(asdict(tags)),
+        identity_json=_dumps(asdict(identity)),
+        source_report_json=_dumps(report),
+        replace_id=replace_id,
+        old_drive_id=old_drive_id,
+        track_id=track_id,
+        expires_at=_expires_at(),
+    )
+    return pending_id
+
+
+async def maybe_cover_picker(
+    ctx: Ctx,
+    *,
+    job: Job,
+    local: Path,
+    tags: TagSet,
+    identity: Identity,
+    report: dict,
+    pending_id: int | None = None,
+    replace_id: int | None = None,
+    old_drive_id: str | None = None,
+    track_id: int | None = None,
+    replaced: bool = False,
+    old_q: tuple[int, int] | None = None,
+    new_q: tuple[int, int] | None = None,
+    file_cover: tuple[bytes | None, str | None] | None = None,
+) -> bool:
+    album = tags.album
+    albumartist = tags.albumartist or tags.artist
+    ident = cover_identity(identity, tags)
+    if replaced or old_q is not None or new_q is not None:
+        report["quality_replace"] = {
+            "replaced": replaced,
+            "old_q": list(old_q) if old_q else None,
+            "new_q": list(new_q) if new_q else None,
+        }
+
+    if not is_shareable_album(album):
+        hit = await resolve_album_cover(
+            ctx, ident, job.topic_name, album=album, albumartist=albumartist
+        )
+        await _apply_resolved_cover(local, tags, report, hit)
+        return False
+
+    existing = await existing_album_cover(ctx, job.topic_name, album, albumartist)
+    if existing and existing.data:
+        await _apply_resolved_cover(local, tags, report, existing)
+        return False
+
+    album_k = cover_album_key(album, albumartist)
+    leader = _find_cover_leader(ctx, album_k)
+    park_kwargs = dict(
+        job=job,
+        tags=tags,
+        identity=identity,
+        pending_id=pending_id,
+        replace_id=replace_id,
+        old_drive_id=old_drive_id,
+        track_id=track_id,
+    )
+    if leader:
+        dest = await _park_pending_flac(ctx, job, local)
+        parked = dict(report)
+        parked["cover_picker"] = {
+            "album_key": album_k,
+            "album": album,
+            "albumartist": albumartist,
+            "role": "follower",
+            "leader_id": leader.id,
+            "options": [],
+            "media_message_ids": [],
+        }
+        new_id = _upsert_cover_pending(ctx, dest=dest, report=parked, **park_kwargs)
+        text = format_cover_prompt(album, albumartist, [], job.file_name, waiting=True)
+        status_id = await edit_status(ctx, job, text)
+        ctx.catalog.update_pending_review(new_id, status_message_id=status_id)
+        log.info("cover follower waiting id=%s leader=%s album=%s", new_id, leader.id, album)
+        return True
+
+    cover_tuple: tuple[bytes, str] | None = None
+    if file_cover and file_cover[0]:
+        cover_tuple = (file_cover[0], file_cover[1] or "image/jpeg")
+    else:
+        data, mime = await asyncio.to_thread(read_cover, local)
+        if data:
+            cover_tuple = (data, mime or "image/jpeg")
+
+    await edit_status(ctx, job, "Fetching album cover options…")
+    options = await list_cover_candidates(ctx, ident, cover_tuple)
+    if len(options) <= 1:
+        if options:
+            opt = options[0]
+            await _embed_cover(local, tags, opt.data, opt.mime)
+            cache_album_cover(ctx, album, albumartist, opt.data)
+            _set_cover_report(report, opt.source, opt.caa_release)
+        return False
+
+    dest = await _park_pending_flac(ctx, job, local)
+    option_meta = _write_cover_option_files(options, dest.parent)
+    parked = dict(report)
+    parked["cover_picker"] = {
+        "album_key": album_k,
+        "album": album,
+        "albumartist": albumartist,
+        "role": "leader",
+        "options": option_meta,
+        "media_message_ids": [],
+    }
+    new_id = _upsert_cover_pending(ctx, dest=dest, report=parked, **park_kwargs)
+    media_ids = await _send_cover_gallery(ctx, job, options, album, albumartist)
+    parked["cover_picker"]["media_message_ids"] = media_ids
+    ctx.catalog.update_pending_review(new_id, source_report_json=_dumps(parked))
+    text = format_cover_prompt(album, albumartist, option_meta, job.file_name)
+    status_id = await edit_status(ctx, job, text, cover_keyboard(new_id, option_meta))
+    ctx.catalog.update_pending_review(new_id, status_message_id=status_id)
+    log.info("cover picker waiting id=%s file=%s options=%s", new_id, job.file_name, len(options))
+    return True
+
+
+async def _library_commit_with_cover(
+    ctx: Ctx,
+    *,
+    job: Job,
+    local: Path,
+    tags: TagSet,
+    identity: Identity,
+    report: dict,
+    pending_id: int | None = None,
+    replace_id: int | None = None,
+    old_drive_id: str | None = None,
+    track_id: int | None = None,
+    replaced: bool = False,
+    old_q: tuple[int, int] | None = None,
+    new_q: tuple[int, int] | None = None,
+    file_cover: tuple[bytes | None, str | None] | None = None,
+) -> None:
+    paused = await maybe_cover_picker(
+        ctx,
+        job=job,
+        local=local,
+        tags=tags,
+        identity=identity,
+        report=report,
+        pending_id=pending_id,
+        replace_id=replace_id,
+        old_drive_id=old_drive_id,
+        track_id=track_id,
+        replaced=replaced,
+        old_q=old_q,
+        new_q=new_q,
+        file_cover=file_cover,
+    )
+    if paused:
+        return
+    await _commit_upload(
+        ctx,
+        job=job,
+        local=local,
+        tags=tags,
+        identity=identity,
+        kind="library",
+        source_report=report,
+        replace_id=replace_id,
+        old_drive_id=old_drive_id,
+        replaced=replaced,
+        old_q=old_q,
+        new_q=new_q,
+        pending_id=pending_id,
+        track_id=track_id,
+    )
+
+
+async def _resume_library_after_cover(
+    ctx: Ctx,
+    row: PendingReview,
+    tags: TagSet,
+    identity: Identity,
+    report: dict,
+) -> None:
+    job = _job_from_pending(row)
+    qr = report.get("quality_replace") or {}
+    old_q = tuple(qr["old_q"]) if qr.get("old_q") else None
+    new_q = tuple(qr["new_q"]) if qr.get("new_q") else None
+    await _commit_upload(
+        ctx,
+        job=job,
+        local=Path(row.local_path),
+        tags=tags,
+        identity=identity,
+        kind="library",
+        source_report=apply_chosen(report, tags, identity),
+        replace_id=row.replace_id,
+        old_drive_id=row.old_drive_id,
+        replaced=bool(qr.get("replaced")),
+        old_q=old_q,
+        new_q=new_q,
+        pending_id=row.id,
+        track_id=row.track_id,
+    )
+
+
+async def _apply_cover_to_waiter(
+    ctx: Ctx,
+    row: PendingReview,
+    data: bytes,
+    mime: str,
+    source: str,
+    caa_release: str | None,
+) -> None:
+    working = tagset_from_dict(_loads(row.working_json, {}))
+    identity = identity_from_dict(_loads(row.identity_json, {}))
+    report = _loads(row.source_report_json, {})
+    local = Path(row.local_path)
+    if not local.exists():
+        ctx.catalog.update_pending_review(row.id, status="failed")
+        return
+    await _embed_cover(local, working, data, mime)
+    _set_cover_report(report, source, caa_release)
+    report.pop("cover_picker", None)
+    await _resume_library_after_cover(ctx, row, working, identity, report)
+
+
+async def _apply_cover_choice(ctx: Ctx, row: PendingReview, index: int) -> None:
+    _original, _recommended, working, identity, report, _cands = _load_pending_state(row)
+    picker = _cover_picker_meta(report)
+    if picker.get("role") != "leader":
+        return
+    options = picker.get("options") or []
+    if index < 0 or index >= len(options):
+        return
+    local = Path(row.local_path)
+    job = _job_from_pending(row)
+    if not local.exists():
+        await edit_status(ctx, job, "Local file missing. Cannot continue.")
+        ctx.catalog.update_pending_review(row.id, status="failed")
+        return
+    chosen = _read_cover_option(local, options[index])
+    if not chosen:
+        await edit_status(ctx, job, "Cover file missing. Cannot continue.")
+        ctx.catalog.update_pending_review(row.id, status="failed")
+        return
+    data, mime, source, caa_release = chosen
+    tags = tagset_from_dict(working)
+    album = str(picker.get("album") or tags.album)
+    albumartist = str(picker.get("albumartist") or tags.albumartist or tags.artist)
+    await _embed_cover(local, tags, data, mime)
+    cache_album_cover(ctx, album, albumartist, data)
+    _set_cover_report(report, source, caa_release)
+    await _delete_cover_gallery(ctx, row.chat_id, list(picker.get("media_message_ids") or []))
+    _cleanup_cover_option_files(local, options)
+    album_k = picker.get("album_key")
+    report.pop("cover_picker", None)
+    ctx.catalog.update_pending_review(row.id, source_report_json=_dumps(report))
+    await _resume_library_after_cover(ctx, row, tags, identity, report)
+    for other in ctx.catalog.list_waiting_by_phase("cover"):
+        if other.id == row.id:
+            continue
+        other_picker = _cover_picker_meta(_loads(other.source_report_json, {}))
+        if other_picker.get("album_key") != album_k:
+            continue
+        await _apply_cover_to_waiter(ctx, other, data, mime, source, caa_release)
+
+
+async def _cover_choice_from_pending(
+    ctx: Ctx, row: PendingReview
+) -> tuple[bytes, str, str, str | None] | None:
+    report = _loads(row.source_report_json, {})
+    picker = _cover_picker_meta(report)
+    tags = tagset_from_dict(_loads(row.working_json, {}))
+    album = str(picker.get("album") or tags.album)
+    albumartist = str(picker.get("albumartist") or tags.albumartist or tags.artist)
+    existing = await existing_album_cover(ctx, row.topic_name, album, albumartist)
+    if existing and existing.data:
+        return existing.data, existing.mime or "image/jpeg", existing.source, existing.caa_release
+    if picker.get("role") == "leader":
+        options = picker.get("options") or []
+        if options:
+            return _read_cover_option(Path(row.local_path), options[0])
+        return None
+    leader_id = picker.get("leader_id")
+    if not leader_id:
+        return None
+    leader = ctx.catalog.get_pending_review(int(leader_id))
+    if leader is None:
+        return None
+    leader_picker = _cover_picker_meta(_loads(leader.source_report_json, {}))
+    options = leader_picker.get("options") or []
+    if not options:
+        return None
+    return _read_cover_option(Path(leader.local_path), options[0])
 
 
 def _sidecar_payload(job: Job, tags: TagSet, identity: Identity) -> dict:
@@ -694,6 +1159,12 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
         await state.clear()
         await _apply_confirm(ctx, row, kind="review")
         return
+    if action.op == "cover" and action.index is not None:
+        if row.phase != "cover":
+            return
+        await state.clear()
+        await _apply_cover_choice(ctx, row, action.index)
+        return
     if action.op == "cand" and action.index is not None:
         await state.clear()
         await _apply_candidate(ctx, row, action.index)
@@ -722,30 +1193,14 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
 
 
 async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
-    original, recommended, working, identity, report, _cands = _load_pending_state(row)
+    _original, _recommended, working, identity, report, _cands = _load_pending_state(row)
     tags = tagset_from_dict(working)
     local = Path(row.local_path)
     if not local.exists():
         await edit_status(ctx, _job_from_pending(row), "Local file missing. Cannot continue.")
         ctx.catalog.update_pending_review(row.id, status="failed")
         return
-    if kind == "library" and album_changed(identity, tags):
-        cover_hit = await resolve_album_cover(
-            ctx,
-            cover_identity(identity, tags),
-            row.topic_name,
-            album=tags.album,
-            albumartist=tags.albumartist or tags.artist,
-        )
-        cover, mime = cover_hit.data, cover_hit.mime
-        if cover_hit.source != "none":
-            report["cover_source"] = cover_hit.source
-            caa = report.get("coverartarchive") or {}
-            caa["used"] = cover_hit.source == "caa"
-            caa["release"] = cover_hit.caa_release or ""
-            report["coverartarchive"] = caa
-    else:
-        cover, mime = await asyncio.to_thread(read_cover, local)
+    cover, mime = await asyncio.to_thread(read_cover, local)
     await asyncio.to_thread(write_tags, local, tags, cover, mime)
     report = apply_chosen(report, tags, identity)
 
@@ -764,35 +1219,51 @@ async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
                     f"({old_q[0]}/{old_q[1]}). Skipped.\n\n{tag_preview(tags)}",
                 )
                 return
-            await _commit_upload(
+            await _library_commit_with_cover(
                 ctx,
                 job=job,
                 local=local,
                 tags=tags,
                 identity=identity,
-                kind="library",
-                source_report=report,
+                report=report,
                 replace_id=existing.id,
                 old_drive_id=existing.drive_file_id,
                 replaced=existing.status == "uploaded" and new_q > old_q,
                 old_q=old_q,
                 new_q=new_q,
                 pending_id=row.id,
+                file_cover=(cover, mime),
             )
             return
 
-    await _commit_upload(
+    if kind != "library":
+        await _commit_upload(
+            ctx,
+            job=job,
+            local=local,
+            tags=tags,
+            identity=identity,
+            kind=kind,
+            source_report=report,
+            replace_id=row.replace_id,
+            old_drive_id=row.old_drive_id,
+            pending_id=row.id,
+            track_id=row.track_id,
+        )
+        return
+
+    await _library_commit_with_cover(
         ctx,
         job=job,
         local=local,
         tags=tags,
         identity=identity,
-        kind=kind,
-        source_report=report,
+        report=report,
         replace_id=row.replace_id,
         old_drive_id=row.old_drive_id,
         pending_id=row.id,
         track_id=row.track_id,
+        file_cover=(cover, mime),
     )
 
 
@@ -829,21 +1300,20 @@ async def _apply_candidate(ctx: Ctx, row: PendingReview, index: int) -> None:
     new_identity.confidence = "low"
     new_identity.confidence_reason = identity.confidence_reason
     new_identity.source_report = {**identity.source_report, **new_identity.source_report}
-    cover_hit = await resolve_album_cover(ctx, new_identity, row.topic_name)
+    local = Path(row.local_path)
+    cover, mime = await asyncio.to_thread(read_cover, local)
     enrichment = await enrich(
         ctx.http,
         new_identity,
         ctx.genre,
         ctx.settings.lastfm_api_key,
         row.topic_name,
-        cover=cover_hit.data,
-        cover_mime=cover_hit.mime,
-        cover_source=cover_hit.source,
-        caa_release=cover_hit.caa_release,
+        cover=cover,
+        cover_mime=mime,
+        cover_source="file" if cover else "none",
     )
     tags = identity_to_tags(new_identity, enrichment)
-    local = Path(row.local_path)
-    await asyncio.to_thread(write_tags, local, tags, enrichment.cover, enrichment.cover_mime)
+    await asyncio.to_thread(write_tags, local, tags, cover, mime)
     report = merge_enrichment(report, enrichment)
     report = apply_chosen(report, tags, new_identity)
     ctx.catalog.update_pending_review(
@@ -911,6 +1381,34 @@ async def expire_pending(ctx: Ctx) -> None:
                     conflict_action="auto_keep_both",
                     track_id=row.track_id,
                 )
+            elif row.phase == "cover":
+                working = tagset_from_dict(_loads(row.working_json, {}))
+                identity = identity_from_dict(_loads(row.identity_json, {}))
+                report = _loads(row.source_report_json, {})
+                picker = _cover_picker_meta(report)
+                local = Path(row.local_path)
+                if not local.exists():
+                    ctx.catalog.update_pending_review(row.id, status="failed")
+                    continue
+                chosen = await _cover_choice_from_pending(ctx, row)
+                if chosen:
+                    data, mime, source, caa_release = chosen
+                    await _embed_cover(local, working, data, mime)
+                    cache_album_cover(
+                        ctx,
+                        str(picker.get("album") or working.album),
+                        str(picker.get("albumartist") or working.albumartist or working.artist),
+                        data,
+                    )
+                    _set_cover_report(report, source, caa_release)
+                if picker.get("role") == "leader":
+                    await _delete_cover_gallery(
+                        ctx, row.chat_id, list(picker.get("media_message_ids") or [])
+                    )
+                    _cleanup_cover_option_files(local, picker.get("options") or [])
+                await edit_status(ctx, job, "Timed out (24h). Using first cover option…")
+                report.pop("cover_picker", None)
+                await _resume_library_after_cover(ctx, row, working, identity, report)
             elif row.phase == "drive":
                 working = tagset_from_dict(_loads(row.working_json, {}))
                 identity = identity_from_dict(_loads(row.identity_json, {}))

@@ -396,6 +396,7 @@ class Catalog:
             "track_id",
             "replace_id",
             "old_drive_id",
+            "expires_at",
         }
         cols = []
         values = []
@@ -411,6 +412,14 @@ class Catalog:
                 values,
             )
             self._conn.commit()
+
+    def list_waiting_by_phase(self, phase: str) -> list[PendingReview]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM pending_reviews WHERE status='waiting' AND phase=? ORDER BY id",
+                (phase,),
+            ).fetchall()
+        return [_row_to_pending(row) for row in rows]
 
     def claim_expired_pending(self) -> list[PendingReview]:
         now = _utc_now()

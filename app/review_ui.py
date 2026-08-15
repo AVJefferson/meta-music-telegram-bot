@@ -26,7 +26,7 @@ FIELDS: list[tuple[str, str]] = [
     ("year", "Year"),
 ]
 FIELD_KEYS = {key for key, _ in FIELDS}
-_CALLBACK = re.compile(r"^p(\d+):(ok|rev|dr|dk|ds|c(\d+)|t:([a-z]+)|uf|ur)$")
+_CALLBACK = re.compile(r"^p(\d+):(ok|rev|dr|dk|ds|cv(\d+)|c(\d+)|t:([a-z]+)|uf|ur)$")
 
 
 @dataclass
@@ -59,10 +59,12 @@ def parse_callback(data: str | None) -> PendingAction | None:
         return PendingAction(pending_id, "use_file")
     if rest == "ur":
         return PendingAction(pending_id, "use_rec")
-    if rest.startswith("c") and match.group(3) is not None:
-        return PendingAction(pending_id, "cand", index=int(match.group(3)))
-    if rest.startswith("t:") and match.group(4) in FIELD_KEYS:
-        return PendingAction(pending_id, "toggle", field=match.group(4))
+    if rest.startswith("cv") and match.group(3) is not None:
+        return PendingAction(pending_id, "cover", index=int(match.group(3)))
+    if rest.startswith("c") and match.group(4) is not None:
+        return PendingAction(pending_id, "cand", index=int(match.group(4)))
+    if rest.startswith("t:") and match.group(5) in FIELD_KEYS:
+        return PendingAction(pending_id, "toggle", field=match.group(5))
     return None
 
 
@@ -209,6 +211,48 @@ def review_keyboard(
         rows.append(toggles[i : i + 2])
     rows.append([InlineKeyboardButton(text="Confirm", callback_data=f"p{pending_id}:ok")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def cover_keyboard(pending_id: int, options: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    buttons: list[InlineKeyboardButton] = []
+    for index, option in enumerate(options):
+        label = str(option.get("label") or f"{index + 1}")
+        buttons.append(
+            InlineKeyboardButton(
+                text=f"{index + 1} {label}",
+                callback_data=f"p{pending_id}:cv{index}",
+            )
+        )
+    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def format_cover_prompt(
+    album: str,
+    albumartist: str,
+    options: list[dict[str, Any]],
+    filename: str,
+    *,
+    waiting: bool = False,
+) -> str:
+    if waiting:
+        return _clip(
+            f"<b>Waiting for album cover</b>\n"
+            f"{html_esc(albumartist)} — {html_esc(album)}\n"
+            f"File: <code>{html_esc(filename)}</code>\n\n"
+            "Pick the cover on the first track of this album."
+        )
+    lines = [
+        "<b>Pick album cover</b>",
+        f"{html_esc(albumartist)} — {html_esc(album)}",
+        f"File: <code>{html_esc(filename)}</code>",
+        "",
+    ]
+    for index, option in enumerate(options):
+        lines.append(f"{index + 1}. {html_esc(str(option.get('label') or ''))}")
+    lines.append("")
+    lines.append("Later tracks of this album reuse the pick.")
+    return _clip("\n".join(lines))
 
 
 def conflict_keyboard(pending_id: int) -> InlineKeyboardMarkup:

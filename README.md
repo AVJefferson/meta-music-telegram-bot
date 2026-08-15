@@ -50,7 +50,7 @@ Data:
 - `/data/covers` — album art shortcut, deleted after 7 days
 - `/data/state.sqlite` — catalog (survives wipes; used for dedup)
 - Drive music folder — library layout `{Language}/{AlbumArtist}/{Album}/{AlbumArtist} - {Track} - {Title}.flac`
-- Drive album folder also stores `cover.jpg` (first track wins; later tracks reuse it)
+- Drive album folder also stores `cover.jpg`. First library track of an album sends a photo picker (file art, Cover Art Archive fronts, iTunes). Later tracks reuse that pick. Local copy expires after a week.
 - Drive review folder — low-confidence matches plus a `.json` sidecar
 
 Sunday 03:00 UTC (`CLEANUP_CRON`): retry failed uploads, alert General topic if still failing, delete locals that are confirmed on Drive.
@@ -75,7 +75,7 @@ Artist fields use `A, B, C & D`. Genre is `genre | mood | language | instrument`
 
 1. Chromaprint / AcoustID (audio fingerprint)
 2. MusicBrainz for canonical metadata
-3. Cover Art Archive (release-group), then iTunes album art; saved as `cover.jpg` in the Drive album folder. Local copy expires after a week.
+3. Cover Art Archive (release-group fronts) and iTunes album art. First library track of a named album pauses for a cover pick among distinct images (embedded file art, CAA, iTunes); later tracks reuse `cover.jpg` in the Drive album folder. No pick within 24h uses the first option and still goes to the library. Local copy expires after a week. Unknown / empty album names skip the picker and fetch per track.
 4. LRCLIB for synced lyrics
 5. iTunes + Last.fm tags filtered through `genre_map.yaml`
 
