@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import suppress
-from dataclasses import fields, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 from mutagen.flac import FLAC, Picture
@@ -166,14 +166,33 @@ def read_cover(path: Path) -> tuple[bytes | None, str | None]:
     return front.data, front.mime or "image/jpeg"
 
 
-def audio_info(path: Path) -> tuple[float, int | None, int | None]:
+@dataclass(frozen=True)
+class AudioMetrics:
+    duration: float = 0.0
+    bit_depth: int | None = None
+    sample_rate: int | None = None
+    bitrate_kbps: int | None = None
+
+
+def read_audio_metrics(path: Path) -> AudioMetrics:
     audio = FLAC(path)
     info = audio.info
-    return (
-        float(getattr(info, "length", 0.0) or 0.0),
-        getattr(info, "bits_per_sample", None),
-        getattr(info, "sample_rate", None),
-    )
+    duration = float(getattr(info, "length", 0.0) or 0.0)
+    bit_depth = getattr(info, "bits_per_sample", None)
+    sample_rate = getattr(info, "sample_rate", None)
+    bitrate_bps = int(getattr(info, "bitrate", 0) or 0)
+    if bitrate_bps > 0:
+        kbps = max(1, round(bitrate_bps / 1000))
+    elif duration > 0:
+        kbps = max(1, round(path.stat().st_size * 8 / duration / 1000))
+    else:
+        kbps = None
+    return AudioMetrics(duration, bit_depth, sample_rate, kbps)
+
+
+def audio_info(path: Path) -> tuple[float, int | None, int | None]:
+    metrics = read_audio_metrics(path)
+    return metrics.duration, metrics.bit_depth, metrics.sample_rate
 
 
 def identity_to_tags(identity: Identity, enrichment: Enrichment) -> TagSet:

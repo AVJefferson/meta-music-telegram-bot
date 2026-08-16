@@ -9,9 +9,11 @@ from mutagen.id3 import ID3, TALB, TCOM, TCON, TDRC, TIT2, TPE1, TPE2, TRCK
 
 from app.catalog import Catalog
 from app.models import TagSet
+from app.queue import tag_preview
 from app.relocate import hydrate_track_tags, read_tags_for_card
 from app.review_cmd import format_song_card
-from app.tags import overlay_tagset, read_tagset
+from app.tags import AudioMetrics, overlay_tagset, read_tagset
+from app.util import format_tech_lines
 
 
 def write_id3(path: Path, **fields: str) -> None:
@@ -93,6 +95,7 @@ class TagReadTests(unittest.TestCase):
             self.assertIn("Stay With Me", text)
             self.assertIn("Sam Smith", text)
             self.assertIn("In the Lonely Hour", text)
+            self.assertIn("Format: FLAC", text)
             self.assertNotIn("<b>03 - Sam Smith - Stay With Me</b>", text)
 
 
@@ -146,3 +149,14 @@ class HydrateTrackTagsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(updated.album, "In the Lonely Hour")
             self.assertTrue(updated.tags_json)
             catalog.close()
+
+
+class AudioCardTests(unittest.TestCase):
+    def test_tech_lines_pipe_quality(self) -> None:
+        text = format_tech_lines(duration=172, bit_depth=16, sample_rate=44100, bitrate_kbps=987)
+        self.assertEqual(text, "Format: FLAC\nDuration: 00:02:52\n987 kbps | 44.1 kHz | 16 bits")
+        preview = tag_preview(TagSet(title="Stay"), AudioMetrics(172, 16, 44100, 987))
+        self.assertIn("Format: FLAC", preview)
+        self.assertIn("Duration: 00:02:52", preview)
+        self.assertIn("987 kbps | 44.1 kHz | 16 bits", preview)
+        self.assertIn("<b>Stay</b>", preview)

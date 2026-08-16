@@ -12,7 +12,7 @@ from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.models import Ctx, PendingReview, identity_from_dict, tagset_from_dict
-from app.util import html_esc, split_artist_field
+from app.util import format_audio_block, html_esc, split_artist_field
 
 log = logging.getLogger(__name__)
 
@@ -284,6 +284,7 @@ def format_edit_card(
     hint: str = "",
     footer: str = "",
     genre_mapper=None,
+    tech: str = "",
 ) -> str:
     lines = [header, ""]
     for key, label in PREVIEW_FIELDS:
@@ -307,6 +308,8 @@ def format_edit_card(
             lines.append(f"{label}: <s>{old_html}</s> → {new_html}")
         else:
             lines.append(f"{label}: {new_html}")
+    if tech:
+        lines.append(tech)
     if cover_line:
         lines.append(cover_line)
     if hint:
@@ -376,6 +379,40 @@ def _card_hint(row: PendingReview, field: str | None) -> str:
     return "Tap a field, then type or pick a suggestion. Done writes tags."
 
 
+def _tech_for_row(row: PendingReview) -> str:
+    from app.tags import AudioMetrics, read_audio_metrics
+
+    if row.local_path:
+        path = Path(row.local_path)
+        if path.is_file():
+            try:
+                return format_audio_block(read_audio_metrics(path))
+            except Exception:
+                log.debug("edit card audio metrics failed", exc_info=True)
+    raw = _loads(row.identity_json, {}) or {}
+    report = raw.get("source_report") if isinstance(raw, dict) else None
+    if not isinstance(report, dict):
+        report = _loads(row.source_report_json, {}) or {}
+    bitrate = report.get("bitrate") if isinstance(report, dict) else None
+    try:
+        bitrate_kbps = int(bitrate) if bitrate else None
+    except (TypeError, ValueError):
+        bitrate_kbps = None
+    duration = 0.0
+    if isinstance(raw, dict):
+        duration = float(raw.get("duration") or 0)
+    if not duration and isinstance(report, dict):
+        duration = float(report.get("duration") or 0)
+    return format_audio_block(
+        AudioMetrics(
+            duration=duration,
+            bit_depth=raw.get("bit_depth") if isinstance(raw, dict) else None,
+            sample_rate=raw.get("sample_rate") if isinstance(raw, dict) else None,
+            bitrate_kbps=bitrate_kbps or None,
+        )
+    )
+
+
 def edit_card_text(row: PendingReview, *, field: str | None = None, genre=None) -> str:
     original = tagset_from_dict(_loads(row.original_json, {}))
     working = tagset_from_dict(_loads(row.working_json, {}))
@@ -388,6 +425,7 @@ def edit_card_text(row: PendingReview, *, field: str | None = None, genre=None) 
         hint=_card_hint(row, field),
         footer=_card_footer(row),
         genre_mapper=genre,
+        tech=_tech_for_row(row),
     )
 
 

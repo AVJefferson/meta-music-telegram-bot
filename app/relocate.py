@@ -10,7 +10,7 @@ from pathlib import Path
 from app.genre import genre_tokens
 from app.library import library_relative, place_file, review_relative, rmdir_empty, unlink_quiet, write_sidecar
 from app.models import Ctx, Identity, TagSet, TrackRecord, identity_from_dict, tagset_from_dict
-from app.tags import overlay_tagset, read_cover, read_tagset, write_tags
+from app.tags import AudioMetrics, overlay_tagset, read_audio_metrics, read_cover, read_tagset, write_tags
 from app.util import sanitize_filename
 
 log = logging.getLogger(__name__)
@@ -54,9 +54,11 @@ def tags_from_track(track: TrackRecord) -> TagSet:
 
 
 def identity_from_track(track: TrackRecord) -> Identity:
-    if track.identity_json:
-        return identity_from_dict(_loads(track.identity_json, {}))
-    report = _loads(track.source_report_json, {})
+    if getattr(track, "identity_json", None):
+        raw = _loads(track.identity_json, {})
+        if isinstance(raw, dict) and raw.get("confidence"):
+            return identity_from_dict(raw)
+    report = _loads(getattr(track, "source_report_json", None), {})
     acoustid = report.get("acoustid") or {}
     return Identity(
         confidence=report.get("confidence") or "low",
@@ -354,6 +356,38 @@ def read_tags_for_card(track: TrackRecord) -> TagSet:
     return tags
 
 
+def _bitrate_from_report(report: object) -> int | None:
+    if not isinstance(report, dict):
+        return None
+    raw = report.get("bitrate")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value or None
+
+
+def metrics_from_track(track: TrackRecord) -> AudioMetrics:
+    if track.local_path:
+        path = Path(track.local_path)
+        if path.is_file():
+            try:
+                return read_audio_metrics(path)
+            except Exception:
+                log.debug("read_audio_metrics failed path=%s", path, exc_info=True)
+    ident = identity_from_track(track)
+    report = ident.source_report or _loads(getattr(track, "source_report_json", None), {})
+    duration = ident.duration or 0.0
+    if isinstance(report, dict) and not duration:
+        duration = float(report.get("duration") or 0)
+    return AudioMetrics(
+        duration=duration or 0.0,
+        bit_depth=getattr(track, "bit_depth", None) or ident.bit_depth,
+        sample_rate=getattr(track, "sample_rate", None) or ident.sample_rate,
+        bitrate_kbps=_bitrate_from_report(report),
+    )
+
+
 async def hydrate_track_tags(ctx: Ctx, track: TrackRecord) -> TrackRecord:
     local = await ensure_local_flac(ctx, track)
     tags = await asyncio.to_thread(read_tagset, local)
@@ -363,5 +397,20 @@ async def hydrate_track_tags(ctx: Ctx, track: TrackRecord) -> TrackRecord:
         fields["artist"] = tags.artist or track.artist
         fields["album"] = tags.album or track.album
         fields["tags_json"] = json.dumps(asdict(tags), ensure_ascii=False)
+    try:
+        metrics = await asyncio.to_thread(read_audio_metrics, local)
+        fields["bit_depth"] = metrics.bit_depth
+        fields["sample_rate"] = metrics.sample_rate
+        report = _loads(track.source_report_json, {})
+        if not isinstance(report, dict):
+            report = {}
+        report["duration"] = metrics.duration
+        report["bit_depth"] = metrics.bit_depth
+        report["sample_rate"] = metrics.sample_rate
+        if metrics.bitrate_kbps:
+            report["bitrate"] = metrics.bitrate_kbps
+        fields["source_report_json"] = json.dumps(report, ensure_ascii=False)
+    except Exception:
+        log.debug("hydrate audio metrics failed path=%s", local, exc_info=True)
     ctx.catalog.update_track(track.id, **fields)
     return ctx.catalog.get_track(track.id) or track

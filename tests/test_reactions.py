@@ -220,7 +220,7 @@ class LyricsPreviewTests(unittest.TestCase):
 
         lrc = "[ar:Sam]\n[00:12.00] Guess it's true\n[00:16.50] I'm not good\n[00:20.00] At a one night stand"
         self.assertEqual(lyrics_preview(lrc), "Guess it's true\nI'm not good\nAt a one night stand")
-        self.assertEqual(format_clock(172), "2:52")
+        self.assertEqual(format_clock(172), "00:02:52")
         self.assertEqual(format_clock(None), "")
 
 

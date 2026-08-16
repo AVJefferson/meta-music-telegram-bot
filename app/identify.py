@@ -13,7 +13,7 @@ import musicbrainzngs
 from app.config import Settings
 from app.models import Candidate, Identity, TagHints
 from app.songlog import mb_snapshot
-from app.tags import audio_info
+from app.tags import read_audio_metrics
 from app.util import (
     artist_name_set,
     file_stem_hints,
@@ -534,7 +534,13 @@ def _identity_from_hints(
     )
 
 
-def _attach_report(identity: Identity, hints: TagHints, acoustid_report: dict | None = None) -> Identity:
+def _attach_report(
+    identity: Identity,
+    hints: TagHints,
+    acoustid_report: dict | None = None,
+    *,
+    bitrate_kbps: int | None = None,
+) -> Identity:
     report = dict(identity.source_report or {})
     if acoustid_report is not None:
         report["acoustid"] = acoustid_report
@@ -543,12 +549,15 @@ def _attach_report(identity: Identity, hints: TagHints, acoustid_report: dict | 
     report["duration"] = identity.duration
     report["bit_depth"] = identity.bit_depth
     report["sample_rate"] = identity.sample_rate
+    if bitrate_kbps:
+        report["bitrate"] = bitrate_kbps
     identity.source_report = report
     return identity
 
 
 def identify_file(path: Path, hints: TagHints, settings: Settings, mb: MBClient) -> Identity:
-    duration, bit_depth, sample_rate = audio_info(path)
+    metrics = read_audio_metrics(path)
+    duration, bit_depth, sample_rate = metrics.duration, metrics.bit_depth, metrics.sample_rate
     if duration <= 0:
         duration = 0.0
 
@@ -614,7 +623,7 @@ def identify_file(path: Path, hints: TagHints, settings: Settings, mb: MBClient)
                     identity.title = str(chosen.get("title") or hints.title)
                 if not identity.artists:
                     identity.artists = artist_names_from_acoustid(chosen.get("artists"))
-                _attach_report(identity, hints, ac_report)
+                _attach_report(identity, hints, ac_report, bitrate_kbps=metrics.bitrate_kbps)
                 log.debug(
                     "identified mbid=%s confidence=%s reason=%s score=%.3f clusters=%s",
                     identity.mb_recording_id,
@@ -666,13 +675,13 @@ def identify_file(path: Path, hints: TagHints, settings: Settings, mb: MBClient)
                     for r in found
                     if r.get("id")
                 ]
-                _attach_report(identity, hints)
+                _attach_report(identity, hints, bitrate_kbps=metrics.bitrate_kbps)
                 log.info("identified %s confidence=low reason=mb-search", hints.filename)
                 return identity
             except musicbrainzngs.WebServiceError:
                 log.warning("mb recording lookup failed after search")
 
     identity = _identity_from_hints(hints, duration, bit_depth, sample_rate)
-    _attach_report(identity, hints)
+    _attach_report(identity, hints, bitrate_kbps=metrics.bitrate_kbps)
     log.info("identified %s confidence=low reason=existing-tags", hints.filename)
     return identity

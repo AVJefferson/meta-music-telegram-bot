@@ -146,6 +146,7 @@ def format_summary(
     working: dict[str, Any] | TagSet,
     *,
     reason: str = "",
+    tech: str = "",
 ) -> str:
     lines = ["<b>Low confidence — check tags</b>"]
     if reason:
@@ -179,6 +180,9 @@ def format_summary(
             if now_val not in {file_val, rec_val}:
                 block += f"\n  now: {html_esc(now_val) or '—'}"
             lines.append(block)
+    if tech:
+        lines.append("")
+        lines.append(tech)
     return _clip("\n".join(lines))
 
 

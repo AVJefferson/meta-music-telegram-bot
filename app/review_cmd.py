@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from app.membership import is_forum_member
 from app.models import Ctx, TrackRecord
 from app.queue import tag_preview
-from app.relocate import hydrate_track_tags, read_tags_for_card
+from app.relocate import hydrate_track_tags, metrics_from_track, read_tags_for_card
 from app.util import html_esc, safe_link
 
 log = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ def format_song_card(track: TrackRecord) -> str:
     link = f'\nDrive: <a href="{href}">open</a>' if href else ""
     relative = html_esc(track.relative_path or "")
     path_line = f"\n<code>{relative}</code>" if relative else ""
-    return f"{dest_label}\n\n{tag_preview(tags)}{link}{path_line}"
+    return f"{dest_label}\n\n{tag_preview(tags, metrics_from_track(track))}{link}{path_line}"
 
 
 async def _sync_drive_review(ctx: Ctx) -> None:

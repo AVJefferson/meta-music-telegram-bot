@@ -57,8 +57,17 @@ from app.review_ui import (
     toggle_working_field,
 )
 from app.songlog import apply_chosen, merge_enrichment, render_songlog, seed_report
-from app.tags import fill_sparse_tags, hints_to_tagset, identity_to_tags, read_cover, read_hints, write_tags
-from app.util import html_esc, safe_link, sanitize_filename
+from app.tags import (
+    AudioMetrics,
+    fill_sparse_tags,
+    hints_to_tagset,
+    identity_to_tags,
+    read_audio_metrics,
+    read_cover,
+    read_hints,
+    write_tags,
+)
+from app.util import format_audio_block, html_esc, safe_link, sanitize_filename
 
 log = logging.getLogger(__name__)
 _cover_pick_lock = asyncio.Lock()
@@ -68,7 +77,7 @@ def quality(bit_depth: int | None, sample_rate: int | None) -> tuple[int, int]:
     return (bit_depth or 0, sample_rate or 0)
 
 
-def tag_preview(tags: TagSet) -> str:
+def tag_preview(tags: TagSet, metrics: AudioMetrics | None = None) -> str:
     lyrics = "present" if tags.lyrics else "none"
     return (
         f"<b>{html_esc(tags.title)}</b>\n"
@@ -78,7 +87,28 @@ def tag_preview(tags: TagSet) -> str:
         f"Composer: {html_esc(tags.composer)}\n"
         f"Genre: {html_esc(tags.genre)}\n"
         f"Year: {html_esc(tags.date)}\n"
-        f"Lyrics: {lyrics}"
+        f"Lyrics: {lyrics}\n"
+        f"{format_audio_block(metrics)}"
+    )
+
+
+def _metrics_from_identity(identity, path: Path | None = None) -> AudioMetrics:
+    if path is not None and path.is_file():
+        try:
+            return read_audio_metrics(path)
+        except Exception:
+            log.debug("audio metrics failed path=%s", path, exc_info=True)
+    report = getattr(identity, "source_report", None) or {}
+    bitrate = report.get("bitrate") if isinstance(report, dict) else None
+    try:
+        bitrate_kbps = int(bitrate) if bitrate else None
+    except (TypeError, ValueError):
+        bitrate_kbps = None
+    return AudioMetrics(
+        duration=float(getattr(identity, "duration", 0) or 0),
+        bit_depth=getattr(identity, "bit_depth", None),
+        sample_rate=getattr(identity, "sample_rate", None),
+        bitrate_kbps=bitrate_kbps or None,
     )
 
 
@@ -303,7 +333,7 @@ async def process_job(job: Job, ctx: Ctx) -> None:
                         ctx,
                         job,
                         "Duplicate — already in library "
-                        f"({old_q[0]}/{old_q[1]}). Skipped.\n\n{tag_preview(tags)}",
+                        f"({old_q[0]}/{old_q[1]}). Skipped.\n\n{tag_preview(tags, _metrics_from_identity(identity, tmp))}",
                     )
                     return
                 await _library_commit_with_cover(
@@ -407,7 +437,13 @@ async def start_tag_review(
             await show_field_menu(ctx, row)
         status_id = job.status_message_id
     else:
-        text = format_summary(original, tags, tags, reason=identity.confidence_reason)
+        text = format_summary(
+            original,
+            tags,
+            tags,
+            reason=identity.confidence_reason,
+            tech=format_audio_block(_metrics_from_identity(identity, dest)),
+        )
         markup = review_keyboard(pending_id, original, tags, tags)
         status_id = await edit_status(ctx, job, text, markup)
     ctx.catalog.update_pending_review(pending_id, status_message_id=status_id)
@@ -1502,7 +1538,13 @@ async def _commit_upload(
         )
         if pending_id is not None:
             ctx.catalog.update_pending_review(pending_id, status="skipped", track_id=skipped_id)
-        await edit_status(ctx, job, f"Skipped Drive upload. Kept locally.\n\n{tag_preview(tags)}\n<code>{html_esc(dest)}</code>")
+        await edit_status(
+            ctx,
+            job,
+            "Skipped Drive upload. Kept locally.\n\n"
+            f"{tag_preview(tags, _metrics_from_identity(identity, dest))}\n"
+            f"<code>{html_esc(dest)}</code>",
+        )
         log.info("drive skip track=%s path=%s", skipped_id, relative)
         return dest
 
@@ -1622,7 +1664,7 @@ async def _commit_upload(
             status="uploading",
         )
 
-    await edit_status(ctx, job, f"Uploading to Drive…\n\n{tag_preview(tags)}")
+    await edit_status(ctx, job, f"Uploading to Drive…\n\n{tag_preview(tags, _metrics_from_identity(identity, dest))}")
     log.debug("drive upload path=%s parent=%s replace=%s", relative, parent_id, replace_file_id)
     try:
         if replace_file_id:
@@ -1685,7 +1727,7 @@ async def _commit_upload(
         await edit_status(
             ctx,
             job,
-            f"Tagged, but Drive upload failed. Kept locally.\n\n{tag_preview(tags)}\n\n"
+            f"Tagged, but Drive upload failed. Kept locally.\n\n{tag_preview(tags, _metrics_from_identity(identity, dest))}\n\n"
             f"<code>{html_esc(dest)}</code>",
         )
         return dest
@@ -1700,7 +1742,7 @@ async def _commit_upload(
         ctx,
         job,
         f"Saved ({dest_label}, {identity.confidence} confidence).{extra}\n\n"
-        f"{tag_preview(tags)}{link}\n"
+        f"{tag_preview(tags, _metrics_from_identity(identity, dest))}{link}\n"
         f"<code>{html_esc(relative.as_posix())}</code>",
     )
     if job.status_message_id:
@@ -1854,7 +1896,14 @@ def _load_pending_state(row: PendingReview) -> tuple[dict, dict, dict, Identity,
 async def _refresh_tag_ui(ctx: Ctx, row: PendingReview) -> None:
     original, recommended, working, identity, _report, _candidates = _load_pending_state(row)
     job = _job_from_pending(row)
-    text = format_summary(original, recommended, working, reason=identity.confidence_reason)
+    path = Path(row.local_path) if row.local_path else None
+    text = format_summary(
+        original,
+        recommended,
+        working,
+        reason=identity.confidence_reason,
+        tech=format_audio_block(_metrics_from_identity(identity, path)),
+    )
     status_id = await edit_status(ctx, job, text, review_keyboard(row.id, original, recommended, working))
     if status_id != row.status_message_id:
         ctx.catalog.update_pending_review(row.id, status_message_id=status_id)
@@ -2051,7 +2100,7 @@ async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
                     ctx,
                     job,
                     "Duplicate — already in library "
-                    f"({old_q[0]}/{old_q[1]}). Skipped.\n\n{tag_preview(tags)}",
+                    f"({old_q[0]}/{old_q[1]}). Skipped.\n\n{tag_preview(tags, _metrics_from_identity(identity, local))}",
                 )
                 return
             await _library_commit_with_cover(

@@ -120,7 +120,43 @@ def format_clock(seconds: float | None) -> str:
     total = round(float(seconds))
     if total < 0:
         return ""
-    return f"{total // 60}:{total % 60:02d}"
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def format_tech_lines(
+    duration: float | None = None,
+    bit_depth: int | None = None,
+    sample_rate: int | None = None,
+    bitrate_kbps: int | None = None,
+) -> str:
+    lines = ["Format: FLAC"]
+    clock = format_clock(duration) if duration else ""
+    if clock:
+        lines.append(f"Duration: {clock}")
+    parts: list[str] = []
+    if bitrate_kbps:
+        parts.append(f"{bitrate_kbps} kbps")
+    if sample_rate:
+        parts.append(f"{sample_rate / 1000:g} kHz")
+    if bit_depth:
+        parts.append(f"{bit_depth} bits")
+    if parts:
+        lines.append(" | ".join(parts))
+    return "\n".join(lines)
+
+
+def format_audio_block(metrics: object | None = None) -> str:
+    if metrics is None:
+        return format_tech_lines()
+    duration = getattr(metrics, "duration", None) or None
+    return format_tech_lines(
+        duration=duration,
+        bit_depth=getattr(metrics, "bit_depth", None),
+        sample_rate=getattr(metrics, "sample_rate", None),
+        bitrate_kbps=getattr(metrics, "bitrate_kbps", None),
+    )
 
 
 def format_bytes(n: int | None) -> str:

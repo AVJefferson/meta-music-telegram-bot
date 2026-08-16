@@ -198,14 +198,23 @@ async def _show_cover_prompt(ctx: Ctx, row: PendingReview) -> None:
 
 async def _show_confirm(ctx: Ctx, row: PendingReview) -> None:
     from app.queue import edit_status, tag_preview
+    from app.tags import read_audio_metrics
 
     tags = tagset_from_dict(_loads(row.working_json, {}))
     report = _loads(row.source_report_json, {})
     cover_mode = (report.get("manual_cover") or {}).get("mode", "keep")
+    metrics = None
+    if row.local_path:
+        path = Path(row.local_path)
+        if path.is_file():
+            try:
+                metrics = await asyncio.to_thread(read_audio_metrics, path)
+            except Exception:
+                log.debug("confirm audio metrics failed", exc_info=True)
     await edit_status(
         ctx,
         Job(row.chat_id, None, row.topic_name, "", row.file_name, row.status_message_id, private=True),
-        f"<b>Confirm changes</b>\n\n{tag_preview(tags)}\nCover: {html_esc(cover_mode)}\n"
+        f"<b>Confirm changes</b>\n\n{tag_preview(tags, metrics)}\nCover: {html_esc(cover_mode)}\n"
         f"Library topic: {html_esc(row.topic_name or 'General')}",
         _control_keyboard(row.id, confirm=True),
     )
