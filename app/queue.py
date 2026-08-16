@@ -155,9 +155,9 @@ async def edit_status(ctx: Ctx, job: Job, text: str, markup=None) -> int:
         except TelegramBadRequest as exc:
             if "message is not modified" in str(exc).lower():
                 return job.status_message_id
-            log.debug("status edit failed: %s", exc)
+            log.warning("status edit failed: %s", exc)
         except Exception:
-            log.debug("status edit failed", exc_info=True)
+            log.warning("status edit failed", exc_info=True)
     try:
         kwargs: dict = {
             "chat_id": job.chat_id,
@@ -172,7 +172,7 @@ async def edit_status(ctx: Ctx, job: Job, text: str, markup=None) -> int:
         job.status_message_id = sent.message_id
         return sent.message_id
     except Exception:
-        log.debug("status send failed", exc_info=True)
+        log.warning("status send failed", exc_info=True)
         return job.status_message_id
 
 

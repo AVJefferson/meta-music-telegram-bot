@@ -716,7 +716,12 @@ class Catalog:
                 "WHERE m.chat_id=? AND m.message_id=?",
                 (chat_id, message_id),
             ).fetchone()
-        return _row_to_track(row) if row else None
+        if row:
+            return _row_to_track(row)
+        pending = self.get_pending_by_message(chat_id, message_id)
+        if pending and pending.track_id:
+            return self.get_track(pending.track_id)
+        return None
 
     def get_pending_by_message(self, chat_id: int, message_id: int) -> PendingReview | None:
         with self._lock:

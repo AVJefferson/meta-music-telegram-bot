@@ -12,7 +12,7 @@ from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.models import Ctx, PendingReview, identity_from_dict, tagset_from_dict
-from app.util import diff_credit_html, format_audio_block, html_esc, split_artist_field
+from app.util import clip_html, diff_credit_html, format_audio_block, html_esc, split_artist_field
 
 log = logging.getLogger(__name__)
 
@@ -315,9 +315,7 @@ def format_edit_card(
         lines.append("")
         lines.append(footer)
     text = "\n".join(lines)
-    if len(text) > 3900:
-        return text[:3880] + "\n…"
-    return text
+    return clip_html(text)
 
 
 def _cover_line(report: dict) -> str | None:
@@ -486,6 +484,8 @@ async def show_field_menu(ctx: Ctx, row: PendingReview) -> None:
     )
     if status_id != row.status_message_id:
         ctx.catalog.update_pending_review(row.id, status_message_id=status_id)
+    if status_id and refreshed.track_id:
+        ctx.catalog.bind_track_message(refreshed.track_id, refreshed.chat_id, status_id)
 
 
 async def show_field_prompt(ctx: Ctx, row: PendingReview, key: str) -> None:

@@ -304,6 +304,10 @@ class CatalogMessageBindTests(unittest.TestCase):
                 track_id=track_id,
                 expires_at="2000-01-01T00:00:00+00:00",
             )
+            via_pending = catalog.get_track_by_message(-100, 56)
+            self.assertIsNotNone(via_pending)
+            assert via_pending is not None
+            self.assertEqual(via_pending.id, track_id)
             expired = catalog.claim_expired_pending()
             self.assertEqual(expired, [])
             still = catalog.get_pending_review(pending_id)
@@ -631,7 +635,7 @@ class ReviewListDeliverTests(unittest.IsolatedAsyncioTestCase):
 
             async def answer(self, text, **kwargs):
                 calls.append(text)
-                outer.assertEqual(kwargs.get("message_thread_id"), 12)
+                outer.assertNotIn("message_thread_id", kwargs)
 
         await _deliver_list(Msg(), "page 2", edit=True)
         self.assertEqual(calls, ["page 2"])
@@ -651,3 +655,14 @@ class ReviewListDeliverTests(unittest.IsolatedAsyncioTestCase):
                 raise outer._bad("Bad Request: RECEIVER_ID_INVALID")
 
         await _deliver_list(Msg(), "page 2", edit=True)
+
+
+class ClipHtmlTests(unittest.TestCase):
+    def test_closes_open_tag_after_cut(self) -> None:
+        from app.util import clip_html
+
+        raw = "<b>" + ("x" * 100)
+        out = clip_html(raw, limit=40)
+        self.assertIn("</b>", out)
+        self.assertTrue(out.endswith("…"))
+        self.assertLess(out.count("<b>"), 2)

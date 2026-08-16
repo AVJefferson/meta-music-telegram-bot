@@ -115,9 +115,6 @@ async def _deliver_list(message: Message, text: str, markup=None, *, edit: bool 
                 log.debug("review list edit failed: %s", exc)
             except Exception:
                 log.debug("review list edit failed", exc_info=True)
-    thread_id = getattr(message, "message_thread_id", None)
-    if thread_id:
-        kwargs["message_thread_id"] = thread_id
     try:
         if not edit:
             try:
@@ -125,8 +122,10 @@ async def _deliver_list(message: Message, text: str, markup=None, *, edit: bool 
                 return
             except TelegramBadRequest as exc:
                 log.debug("review list reply failed: %s", exc)
+            except TypeError as exc:
+                log.debug("review list reply failed: %s", exc)
         await message.answer(text, **kwargs)
-    except TelegramBadRequest as exc:
+    except (TelegramBadRequest, TypeError) as exc:
         log.warning("review list send failed: %s", exc)
 
 
@@ -145,14 +144,12 @@ async def _show_list(message: Message, ctx: Ctx, page: int = 0, *, edit: bool = 
 async def _send_card(callback: CallbackQuery, ctx: Ctx, track: TrackRecord) -> None:
     track = await hydrate_track_tags(ctx, track)
     text = format_song_card(track)
-    kwargs: dict = {"text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     assert callback.message is not None
-    if callback.message.message_thread_id:
-        kwargs["message_thread_id"] = callback.message.message_thread_id
-    sent = await callback.message.answer(**kwargs)
+    sent = await callback.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
     ctx.catalog.bind_track_message(track.id, sent.chat.id, sent.message_id)
-    if track.thread_id is None and callback.message.message_thread_id:
-        ctx.catalog.update_track(track.id, thread_id=callback.message.message_thread_id)
+    thread_id = callback.message.message_thread_id
+    if track.thread_id is None and thread_id:
+        ctx.catalog.update_track(track.id, thread_id=thread_id)
 
 
 def build_review_command_router() -> Router:

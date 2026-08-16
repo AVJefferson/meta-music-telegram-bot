@@ -100,6 +100,27 @@ def parse_mb_user_agent(value: str) -> tuple[str, str, str]:
     return "telegram-music-bot", "1.0", value.strip() or "unknown@example.com"
 
 
+def clip_html(text: str, limit: int = 3900) -> str:
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 2]
+    last_lt = cut.rfind("<")
+    last_gt = cut.rfind(">")
+    if last_lt > last_gt:
+        cut = cut[:last_lt]
+    stack: list[str] = []
+    for match in re.finditer(r"<(/?)([a-z]+)(?:\s[^>]*)?>", cut, re.I):
+        name = match.group(2).lower()
+        if name in {"br", "hr"}:
+            continue
+        if match.group(1):
+            if stack and stack[-1] == name:
+                stack.pop()
+        else:
+            stack.append(name)
+    return cut.rstrip() + "".join(f"</{name}>" for name in reversed(stack)) + "\n…"
+
+
 def html_esc(value: object) -> str:
     return html.escape(str(value), quote=False)
 

@@ -117,6 +117,13 @@ def build_reactions_router() -> Router:
             return
         track = ctx.catalog.get_track_by_message(event.chat.id, event.message_id)
         if track is None or track.status == "deleted":
+            log.debug(
+                "reaction ignored chat=%s message=%s added=%s removed=%s",
+                event.chat.id,
+                event.message_id,
+                added,
+                removed,
+            )
             return
         try:
             if WRITING in added:
@@ -182,20 +189,27 @@ async def _reply_card(
         "text": text,
         "parse_mode": "HTML",
         "reply_markup": markup,
-        "reply_to_message_id": event.message_id,
     }
     if thread_id:
         kwargs["message_thread_id"] = thread_id
-    try:
-        sent = await ctx.bot.send_message(**kwargs)
-    except Exception:
-        kwargs.pop("reply_to_message_id", None)
+    attempts = [
+        {**kwargs, "reply_to_message_id": event.message_id},
+        kwargs,
+    ]
+    if thread_id:
+        bare = dict(kwargs)
+        bare.pop("message_thread_id", None)
+        attempts.append(bare)
+    last_exc: Exception | None = None
+    for send_kwargs in attempts:
         try:
-            sent = await ctx.bot.send_message(**kwargs)
-        except Exception:
-            log.exception("reaction reply failed")
-            return None
-    return sent.message_id
+            sent = await ctx.bot.send_message(**send_kwargs)
+            return sent.message_id
+        except Exception as exc:
+            last_exc = exc
+            continue
+    log.warning("reaction reply failed: %s", last_exc)
+    return None
 
 
 async def _upsert_react_pending(
@@ -252,6 +266,13 @@ async def _upsert_react_pending(
 async def _confirm_reaction(ctx: Ctx, event: MessageReactionUpdated, track: TrackRecord, emoji: str) -> None:
     existing = ctx.catalog.get_waiting_for_track(track.id)
     if existing and existing.phase in {"react_edit", "react_exit"}:
+        await _reply_card(
+            ctx,
+            event,
+            "Finish or cancel ✍️ first.",
+            None,
+            thread_id=track.thread_id,
+        )
         return
     if emoji == THUMBS_UP:
         op = "library"
@@ -318,7 +339,10 @@ async def _enter_edit(ctx: Ctx, event: MessageReactionUpdated, track: TrackRecor
         if existing.phase == "react_edit":
             refreshed = ctx.catalog.get_pending_review(existing.id)
             if refreshed:
-                await show_field_menu(ctx, refreshed)
+                try:
+                    await show_field_menu(ctx, refreshed)
+                except Exception:
+                    log.exception("edit UI refresh failed track=%s", track.id)
         return
     try:
         staged = await _stage_copy(ctx, track)
@@ -344,7 +368,13 @@ async def _enter_edit(ctx: Ctx, event: MessageReactionUpdated, track: TrackRecor
         source_report_json=_dumps(report),
     )
     if row:
-        await show_field_menu(ctx, row)
+        try:
+            await show_field_menu(ctx, row)
+        except Exception:
+            log.exception("edit UI failed track=%s", track.id)
+            await _reply_card(
+                ctx, event, "Could not open the editor. Remove ✍️ and try again.", None, thread_id=track.thread_id
+            )
 
 
 async def _exit_edit_prompt(ctx: Ctx, event: MessageReactionUpdated, track: TrackRecord) -> None:
