@@ -27,7 +27,7 @@ from app.relocate import (
     read_tags_for_card,
     relocate_track,
 )
-from app.tags import read_cover, read_tagset, write_tags
+from app.tags import normalize_tagset, read_cover, read_tagset, write_tags
 from app.util import sanitize_filename
 
 log = logging.getLogger(__name__)
@@ -326,7 +326,7 @@ async def _enter_edit(ctx: Ctx, event: MessageReactionUpdated, track: TrackRecor
         log.exception("stage for edit failed track=%s", track.id)
         await _reply_card(ctx, event, "Could not load this file for editing.", None, thread_id=track.thread_id)
         return
-    tags = await asyncio.to_thread(read_tagset, staged)
+    tags = normalize_tagset(await asyncio.to_thread(read_tagset, staged), ctx.genre)
     identity = identity_from_track(track)
     report = _loads(track.source_report_json, {})
     row = await _upsert_react_pending(

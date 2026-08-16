@@ -4,8 +4,14 @@ import unittest
 
 from app.models import TagSet
 from app.review_ui import bulk_choice, format_summary, review_keyboard
-from app.tags import fill_sparse_tags
-from app.util import format_artist_list, same_artist_names, split_artist_field
+from app.tags import fill_sparse_tags, normalize_tagset
+from app.util import (
+    diff_credit_html,
+    format_artist_list,
+    normalize_name_list,
+    same_artist_names,
+    split_artist_field,
+)
 
 
 def _toggle_fields(keyboard) -> set[str]:
@@ -62,7 +68,8 @@ class ReviewUiTests(unittest.TestCase):
         original = {"title": "Song", "artist": "B & A"}
         recommended = {"title": "Song", "artist": "A & B"}
         summary = format_summary(original, recommended, recommended)
-        self.assertIn("<b>Artist</b>: A &amp; B (reordered)", summary)
+        self.assertIn("<b>Artist</b>: A &amp; B", summary)
+        self.assertNotIn("(reordered)", summary)
         self.assertNotIn("file: B &amp; A", summary)
 
     def test_use_file_keeps_recommended_artist_order(self) -> None:
@@ -111,6 +118,14 @@ class ReviewUiTests(unittest.TestCase):
         self.assertNotIn("file: Bach", summary)
         self.assertNotIn("rec: Rock", summary)
 
+    def test_summary_composer_strikes_removed_names_only(self) -> None:
+        original = {"title": "Song", "composer": "Bach, Mozart & Salieri"}
+        recommended = {"title": "Song", "composer": "Bach & Mozart"}
+        summary = format_summary(original, recommended, recommended)
+        self.assertIn("<b>Composer</b>: Bach &amp; Mozart, <s>Salieri</s>", summary)
+        self.assertNotIn("<s>Bach</s>", summary)
+        self.assertNotIn("file: Bach", summary)
+
     def test_use_file_keeps_nonempty_sparse_fields(self) -> None:
         original = {"title": "Old", "genre": "", "date": "1999", "composer": ""}
         recommended = {"title": "New", "genre": "Rock", "date": "", "composer": "Bach"}
@@ -127,6 +142,49 @@ class ReviewUiTests(unittest.TestCase):
         self.assertEqual(chosen["title"], "New")
         self.assertEqual(chosen["genre"], "Jazz")
         self.assertEqual(chosen["composer"], "Bach")
+
+
+class FormatRoundTripTests(unittest.TestCase):
+    def test_split_then_format_normalizes_separators(self) -> None:
+        self.assertEqual(format_artist_list(split_artist_field("A; B / C feat. D")), "A, B, C & D")
+
+    def test_sorts_alphabetically_and_uses_ampersand(self) -> None:
+        self.assertEqual(format_artist_list(["C", "A", "B"]), "A, B & C")
+        self.assertEqual(format_artist_list(["A", "a", "B"]), "A & B")
+
+    def test_album_artist_leads_when_present(self) -> None:
+        names = ["Jimmy Napes", "Disclosure", "Sam Smith"]
+        self.assertEqual(
+            format_artist_list(names, lead="Sam Smith"),
+            "Sam Smith, Disclosure & Jimmy Napes",
+        )
+        self.assertEqual(
+            format_artist_list(names, lead="Sam Smith & Disclosure"),
+            "Sam Smith, Disclosure & Jimmy Napes",
+        )
+
+    def test_normalize_name_list_dedupes(self) -> None:
+        self.assertEqual(normalize_name_list("B, A, b & C"), "A, B & C")
+
+    def test_diff_credit_html_strikes_removed_only(self) -> None:
+        html = diff_credit_html("Bach, Mozart & Salieri", "Bach & Mozart")
+        self.assertEqual(html, "Bach &amp; Mozart, <s>Salieri</s>")
+        self.assertNotIn("<s>Bach</s>", html)
+        self.assertNotIn("<s>Mozart</s>", html)
+
+
+class NormalizeTagsetTests(unittest.TestCase):
+    def test_album_artist_leads_artist_and_composer(self) -> None:
+        tags = normalize_tagset(
+            TagSet(
+                albumartist="Sam Smith & Disclosure",
+                artist="Jimmy Napes, Disclosure, Sam Smith, sam smith",
+                composer="Jimmy Napes, Sam Smith",
+            )
+        )
+        self.assertEqual(tags.albumartist, "Disclosure & Sam Smith")
+        self.assertEqual(tags.artist, "Disclosure, Sam Smith & Jimmy Napes")
+        self.assertEqual(tags.composer, "Sam Smith & Jimmy Napes")
 
 
 class FillSparseTagsTests(unittest.TestCase):
@@ -146,11 +204,6 @@ class FillSparseTagsTests(unittest.TestCase):
         self.assertEqual(filled.composer, "Rec")
         self.assertEqual(filled.genre, "Rock")
         self.assertEqual(filled.date, "1999")
-
-
-class FormatRoundTripTests(unittest.TestCase):
-    def test_split_then_format_normalizes_separators(self) -> None:
-        self.assertEqual(format_artist_list(split_artist_field("A; B / C feat. D")), "A, B, C & D")
 
 
 if __name__ == "__main__":

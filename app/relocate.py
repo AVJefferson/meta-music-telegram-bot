@@ -10,7 +10,7 @@ from pathlib import Path
 from app.genre import genre_tokens
 from app.library import library_relative, place_file, review_relative, rmdir_empty, unlink_quiet, write_sidecar
 from app.models import Ctx, Identity, TagSet, TrackRecord, identity_from_dict, tagset_from_dict
-from app.tags import AudioMetrics, overlay_tagset, read_audio_metrics, read_cover, read_tagset, write_tags
+from app.tags import AudioMetrics, normalize_tagset, overlay_tagset, read_audio_metrics, read_cover, read_tagset, write_tags
 from app.util import sanitize_filename
 
 log = logging.getLogger(__name__)
@@ -223,6 +223,7 @@ async def relocate_track(
     staged: Path | None = None,
 ) -> TrackRecord:
     local = staged if staged and staged.is_file() else await ensure_local_flac(ctx, track)
+    tags = normalize_tagset(tags, ctx.genre)
     if tags.genre:
         tags = replace(tags, genre=ctx.genre.classify(genre_tokens(tags.genre)))
     cover, mime = await asyncio.to_thread(read_cover, local)

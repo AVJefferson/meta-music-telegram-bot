@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from aiogram import F, Router
@@ -12,7 +12,7 @@ from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.models import Ctx, PendingReview, identity_from_dict, tagset_from_dict
-from app.util import format_audio_block, html_esc, split_artist_field
+from app.util import diff_credit_html, format_audio_block, html_esc, split_artist_field
 
 log = logging.getLogger(__name__)
 
@@ -263,18 +263,6 @@ def _preview_value(key: str, value: str) -> str:
     return (value or "").strip()
 
 
-def _genre_line(old_raw: str, new_raw: str, mapper) -> str:
-    from app.genre import genre_tokens
-
-    old_allowed = mapper.classify(genre_tokens(old_raw))
-    new_allowed = mapper.classify(genre_tokens(new_raw))
-    new_html = mapper.format_html(new_raw) or "—"
-    if old_allowed != new_allowed:
-        old_html = html_esc(old_allowed) if old_allowed else "—"
-        return f"Genre: <s>{old_html}</s> → {new_html}"
-    return f"Genre: {new_html}"
-
-
 def format_edit_card(
     original,
     working,
@@ -286,6 +274,11 @@ def format_edit_card(
     genre_mapper=None,
     tech: str = "",
 ) -> str:
+    from app.genre import diff_genre_html
+    from app.tags import normalize_tagset
+
+    original = normalize_tagset(original, genre_mapper)
+    working = normalize_tagset(working, genre_mapper)
     lines = [header, ""]
     for key, label in PREVIEW_FIELDS:
         old_raw = getattr(original, key, "") or ""
@@ -295,8 +288,11 @@ def format_edit_card(
         changed = old_raw != new_raw if key != "lyrics" else old != new
         old_html = html_esc(old) if old else "—"
         new_html = html_esc(new) if new else "—"
+        if key == "composer":
+            lines.append(f"{label}: {diff_credit_html(old_raw, new_raw)}")
+            continue
         if key == "genre" and genre_mapper is not None:
-            lines.append(_genre_line(old_raw, new_raw, genre_mapper))
+            lines.append(f"{label}: {diff_genre_html(old_raw, new_raw, genre_mapper)}")
             continue
         if key == "title":
             if changed:
@@ -350,6 +346,16 @@ def _card_footer(row: PendingReview) -> str:
 def _card_hint(row: PendingReview, field: str | None) -> str:
     if field == "cover":
         return "Pick a cover photo, Keep / Remove, or reply to this card with an image."
+    if field == "genre":
+        prefix = (
+            "Reply to this card with text, or tap a suggestion."
+            if is_post_save(row)
+            else "Type a value or tap a suggestion."
+        )
+        return (
+            f"Editing <b>Genre</b>. {prefix}\n"
+            "Start with + , or | to add tags. Start with - to remove."
+        )
     if field == "lyrics":
         from app.enrich import lyrics_preview
 
@@ -655,7 +661,7 @@ async def _pull_lyrics(ctx: Ctx, row: PendingReview) -> None:
             "preview": lyrics_preview(hit.lyrics),
             "duration_label": format_clock(hit.duration),
         }
-        working_json = set_working_field(row, "lyrics", hit.lyrics)
+        working_json = set_working_field(row, "lyrics", hit.lyrics, ctx.genre)
     ctx.catalog.update_pending_review(
         row.id,
         working_json=working_json,
@@ -673,10 +679,11 @@ async def _pull_lyrics(ctx: Ctx, row: PendingReview) -> None:
     )
 
 
-def set_working_field(row: PendingReview, key: str, value: str) -> str:
-    tags = asdict(tagset_from_dict(_loads(row.working_json, {})))
-    tags[key] = value
-    return _dumps(tags)
+def set_working_field(row: PendingReview, key: str, value: str, genre=None) -> str:
+    from app.tags import normalize_tagset
+
+    tags = replace(tagset_from_dict(_loads(row.working_json, {})), **{key: value})
+    return _dumps(asdict(normalize_tagset(tags, genre)))
 
 
 def current_edit_field(row: PendingReview) -> str | None:
@@ -699,7 +706,7 @@ def apply_suggestion(row: PendingReview, key: str, index: int, genre=None) -> st
         suggestions = suggestions_for(report, key, genre, working)
     if index < 0 or index >= len(suggestions):
         return None
-    return set_working_field(row, key, suggestions[index])
+    return set_working_field(row, key, suggestions[index], genre)
 
 
 async def _apply_cover_option(ctx: Ctx, row: PendingReview, index: int) -> None:
@@ -843,7 +850,7 @@ async def handle_edit_callback(callback, ctx: Ctx) -> None:
                 )
             elif field:
                 ctx.catalog.update_pending_review(
-                    row.id, working_json=set_working_field(row, field, ""), status="waiting"
+                    row.id, working_json=set_working_field(row, field, "", ctx.genre), status="waiting"
                 )
             else:
                 ctx.catalog.update_pending_review(row.id, status="waiting")
@@ -898,7 +905,7 @@ async def handle_edit_text(message, ctx: Ctx) -> bool:
         tags = tagset_from_dict(_loads(row.working_json, {}))
         value = ctx.genre.merge_typed(tags.genre, message.text)
     ctx.catalog.update_pending_review(
-        row.id, working_json=set_working_field(row, field, value), status="waiting"
+        row.id, working_json=set_working_field(row, field, value, ctx.genre), status="waiting"
     )
     refreshed = ctx.catalog.get_pending_review(row.id)
     if refreshed:

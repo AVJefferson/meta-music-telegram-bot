@@ -8,7 +8,7 @@ from mutagen.flac import FLAC, Picture
 from mutagen.id3 import ID3
 
 from app.models import Enrichment, Identity, TagHints, TagSet
-from app.util import format_artist_list, is_synced_lrc, parse_track_number, sanitize_filename, year_from_date
+from app.util import format_artist_list, is_synced_lrc, normalize_name_list, parse_track_number, sanitize_filename, year_from_date
 
 ALLOWED = (
     "TITLE",
@@ -197,17 +197,30 @@ def audio_info(path: Path) -> tuple[float, int | None, int | None]:
 
 def identity_to_tags(identity: Identity, enrichment: Enrichment) -> TagSet:
     lyrics = enrichment.lyrics if is_synced_lrc(enrichment.lyrics) else ""
+    albumartist = format_artist_list(identity.album_artists) or format_artist_list(identity.artists)
     return TagSet(
         title=identity.title,
         album=identity.album,
-        artist=format_artist_list(identity.artists),
-        albumartist=format_artist_list(identity.album_artists) or format_artist_list(identity.artists),
-        composer=format_artist_list(identity.composers),
+        artist=format_artist_list(identity.artists, lead=albumartist),
+        albumartist=albumartist,
+        composer=format_artist_list(identity.composers, lead=albumartist),
         genre=enrichment.genre,
         date=year_from_date(identity.year) or identity.year,
         tracknumber=identity.tracknumber,
         discnumber=identity.discnumber,
         lyrics=lyrics or "",
+    )
+
+
+def normalize_tagset(tags: TagSet, mapper=None) -> TagSet:
+    albumartist = normalize_name_list(tags.albumartist)
+    genre = mapper.compose(tags.genre) if mapper is not None else tags.genre
+    return replace(
+        tags,
+        albumartist=albumartist,
+        artist=normalize_name_list(tags.artist, lead=albumartist),
+        composer=normalize_name_list(tags.composer, lead=albumartist),
+        genre=genre,
     )
 
 

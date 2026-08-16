@@ -200,7 +200,27 @@ class EditUiTests(unittest.TestCase):
         replaced = format_edit_card(
             old, TagSet(title="Stay", genre="rock | xyz"), header="x", genre_mapper=mapper
         )
-        self.assertIn("Genre: <s>pop</s> → rock | <s>xyz</s>", replaced)
+        self.assertIn("Genre: rock | <s>xyz</s> | <s>pop</s>", replaced)
+        self.assertNotIn("→", replaced)
+
+    def test_genre_prefix_add_and_remove(self) -> None:
+        mapper = GenreMapper(Path("genre_map.yaml"))
+        added = mapper.merge_typed("pop", "+ rock, xyz")
+        self.assertEqual(added, "pop | rock | xyz")
+        piped = mapper.merge_typed("pop", "| happy")
+        self.assertEqual(piped, "pop | happy")
+        removed = mapper.merge_typed("pop | rock | xyz", "- rock, xyz")
+        self.assertEqual(removed, "pop")
+        alias_removed = mapper.merge_typed("NCS | pop", "- ncs")
+        self.assertEqual(alias_removed, "pop")
+
+    def test_composer_strikes_removed_names_only(self) -> None:
+        old = TagSet(title="Stay", composer="Bach, Mozart & Salieri")
+        new = TagSet(title="Stay", composer="Bach & Mozart")
+        text = format_edit_card(old, new, header="<b>review</b>")
+        self.assertIn("Composer: Bach &amp; Mozart, <s>Salieri</s>", text)
+        self.assertNotIn("<s>Bach</s>", text)
+        self.assertNotIn("→", text.split("Composer:", 1)[1].split("\n", 1)[0])
 
     def test_lyrics_keyboard_has_pull_button(self) -> None:
         markup = field_value_keyboard(4, "lyrics", [])

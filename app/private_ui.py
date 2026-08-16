@@ -30,7 +30,7 @@ from app.edit_ui import EDITOR_FIELDS, current_edit_field, handle_edit_text, sho
 from app.genre import genre_tokens
 from app.membership import is_forum_member
 from app.models import Ctx, Identity, Job, PendingReview, tagset_from_dict
-from app.tags import audio_info, read_cover, read_tagset, write_tags
+from app.tags import audio_info, normalize_tagset, read_cover, read_tagset, write_tags
 from app.util import format_bytes, html_esc, sanitize_filename
 
 log = logging.getLogger(__name__)
@@ -364,7 +364,7 @@ async def _confirm_typed_review(ctx: Ctx, row: PendingReview) -> None:
 
     report = _loads(row.source_report_json, {})
     manual = report.get("manual_cover") or {"mode": "keep"}
-    tags = tagset_from_dict(_loads(row.working_json, {}))
+    tags = normalize_tagset(tagset_from_dict(_loads(row.working_json, {})), ctx.genre)
     if tags.genre:
         tags = replace(tags, genre=ctx.genre.classify(genre_tokens(tags.genre)))
     cover, mime = await asyncio.to_thread(read_cover, Path(row.local_path))

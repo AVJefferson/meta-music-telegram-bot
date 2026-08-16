@@ -12,8 +12,17 @@ from aiogram.types import (
     InlineKeyboardMarkup,
 )
 
+from app.genre import diff_genre_html
 from app.models import Ctx, TagSet
-from app.util import format_bytes, format_quality, html_esc, safe_link, same_artist_names
+from app.util import (
+    diff_credit_html,
+    format_bytes,
+    format_quality,
+    html_esc,
+    normalize_name_list,
+    safe_link,
+    same_artist_names,
+)
 
 TG_LIMIT = 4000
 FIELDS: list[tuple[str, str]] = [
@@ -147,15 +156,58 @@ def format_summary(
     *,
     reason: str = "",
     tech: str = "",
+    genre_mapper=None,
 ) -> str:
     lines = ["<b>Low confidence — check tags</b>"]
     if reason:
         lines.append(f"Reason: {html_esc(reason)}")
     lines.append("")
+    lead = normalize_name_list(
+        _get_field(working, "albumartist")
+        or _get_field(recommended, "albumartist")
+        or _get_field(original, "albumartist")
+    )
     for key, label in FIELDS:
         file_val = _get_field(original, key)
         rec_val = _get_field(recommended, key)
         now_val = _get_field(working, key)
+        if key == "albumartist":
+            file_val = normalize_name_list(file_val)
+            rec_val = normalize_name_list(rec_val)
+            now_val = normalize_name_list(now_val)
+        elif key in {"artist", "composer"}:
+            file_val = normalize_name_list(file_val, lead=lead)
+            rec_val = normalize_name_list(rec_val, lead=lead)
+            now_val = normalize_name_list(now_val, lead=lead)
+        elif key == "genre" and genre_mapper is not None:
+            file_val = genre_mapper.compose(file_val)
+            rec_val = genre_mapper.compose(rec_val)
+            now_val = genre_mapper.compose(now_val)
+        if key == "composer":
+            if not file_val or not rec_val:
+                shown = rec_val or file_val
+                line = f"<b>{label}</b>: {html_esc(shown) or '—'}"
+                if now_val != shown:
+                    line += f"\n  now: {html_esc(now_val) or '—'}"
+                lines.append(line)
+            else:
+                lines.append(f"<b>{label}</b>: {diff_credit_html(file_val, now_val)}")
+            continue
+        if key == "genre":
+            if not file_val or not rec_val:
+                shown = rec_val or file_val
+                shown_html = (
+                    genre_mapper.format_html(shown)
+                    if genre_mapper is not None
+                    else html_esc(shown)
+                )
+                line = f"<b>{label}</b>: {shown_html or '—'}"
+                if now_val != shown:
+                    line += f"\n  now: {html_esc(now_val) or '—'}"
+                lines.append(line)
+            else:
+                lines.append(f"<b>{label}</b>: {diff_genre_html(file_val, now_val, genre_mapper)}")
+            continue
         if key in SPARSE_FILL_FIELDS and (not file_val or not rec_val):
             shown = rec_val or file_val
             line = f"<b>{label}</b>: {html_esc(shown) or '—'}"

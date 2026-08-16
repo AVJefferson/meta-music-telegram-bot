@@ -214,15 +214,16 @@ def render_songlog(report: dict[str, Any]) -> str:
 
 
 def mb_snapshot(identity: Identity) -> dict[str, Any]:
+    albumartist = format_artist_list(identity.album_artists)
     return {
         "recording": identity.mb_recording_id or "",
         "release": identity.mb_release_id or "",
         "release_group": identity.mb_release_group_id or "",
         "title": identity.title,
-        "artist": format_artist_list(identity.artists),
+        "artist": format_artist_list(identity.artists, lead=albumartist),
         "album": identity.album,
-        "albumartist": format_artist_list(identity.album_artists),
-        "composer": format_artist_list(identity.composers),
+        "albumartist": albumartist,
+        "composer": format_artist_list(identity.composers, lead=albumartist),
         "year": identity.year,
         "track": identity.tracknumber,
         "disc": identity.discnumber,

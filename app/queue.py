@@ -62,6 +62,7 @@ from app.tags import (
     fill_sparse_tags,
     hints_to_tagset,
     identity_to_tags,
+    normalize_tagset,
     read_audio_metrics,
     read_cover,
     read_hints,
@@ -307,6 +308,7 @@ async def process_job(job: Job, ctx: Ctx) -> None:
         )
         tags = identity_to_tags(identity, enrichment)
         tags = fill_sparse_tags(hints_to_tagset(hints), tags)
+        tags = normalize_tagset(tags, ctx.genre)
         if not tags.title:
             tags.title = Path(job.file_name).stem
 
@@ -386,7 +388,8 @@ async def start_tag_review(
     pending_dir.mkdir(parents=True, exist_ok=True)
     dest = pending_dir / (sanitize_filename(Path(job.file_name).stem) + ".flac")
     dest = await asyncio.to_thread(place_file, tmp, dest)
-    original = hints_to_tagset(hints)
+    original = normalize_tagset(hints_to_tagset(hints), ctx.genre)
+    tags = normalize_tagset(tags, ctx.genre)
     if job.source_pending_id:
         pending_id = job.source_pending_id
         ctx.catalog.update_pending_review(
@@ -443,6 +446,7 @@ async def start_tag_review(
             tags,
             reason=identity.confidence_reason,
             tech=format_audio_block(_metrics_from_identity(identity, dest)),
+            genre_mapper=ctx.genre,
         )
         markup = review_keyboard(pending_id, original, tags, tags)
         status_id = await edit_status(ctx, job, text, markup)
@@ -1903,6 +1907,7 @@ async def _refresh_tag_ui(ctx: Ctx, row: PendingReview) -> None:
         working,
         reason=identity.confidence_reason,
         tech=format_audio_block(_metrics_from_identity(identity, path)),
+        genre_mapper=ctx.genre,
     )
     status_id = await edit_status(ctx, job, text, review_keyboard(row.id, original, recommended, working))
     if status_id != row.status_message_id:
@@ -2011,7 +2016,9 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
         original, recommended, working, _identity, _report, _cands = _load_pending_state(row)
         working = toggle_working_field(original, recommended, working, action.field)
         ctx.catalog.update_pending_review(
-            row.id, working_json=_dumps(working), status="waiting"
+            row.id,
+            working_json=_dumps(asdict(normalize_tagset(tagset_from_dict(working), ctx.genre))),
+            status="waiting",
         )
         row = ctx.catalog.get_pending_review(row.id)
         if row:
@@ -2022,7 +2029,9 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
         original, recommended, _working, _identity, _report, _cands = _load_pending_state(row)
         working = bulk_choice(original, recommended, use_file=action.op == "use_file")
         ctx.catalog.update_pending_review(
-            row.id, working_json=_dumps(working), status="waiting"
+            row.id,
+            working_json=_dumps(asdict(normalize_tagset(tagset_from_dict(working), ctx.genre))),
+            status="waiting",
         )
         row = ctx.catalog.get_pending_review(row.id)
         if row:
@@ -2075,7 +2084,7 @@ async def cancel_pending(ctx: Ctx, row: PendingReview) -> None:
 
 async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
     _original, _recommended, working, identity, report, _cands = _load_pending_state(row)
-    tags = tagset_from_dict(working)
+    tags = normalize_tagset(tagset_from_dict(working), ctx.genre)
     local = Path(row.local_path)
     if not local.exists():
         await edit_status(ctx, _job_from_pending(row), "Local file missing. Cannot continue.")
@@ -2200,6 +2209,7 @@ async def _apply_candidate(ctx: Ctx, row: PendingReview, index: int) -> None:
         cover_source="file" if cover else "none",
     )
     tags = fill_sparse_tags(tagset_from_dict(_original), identity_to_tags(new_identity, enrichment))
+    tags = normalize_tagset(tags, ctx.genre)
     # Not written to disk yet — the file is still under review, and confirm or
     # expiry will write the final tags.
     report = merge_enrichment(report, enrichment)
@@ -2251,7 +2261,7 @@ async def expire_pending(ctx: Ctx) -> None:
         try:
             job = _job_from_pending(row)
             if row.phase == "tags":
-                working = tagset_from_dict(_loads(row.working_json, {}))
+                working = normalize_tagset(tagset_from_dict(_loads(row.working_json, {})), ctx.genre)
                 identity = identity_from_dict(_loads(row.identity_json, {}))
                 report = _loads(row.source_report_json, {})
                 local = Path(row.local_path)

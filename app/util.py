@@ -14,7 +14,7 @@ _ARTIST_SEPARATORS = re.compile(
 )
 
 
-def format_artist_list(names: list[str]) -> str:
+def unique_names(names: list[str]) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
     for raw in names:
@@ -26,13 +26,59 @@ def format_artist_list(names: list[str]) -> str:
             continue
         seen.add(key)
         cleaned.append(name)
-    if not cleaned:
+    return cleaned
+
+
+def join_credit_names(names: list[str], *, amp: str = " & ") -> str:
+    if not names:
         return ""
-    if len(cleaned) == 1:
-        return cleaned[0]
-    if len(cleaned) == 2:
-        return f"{cleaned[0]} & {cleaned[1]}"
-    return f"{', '.join(cleaned[:-1])} & {cleaned[-1]}"
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]}{amp}{names[1]}"
+    return f"{', '.join(names[:-1])}{amp}{names[-1]}"
+
+
+def sort_credit_names(names: list[str], *, lead: list[str] | str | None = None) -> list[str]:
+    names = unique_names(names)
+    if isinstance(lead, str):
+        lead_names = unique_names(split_artist_field(lead))
+    else:
+        lead_names = unique_names(list(lead or []))
+    by_key = {name.casefold(): name for name in names}
+    head: list[str] = []
+    used: set[str] = set()
+    for lead_name in lead_names:
+        key = lead_name.casefold()
+        if key in by_key and key not in used:
+            head.append(by_key[key])
+            used.add(key)
+    rest = [name for name in names if name.casefold() not in used]
+    rest.sort(key=lambda name: name.casefold())
+    return head + rest
+
+
+def format_artist_list(names: list[str], *, lead: list[str] | str | None = None) -> str:
+    return join_credit_names(sort_credit_names(names, lead=lead))
+
+
+def normalize_name_list(value: str, *, lead: str = "") -> str:
+    return format_artist_list(split_artist_field(value), lead=lead)
+
+
+def diff_credit_html(old: str, new: str) -> str:
+    old_names = unique_names(split_artist_field(old))
+    new_names = unique_names(split_artist_field(new))
+    new_keys = {name.casefold() for name in new_names}
+    live = [html_esc(name) for name in new_names]
+    removed = [f"<s>{html_esc(name)}</s>" for name in old_names if name.casefold() not in new_keys]
+    body = join_credit_names(live, amp=" &amp; ")
+    if not live and not removed:
+        return "—"
+    if not removed:
+        return body or "—"
+    extra = ", ".join(removed)
+    return f"{body}, {extra}" if body else extra
 
 
 def sanitize_filename(name: str, max_len: int = 120) -> str:
