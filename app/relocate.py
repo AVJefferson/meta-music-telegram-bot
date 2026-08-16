@@ -9,7 +9,7 @@ from pathlib import Path
 
 from app.library import library_relative, place_file, review_relative, rmdir_empty, unlink_quiet, write_sidecar
 from app.models import Ctx, Identity, TagSet, TrackRecord, identity_from_dict, tagset_from_dict
-from app.tags import read_cover, read_tagset, write_tags
+from app.tags import overlay_tagset, read_cover, read_tagset, write_tags
 from app.util import sanitize_filename
 
 log = logging.getLogger(__name__)
@@ -326,11 +326,25 @@ async def delete_track(ctx: Ctx, track: TrackRecord) -> None:
 
 
 def read_tags_for_card(track: TrackRecord) -> TagSet:
+    tags = tags_from_track(track)
     if track.local_path:
         path = Path(track.local_path)
         if path.is_file():
             try:
-                return read_tagset(path)
+                return overlay_tagset(tags, read_tagset(path))
             except Exception:
                 log.debug("read_tagset failed path=%s", path, exc_info=True)
-    return tags_from_track(track)
+    return tags
+
+
+async def hydrate_track_tags(ctx: Ctx, track: TrackRecord) -> TrackRecord:
+    local = await ensure_local_flac(ctx, track)
+    tags = await asyncio.to_thread(read_tagset, local)
+    fields: dict[str, object] = {"local_path": str(local)}
+    if any(asdict(tags).values()):
+        fields["title"] = tags.title or track.title
+        fields["artist"] = tags.artist or track.artist
+        fields["album"] = tags.album or track.album
+        fields["tags_json"] = json.dumps(asdict(tags), ensure_ascii=False)
+    ctx.catalog.update_track(track.id, **fields)
+    return ctx.catalog.get_track(track.id) or track

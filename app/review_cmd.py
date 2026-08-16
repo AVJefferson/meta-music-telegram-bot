@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from pathlib import Path
 
@@ -12,15 +11,11 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from app.membership import is_forum_member
 from app.models import Ctx, TrackRecord
 from app.queue import tag_preview
-from app.relocate import ensure_local_flac, read_tags_for_card
+from app.relocate import hydrate_track_tags, read_tags_for_card
 from app.util import html_esc, safe_link
 
 log = logging.getLogger(__name__)
 PAGE_SIZE = 8
-
-
-def _dumps(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False)
 
 
 def review_label(track: TrackRecord) -> str:
@@ -72,7 +67,6 @@ async def _sync_drive_review(ctx: Ctx) -> None:
     for item in items:
         if item.file_id in known:
             continue
-        stem = Path(item.name).stem
         ctx.catalog.insert_pending(
             kind="review",
             mb_recording_id=None,
@@ -82,7 +76,7 @@ async def _sync_drive_review(ctx: Ctx) -> None:
             relative_path=item.relative_path,
             bit_depth=None,
             sample_rate=None,
-            title=stem,
+            title="",
             artist="",
             album="",
             status="uploaded",
@@ -127,34 +121,10 @@ async def _show_list(message: Message, ctx: Ctx, page: int = 0, *, edit: bool = 
 
 
 async def _send_card(callback: CallbackQuery, ctx: Ctx, track: TrackRecord) -> None:
-    if not track.title and track.drive_file_id:
-        try:
-            local = await ensure_local_flac(ctx, track)
-            tags = read_tags_for_card(ctx.catalog.get_track(track.id) or track)
-            ctx.catalog.update_track(
-                track.id,
-                title=tags.title or track.title,
-                artist=tags.artist or track.artist,
-                album=tags.album or track.album,
-                tags_json=_dumps(
-                    {
-                        "title": tags.title,
-                        "album": tags.album,
-                        "artist": tags.artist,
-                        "albumartist": tags.albumartist,
-                        "composer": tags.composer,
-                        "genre": tags.genre,
-                        "date": tags.date,
-                        "tracknumber": tags.tracknumber,
-                        "discnumber": tags.discnumber,
-                        "lyrics": tags.lyrics,
-                    }
-                ),
-                local_path=str(local),
-            )
-            track = ctx.catalog.get_track(track.id) or track
-        except Exception:
-            log.exception("review card hydrate failed track=%s", track.id)
+    try:
+        track = await hydrate_track_tags(ctx, track)
+    except Exception:
+        log.exception("review card hydrate failed track=%s", track.id)
     text = format_song_card(track)
     kwargs: dict = {"text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     assert callback.message is not None

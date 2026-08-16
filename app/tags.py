@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from contextlib import suppress
+from dataclasses import fields, replace
 from pathlib import Path
 
 from mutagen.flac import FLAC, Picture
+from mutagen.id3 import ID3
 
 from app.models import Enrichment, Identity, TagHints, TagSet
 from app.util import format_artist_list, is_synced_lrc, parse_track_number, sanitize_filename, year_from_date
@@ -23,26 +25,112 @@ ALLOWED = (
 SPARSE_TAG_FIELDS = ("composer", "genre", "date")
 
 
-def _first(audio: FLAC, *keys: str) -> str:
-    for key in keys:
-        values = audio.get(key)
-        if values:
-            return str(values[0]).strip()
+def _norm_key(key: str) -> str:
+    return "".join(ch for ch in key.casefold() if ch.isalnum())
+
+
+def overlay_tagset(base: TagSet, extra: TagSet) -> TagSet:
+    updates = {item.name: getattr(extra, item.name) for item in fields(TagSet) if getattr(extra, item.name)}
+    return replace(base, **updates) if updates else base
+
+
+def _lookup(index: dict[str, str], *names: str) -> str:
+    for name in names:
+        value = index.get(_norm_key(name))
+        if value:
+            return value
     return ""
 
 
+def _vorbis_index(audio: FLAC) -> dict[str, str]:
+    index: dict[str, str] = {}
+    if not audio.tags:
+        return index
+    for key, values in audio.tags.items():
+        if not values:
+            continue
+        text = str(values[0]).strip()
+        if text:
+            index[_norm_key(str(key))] = text
+    return index
+
+
+def _id3_frame_text(frame: object) -> str:
+    text = getattr(frame, "text", None)
+    if isinstance(text, str):
+        return text.strip()
+    if text:
+        return str(text[0]).strip()
+    return ""
+
+
+def _id3_index(path: Path) -> dict[str, str]:
+    try:
+        id3 = ID3(path)
+    except Exception:
+        return {}
+    mapping = {
+        "title": ("TIT2",),
+        "album": ("TALB",),
+        "artist": ("TPE1",),
+        "albumartist": ("TPE2",),
+        "composer": ("TCOM",),
+        "genre": ("TCON",),
+        "date": ("TDRC", "TYER", "TDRL", "TDAT"),
+        "tracknumber": ("TRCK",),
+        "discnumber": ("TPOS",),
+        "lyrics": ("USLT",),
+    }
+    index: dict[str, str] = {}
+    for field, frame_ids in mapping.items():
+        for frame_id in frame_ids:
+            for frame in id3.getall(frame_id):
+                value = _id3_frame_text(frame)
+                if value:
+                    index[field] = value
+                    break
+            if field in index:
+                break
+    for frame in id3.getall("TXXX"):
+        desc = _norm_key(str(getattr(frame, "desc", "") or ""))
+        value = _id3_frame_text(frame)
+        if not desc or not value or desc in index:
+            continue
+        if desc in {"albumartist", "albumartists"}:
+            index.setdefault("albumartist", value)
+        elif desc in mapping or desc in {"year", "date"}:
+            index.setdefault("date" if desc == "year" else desc, value)
+    return index
+
+
+def _tagset_from_index(index: dict[str, str]) -> TagSet:
+    date = _lookup(index, "date", "year", "origyear", "originaldate")
+    return TagSet(
+        title=_lookup(index, "title"),
+        album=_lookup(index, "album"),
+        artist=_lookup(index, "artist"),
+        albumartist=_lookup(index, "albumartist", "albumartists"),
+        composer=_lookup(index, "composer"),
+        genre=_lookup(index, "genre"),
+        date=year_from_date(date) or date,
+        tracknumber=parse_track_number(_lookup(index, "tracknumber", "track")),
+        discnumber=parse_track_number(_lookup(index, "discnumber", "disc")),
+        lyrics=_lookup(index, "lyrics", "unsyncedlyrics", "unsyncedlyric"),
+    )
+
+
 def read_hints(path: Path, filename: str) -> TagHints:
-    audio = FLAC(path)
+    tags = read_tagset(path)
     return TagHints(
-        title=_first(audio, "title", "TITLE"),
-        album=_first(audio, "album", "ALBUM"),
-        artist=_first(audio, "artist", "ARTIST"),
-        albumartist=_first(audio, "albumartist", "ALBUM ARTIST", "ALBUMARTIST"),
-        composer=_first(audio, "composer", "COMPOSER"),
-        genre=_first(audio, "genre", "GENRE"),
-        date=_first(audio, "date", "DATE", "year", "YEAR"),
-        tracknumber=_first(audio, "tracknumber", "TRACKNUMBER", "track"),
-        discnumber=_first(audio, "discnumber", "DISCNUMBER"),
+        title=tags.title,
+        album=tags.album,
+        artist=tags.artist,
+        albumartist=tags.albumartist,
+        composer=tags.composer,
+        genre=tags.genre,
+        date=tags.date,
+        tracknumber=tags.tracknumber,
+        discnumber=tags.discnumber,
         filename=filename,
     )
 
@@ -63,19 +151,10 @@ def hints_to_tagset(hints: TagHints) -> TagSet:
 
 
 def read_tagset(path: Path) -> TagSet:
-    audio = FLAC(path)
-    return TagSet(
-        title=_first(audio, "title", "TITLE"),
-        album=_first(audio, "album", "ALBUM"),
-        artist=_first(audio, "artist", "ARTIST"),
-        albumartist=_first(audio, "albumartist", "ALBUM ARTIST", "ALBUMARTIST"),
-        composer=_first(audio, "composer", "COMPOSER"),
-        genre=_first(audio, "genre", "GENRE"),
-        date=_first(audio, "date", "DATE", "year", "YEAR"),
-        tracknumber=_first(audio, "tracknumber", "TRACKNUMBER", "track"),
-        discnumber=_first(audio, "discnumber", "DISCNUMBER"),
-        lyrics=_first(audio, "lyrics", "LYRICS"),
-    )
+    tags = TagSet()
+    with suppress(Exception):
+        tags = overlay_tagset(tags, _tagset_from_index(_vorbis_index(FLAC(path))))
+    return overlay_tagset(tags, _tagset_from_index(_id3_index(path)))
 
 
 def read_cover(path: Path) -> tuple[bytes | None, str | None]:
