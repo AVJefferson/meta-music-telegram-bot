@@ -14,6 +14,8 @@ class Settings(BaseSettings):
 
     log_level: str = "info"
     enable_log_per_music_file: bool = False
+    # Chosen cover photo stays this long before the picker gallery is deleted.
+    cover_choice_hold_seconds: float = Field(default=2.0, ge=0)
 
     acoustid_api_key: str
     acoustid_min_score: float = 0.8

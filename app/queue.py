@@ -61,7 +61,6 @@ from app.tags import fill_sparse_tags, hints_to_tagset, identity_to_tags, read_c
 from app.util import html_esc, safe_link, sanitize_filename
 
 log = logging.getLogger(__name__)
-COVER_CHOICE_HOLD = 1.0
 _cover_pick_lock = asyncio.Lock()
 
 
@@ -1114,7 +1113,7 @@ async def _delete_cover_choice_gallery(
             seen.add(mid)
     await _delete_cover_gallery(ctx, chat_id, others)
     if delay_chosen:
-        await asyncio.sleep(COVER_CHOICE_HOLD)
+        await asyncio.sleep(ctx.settings.cover_choice_hold_seconds)
     if chosen_id is not None:
         await _delete_cover_gallery(ctx, chat_id, [chosen_id])
 

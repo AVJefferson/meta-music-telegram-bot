@@ -6,12 +6,13 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from PIL import Image
 
 from app.catalog import Catalog
 from app.covers import add_cover_option, cover_wait_role, finalize_cover_labels
-from app.queue import cover_park_role
+from app.queue import _delete_cover_choice_gallery, cover_park_role
 from app.review_ui import cover_option_text, format_cover_prompt
 
 
@@ -123,6 +124,34 @@ class CoverLabelTests(unittest.TestCase):
         self.assertEqual(cover_option_text(0, option), "1. file == iTunes (1200x1200)")
         prompt = format_cover_prompt("Album", "Artist", [option], "song.flac")
         self.assertIn("1. file == iTunes (1200x1200)", prompt)
+
+
+class CoverChoiceHoldTests(unittest.IsolatedAsyncioTestCase):
+    async def test_holds_chosen_cover_for_settings_seconds(self) -> None:
+        deleted: list[int] = []
+        slept: list[float] = []
+
+        class Bot:
+            async def delete_message(self, *, chat_id, message_id):
+                del chat_id
+                deleted.append(message_id)
+
+        ctx = SimpleNamespace(
+            settings=SimpleNamespace(cover_choice_hold_seconds=2.0),
+            bot=Bot(),
+        )
+        picker = {
+            "options": [{"message_id": 10}, {"message_id": 11}],
+            "media_message_ids": [10, 11],
+        }
+
+        async def fake_sleep(seconds: float) -> None:
+            slept.append(seconds)
+
+        with patch("app.queue.asyncio.sleep", fake_sleep):
+            await _delete_cover_choice_gallery(ctx, -100, picker, 1, delay_chosen=True)
+        self.assertEqual(deleted, [10, 11])
+        self.assertEqual(slept, [2.0])
 
 
 if __name__ == "__main__":
