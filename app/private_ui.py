@@ -9,7 +9,7 @@ import shutil
 import socket
 import ssl
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -27,6 +27,7 @@ from PIL import Image
 
 from app.botapi import discard_download
 from app.edit_ui import EDITOR_FIELDS, current_edit_field, handle_edit_text, show_field_menu
+from app.genre import genre_tokens
 from app.membership import is_forum_member
 from app.models import Ctx, Identity, Job, PendingReview, tagset_from_dict
 from app.tags import audio_info, read_cover, read_tagset, write_tags
@@ -355,6 +356,8 @@ async def _confirm_typed_review(ctx: Ctx, row: PendingReview) -> None:
     report = _loads(row.source_report_json, {})
     manual = report.get("manual_cover") or {"mode": "keep"}
     tags = tagset_from_dict(_loads(row.working_json, {}))
+    if tags.genre:
+        tags = replace(tags, genre=ctx.genre.classify(genre_tokens(tags.genre)))
     cover, mime = await asyncio.to_thread(read_cover, Path(row.local_path))
     if manual.get("mode") == "remove":
         cover, mime = None, None

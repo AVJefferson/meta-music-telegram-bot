@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import logging
+import re
+from dataclasses import dataclass
 
 import httpx
 from PIL import Image
@@ -15,6 +17,26 @@ log = logging.getLogger(__name__)
 MAX_COVER_BYTES = 2_000_000
 MAX_COVER_PX = 1400
 CAA_FRONT_LIMIT = 5
+_LRC_STAMP = re.compile(r"\[\d{1,2}:\d{2}(?:[\.:]\d+)?\]")
+
+
+@dataclass
+class LyricsHit:
+    lyrics: str = ""
+    duration: float | None = None
+    instrumental: bool = False
+
+
+def lyrics_preview(text: str, *, lines: int = 3) -> str:
+    out: list[str] = []
+    for raw in (text or "").splitlines():
+        line = _LRC_STAMP.sub("", raw).strip()
+        if not line or (line.startswith("[") and line.endswith("]")):
+            continue
+        out.append(line)
+        if len(out) >= lines:
+            break
+    return "\n".join(out)
 
 
 def _fit_cover(data: bytes) -> tuple[bytes, str]:
@@ -319,9 +341,9 @@ async def _lastfm_tags(http: httpx.AsyncClient, api_key: str, identity: Identity
     return out
 
 
-async def _lrclib(http: httpx.AsyncClient, identity: Identity) -> tuple[str | None, bool]:
+async def fetch_lrclib(http: httpx.AsyncClient, identity: Identity) -> LyricsHit | None:
     if not identity.title or not identity.artists:
-        return None, False
+        return None
     params = {
         "track_name": identity.title,
         "artist_name": identity.artists[0],
@@ -345,14 +367,32 @@ async def _lrclib(http: httpx.AsyncClient, identity: Identity) -> tuple[str | No
             response.raise_for_status()
             payload = response.json()
     except httpx.HTTPError:
-        return None, False
+        return None
     if not payload:
-        return None, False
+        return None
+    duration_raw = payload.get("duration")
+    try:
+        duration = float(duration_raw) if duration_raw is not None else None
+    except (TypeError, ValueError):
+        duration = None
     if payload.get("instrumental"):
+        return LyricsHit(duration=duration, instrumental=True)
+    synced = str(payload.get("syncedLyrics") or "")
+    plain = str(payload.get("plainLyrics") or "")
+    lyrics = synced if is_synced_lrc(synced) else plain
+    if not lyrics.strip():
+        return None
+    return LyricsHit(lyrics=lyrics, duration=duration)
+
+
+async def _lrclib(http: httpx.AsyncClient, identity: Identity) -> tuple[str | None, bool]:
+    hit = await fetch_lrclib(http, identity)
+    if hit is None:
+        return None, False
+    if hit.instrumental:
         return None, True
-    synced = payload.get("syncedLyrics")
-    if is_synced_lrc(synced):
-        return synced, False
+    if is_synced_lrc(hit.lyrics):
+        return hit.lyrics, False
     return None, False
 
 

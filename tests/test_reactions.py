@@ -15,6 +15,7 @@ from app.catalog import Catalog
 from app.edit_ui import (
     apply_suggestion,
     exit_edit_keyboard,
+    field_value_keyboard,
     format_edit_card,
     parse_edit_callback,
     suggestions_for,
@@ -112,6 +113,9 @@ class EditUiTests(unittest.TestCase):
         assert cover is not None
         self.assertEqual(cover.op, "cover_pick")
         self.assertEqual(cover.index, 2)
+        fetch = parse_edit_callback("e3:lyrics_net")
+        assert fetch is not None
+        self.assertEqual(fetch.op, "lyrics_net")
 
     def test_strikethrough_changed_fields(self) -> None:
         old = TagSet(title="Old", artist="A", album="LP")
@@ -138,6 +142,15 @@ class EditUiTests(unittest.TestCase):
         mapper = GenreMapper(Path("genre_map.yaml"))
         genres = suggestions_for(report, "genre", mapper)
         self.assertTrue(any("NCS" in item for item in genres))
+        albumartists = suggestions_for(
+            report,
+            "albumartist",
+            working=TagSet(artist="Sam Smith & Disclosure", albumartist=""),
+        )
+        self.assertIn("Sam Smith & Disclosure", albumartists)
+        self.assertIn("Sam Smith", albumartists)
+        self.assertIn("Disclosure", albumartists)
+        self.assertIn("File Artist", albumartists)
         row = PendingReview(
             id=1,
             phase="react_edit",
@@ -171,6 +184,44 @@ class EditUiTests(unittest.TestCase):
         updated = apply_suggestion(row, "title", 1)
         assert updated is not None
         self.assertIn("MB Title", updated)
+
+    def test_unknown_genre_uses_html_strikethrough(self) -> None:
+        mapper = GenreMapper(Path("genre_map.yaml"))
+        merged = mapper.merge_typed("pop", "xyz")
+        self.assertEqual(merged, "pop | xyz")
+        self.assertEqual(mapper.format_html(merged), "pop | <s>xyz</s>")
+        mixed = mapper.merge_typed("pop", "rock | xyz")
+        self.assertEqual(mixed, "rock | xyz")
+        old = TagSet(title="Stay", genre="pop")
+        new = TagSet(title="Stay", genre=merged)
+        text = format_edit_card(old, new, header="<b>review</b>", genre_mapper=mapper)
+        self.assertIn("Genre: pop | <s>xyz</s>", text)
+        self.assertNotIn("<s>pop</s>", text)
+        replaced = format_edit_card(
+            old, TagSet(title="Stay", genre="rock | xyz"), header="x", genre_mapper=mapper
+        )
+        self.assertIn("Genre: <s>pop</s> → rock | <s>xyz</s>", replaced)
+
+    def test_lyrics_keyboard_has_pull_button(self) -> None:
+        markup = field_value_keyboard(4, "lyrics", [])
+        labels = [btn.text for row in markup.inline_keyboard for btn in row]
+        data = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+        self.assertIn("Pull from internet", labels)
+        self.assertIn("e4:lyrics_net", data)
+        title_kb = field_value_keyboard(4, "title", ["Stay With Me"])
+        title_labels = [btn.text for row in title_kb.inline_keyboard for btn in row]
+        self.assertNotIn("Pull from internet", title_labels)
+
+
+class LyricsPreviewTests(unittest.TestCase):
+    def test_preview_and_clock(self) -> None:
+        from app.enrich import lyrics_preview
+        from app.util import format_clock
+
+        lrc = "[ar:Sam]\n[00:12.00] Guess it's true\n[00:16.50] I'm not good\n[00:20.00] At a one night stand"
+        self.assertEqual(lyrics_preview(lrc), "Guess it's true\nI'm not good\nAt a one night stand")
+        self.assertEqual(format_clock(172), "2:52")
+        self.assertEqual(format_clock(None), "")
 
 
 class GenreNcsTests(unittest.TestCase):

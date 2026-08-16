@@ -114,6 +114,15 @@ def file_stem_hints(filename: str) -> str:
     return stem.strip()
 
 
+def format_clock(seconds: float | None) -> str:
+    if seconds is None:
+        return ""
+    total = round(float(seconds))
+    if total < 0:
+        return ""
+    return f"{total // 60}:{total % 60:02d}"
+
+
 def format_bytes(n: int | None) -> str:
     if n is None:
         return "?"

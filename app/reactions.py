@@ -5,7 +5,7 @@ import json
 import logging
 import shutil
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,6 +17,7 @@ from app.edit_ui import (
     exit_edit_keyboard,
     show_field_menu,
 )
+from app.genre import genre_tokens
 from app.membership import is_forum_member
 from app.models import Ctx, Job, PendingReview, TrackRecord, identity_from_dict, tagset_from_dict
 from app.relocate import (
@@ -527,6 +528,8 @@ async def _handle_exit(ctx: Ctx, row: PendingReview, action: str) -> None:
         ctx.catalog.update_pending_review(row.id, status="waiting")
         await edit_status(ctx, job, "Staged file missing. Add ✍️ and try again.")
         return
+    if tags.genre:
+        tags = replace(tags, genre=ctx.genre.classify(genre_tokens(tags.genre)))
     try:
         await _clear_edit_cover(ctx, row)
         await _apply_manual_cover(row, tags, staged)

@@ -12,7 +12,7 @@ from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.models import Ctx, PendingReview, identity_from_dict, tagset_from_dict
-from app.util import html_esc
+from app.util import html_esc, split_artist_field
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ def parse_edit_callback(data: str | None) -> EditAction | None:
     if not prefix[1:].isdigit():
         return None
     pending_id = int(prefix[1:])
-    if rest in {"fields", "done", "cancel", "keep", "clear", "back", "cover"}:
+    if rest in {"fields", "done", "cancel", "keep", "clear", "back", "cover", "lyrics_net"}:
         return EditAction(pending_id, rest)
     if rest.startswith("cv:") and rest[3:].isdigit():
         return EditAction(pending_id, "cover_pick", index=int(rest[3:]))
@@ -81,7 +81,7 @@ def _add_unique(values: list[str], raw: object) -> None:
     values.append(text)
 
 
-def suggestions_for(report: dict, key: str, genre=None) -> list[str]:
+def suggestions_for(report: dict, key: str, genre=None, working=None) -> list[str]:
     file_tags = report.get("file_tags") or {}
     filename = report.get("filename") or {}
     mb = report.get("musicbrainz") or {}
@@ -99,8 +99,25 @@ def suggestions_for(report: dict, key: str, genre=None) -> list[str]:
         for raw in (file_tags.get("album"), mb.get("album"), itunes.get("album"), chosen.get("album")):
             _add_unique(out, raw)
     elif key == "albumartist":
-        for raw in (file_tags.get("albumartist"), mb.get("albumartist"), chosen.get("albumartist")):
+        for raw in (
+            file_tags.get("albumartist"),
+            mb.get("albumartist"),
+            chosen.get("albumartist"),
+            getattr(working, "albumartist", None),
+        ):
             _add_unique(out, raw)
+        for raw in (
+            getattr(working, "artist", None),
+            file_tags.get("artist"),
+            mb.get("artist"),
+            itunes.get("artist"),
+            chosen.get("artist"),
+        ):
+            if not raw:
+                continue
+            _add_unique(out, raw)
+            for name in split_artist_field(str(raw)):
+                _add_unique(out, name)
     elif key == "composer":
         for raw in (file_tags.get("composer"), mb.get("composer"), chosen.get("composer")):
             _add_unique(out, raw)
@@ -156,6 +173,10 @@ def field_menu_keyboard(pending_id: int, *, done: bool) -> InlineKeyboardMarkup:
 
 def field_value_keyboard(pending_id: int, key: str, suggestions: list[str]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
+    if key == "lyrics":
+        rows.append(
+            [InlineKeyboardButton(text="Pull from internet", callback_data=f"e{pending_id}:lyrics_net")]
+        )
     for index, value in enumerate(suggestions):
         label = value if len(value) <= 60 else value[:59] + "…"
         rows.append(
@@ -242,6 +263,18 @@ def _preview_value(key: str, value: str) -> str:
     return (value or "").strip()
 
 
+def _genre_line(old_raw: str, new_raw: str, mapper) -> str:
+    from app.genre import genre_tokens
+
+    old_allowed = mapper.classify(genre_tokens(old_raw))
+    new_allowed = mapper.classify(genre_tokens(new_raw))
+    new_html = mapper.format_html(new_raw) or "—"
+    if old_allowed != new_allowed:
+        old_html = html_esc(old_allowed) if old_allowed else "—"
+        return f"Genre: <s>{old_html}</s> → {new_html}"
+    return f"Genre: {new_html}"
+
+
 def format_edit_card(
     original,
     working,
@@ -250,6 +283,7 @@ def format_edit_card(
     cover_line: str | None = None,
     hint: str = "",
     footer: str = "",
+    genre_mapper=None,
 ) -> str:
     lines = [header, ""]
     for key, label in PREVIEW_FIELDS:
@@ -260,6 +294,9 @@ def format_edit_card(
         changed = old_raw != new_raw if key != "lyrics" else old != new
         old_html = html_esc(old) if old else "—"
         new_html = html_esc(new) if new else "—"
+        if key == "genre" and genre_mapper is not None:
+            lines.append(_genre_line(old_raw, new_raw, genre_mapper))
+            continue
         if key == "title":
             if changed:
                 lines.append(f"<s>{old_html}</s> → <b>{new_html}</b>")
@@ -310,6 +347,25 @@ def _card_footer(row: PendingReview) -> str:
 def _card_hint(row: PendingReview, field: str | None) -> str:
     if field == "cover":
         return "Pick a cover photo, Keep / Remove, or reply to this card with an image."
+    if field == "lyrics":
+        from app.enrich import lyrics_preview
+
+        report = _loads(row.source_report_json, {})
+        working = tagset_from_dict(_loads(row.working_json, {}))
+        hit = report.get("lyrics_fetch") or {}
+        status = str(hit.get("status") or "")
+        preview = str(hit.get("preview") or lyrics_preview(working.lyrics) or "")
+        length = str(hit.get("duration_label") or "")
+        lines = [
+            "Editing <b>Lyrics</b>. Pull from internet, reply with text, or tap a suggestion."
+        ]
+        if status:
+            lines.append(html_esc(status))
+        if preview:
+            lines.append(html_esc(preview))
+        if length:
+            lines.append(f"Length: {html_esc(length)}")
+        return "\n".join(lines)
     if field:
         label = FIELD_LABELS.get(field, field)
         if is_post_save(row):
@@ -320,7 +376,7 @@ def _card_hint(row: PendingReview, field: str | None) -> str:
     return "Tap a field, then type or pick a suggestion. Done writes tags."
 
 
-def edit_card_text(row: PendingReview, *, field: str | None = None) -> str:
+def edit_card_text(row: PendingReview, *, field: str | None = None, genre=None) -> str:
     original = tagset_from_dict(_loads(row.original_json, {}))
     working = tagset_from_dict(_loads(row.working_json, {}))
     report = _loads(row.source_report_json, {})
@@ -331,6 +387,7 @@ def edit_card_text(row: PendingReview, *, field: str | None = None) -> str:
         cover_line=_cover_line(report),
         hint=_card_hint(row, field),
         footer=_card_footer(row),
+        genre_mapper=genre,
     )
 
 
@@ -380,7 +437,7 @@ async def show_field_menu(ctx: Ctx, row: PendingReview) -> None:
     status_id = await edit_status(
         ctx,
         _job_from_pending(refreshed),
-        edit_card_text(refreshed),
+        edit_card_text(refreshed, genre=ctx.genre),
         field_menu_keyboard(row.id, done=not post),
     )
     if status_id != row.status_message_id:
@@ -391,7 +448,8 @@ async def show_field_prompt(ctx: Ctx, row: PendingReview, key: str) -> None:
     from app.queue import _job_from_pending, edit_status
 
     report = _loads(row.source_report_json, {})
-    suggestions = suggestions_for(report, key, ctx.genre)
+    working = tagset_from_dict(_loads(row.working_json, {}))
+    suggestions = suggestions_for(report, key, ctx.genre, working)
     report = _set_edit_field(report, key)
     report["edit_suggestions"] = suggestions
     phase = "react_edit" if is_post_save(row) else "edit:fields"
@@ -405,7 +463,7 @@ async def show_field_prompt(ctx: Ctx, row: PendingReview, key: str) -> None:
     await edit_status(
         ctx,
         _job_from_pending(refreshed),
-        edit_card_text(refreshed, field=key),
+        edit_card_text(refreshed, field=key, genre=ctx.genre),
         field_value_keyboard(row.id, key, suggestions),
     )
 
@@ -434,7 +492,7 @@ async def show_cover_prompt(ctx: Ctx, row: PendingReview) -> None:
     await edit_status(
         ctx,
         job,
-        edit_card_text(refreshed, field="cover"),
+        edit_card_text(refreshed, field="cover", genre=ctx.genre),
         cover_edit_keyboard(row.id),
     )
 
@@ -478,8 +536,102 @@ async def show_cover_prompt(ctx: Ctx, row: PendingReview) -> None:
     await edit_status(
         ctx,
         _job_from_pending(latest),
-        edit_card_text(latest, field="cover"),
+        edit_card_text(latest, field="cover", genre=ctx.genre),
         cover_edit_keyboard(row.id, option_meta),
+    )
+
+
+async def _pull_lyrics(ctx: Ctx, row: PendingReview) -> None:
+    from dataclasses import replace
+
+    from app.enrich import fetch_lrclib, lyrics_preview
+    from app.queue import _job_from_pending, edit_status
+    from app.tags import audio_info
+    from app.util import format_clock
+
+    report = _set_edit_field(_loads(row.source_report_json, {}), "lyrics")
+    report["lyrics_fetch"] = {"status": "Fetching lyrics…"}
+    ctx.catalog.update_pending_review(row.id, source_report_json=_dumps(report))
+    refreshed = ctx.catalog.get_pending_review(row.id) or row
+    working = tagset_from_dict(_loads(refreshed.working_json, {}))
+    await edit_status(
+        ctx,
+        _job_from_pending(refreshed),
+        edit_card_text(refreshed, field="lyrics", genre=ctx.genre),
+        field_value_keyboard(row.id, "lyrics", suggestions_for(report, "lyrics", ctx.genre, working)),
+    )
+
+    tags = working
+    raw_ident = _loads(row.identity_json, {}) or {}
+    if "confidence" not in raw_ident:
+        raw_ident["confidence"] = "low"
+    ident = identity_from_dict(raw_ident)
+    artists = split_artist_field(tags.artist) or list(ident.artists)
+    duration = ident.duration or 0.0
+    if not duration and row.local_path:
+        try:
+            duration, _, _ = await asyncio.to_thread(audio_info, Path(row.local_path))
+        except Exception:
+            duration = 0.0
+    ident = replace(
+        ident,
+        title=tags.title or ident.title,
+        artists=artists,
+        album=tags.album or ident.album,
+        duration=duration or ident.duration,
+    )
+    if not ident.title or not ident.artists:
+        report = _set_edit_field(_loads((ctx.catalog.get_pending_review(row.id) or row).source_report_json, {}), "lyrics")
+        report["lyrics_fetch"] = {"status": "Need title and artist first."}
+        ctx.catalog.update_pending_review(row.id, source_report_json=_dumps(report), status="waiting")
+        latest = ctx.catalog.get_pending_review(row.id) or row
+        latest_working = tagset_from_dict(_loads(latest.working_json, {}))
+        suggestions = suggestions_for(
+            _loads(latest.source_report_json, {}), "lyrics", ctx.genre, latest_working
+        )
+        await edit_status(
+            ctx,
+            _job_from_pending(latest),
+            edit_card_text(latest, field="lyrics", genre=ctx.genre),
+            field_value_keyboard(row.id, "lyrics", suggestions),
+        )
+        return
+    hit = None
+    try:
+        hit = await fetch_lrclib(ctx.http, ident)
+    except Exception:
+        log.exception("lyrics fetch failed id=%s", row.id)
+
+    report = _set_edit_field(_loads((ctx.catalog.get_pending_review(row.id) or row).source_report_json, {}), "lyrics")
+    working_json = (ctx.catalog.get_pending_review(row.id) or row).working_json
+    if hit is None:
+        report["lyrics_fetch"] = {"status": "No lyrics found."}
+    elif hit.instrumental:
+        report["lyrics_fetch"] = {
+            "status": "Track is instrumental.",
+            "duration_label": format_clock(hit.duration),
+        }
+    else:
+        report["lyrics_fetch"] = {
+            "status": "",
+            "preview": lyrics_preview(hit.lyrics),
+            "duration_label": format_clock(hit.duration),
+        }
+        working_json = set_working_field(row, "lyrics", hit.lyrics)
+    ctx.catalog.update_pending_review(
+        row.id,
+        working_json=working_json,
+        source_report_json=_dumps(report),
+        status="waiting",
+    )
+    latest = ctx.catalog.get_pending_review(row.id) or row
+    latest_working = tagset_from_dict(_loads(latest.working_json, {}))
+    suggestions = suggestions_for(_loads(latest.source_report_json, {}), "lyrics", ctx.genre, latest_working)
+    await edit_status(
+        ctx,
+        _job_from_pending(latest),
+        edit_card_text(latest, field="lyrics", genre=ctx.genre),
+        field_value_keyboard(row.id, "lyrics", suggestions),
     )
 
 
@@ -505,7 +657,8 @@ def apply_suggestion(row: PendingReview, key: str, index: int, genre=None) -> st
     if isinstance(stored, list) and stored:
         suggestions = [str(item) for item in stored]
     else:
-        suggestions = suggestions_for(report, key, genre)
+        working = tagset_from_dict(_loads(row.working_json, {}))
+        suggestions = suggestions_for(report, key, genre, working)
     if index < 0 or index >= len(suggestions):
         return None
     return set_working_field(row, key, suggestions[index])
@@ -572,6 +725,7 @@ async def handle_edit_callback(callback, ctx: Ctx) -> None:
         "cover_pick",
         "field",
         "suggest",
+        "lyrics_net",
     } and not ctx.catalog.claim_pending(row.id, "processing"):
         await callback.answer("Already handled.")
         return
@@ -613,6 +767,9 @@ async def handle_edit_callback(callback, ctx: Ctx) -> None:
             refreshed = ctx.catalog.get_pending_review(row.id)
             if refreshed:
                 await show_field_prompt(ctx, refreshed, action.field)
+            return
+        if action.op == "lyrics_net":
+            await _pull_lyrics(ctx, row)
             return
         if action.op == "suggest" and action.field is not None and action.index is not None:
             working = apply_suggestion(row, action.field, action.index, ctx.genre)
@@ -698,8 +855,12 @@ async def handle_edit_text(message, ctx: Ctx) -> bool:
         return True
     if not ctx.catalog.claim_pending(row.id, "processing"):
         return True
+    value = message.text
+    if field == "genre":
+        tags = tagset_from_dict(_loads(row.working_json, {}))
+        value = ctx.genre.merge_typed(tags.genre, message.text)
     ctx.catalog.update_pending_review(
-        row.id, working_json=set_working_field(row, field, message.text), status="waiting"
+        row.id, working_json=set_working_field(row, field, value), status="waiting"
     )
     refreshed = ctx.catalog.get_pending_review(row.id)
     if refreshed:

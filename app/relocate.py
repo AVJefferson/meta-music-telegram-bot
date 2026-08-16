@@ -4,9 +4,10 @@ import asyncio
 import json
 import logging
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
+from app.genre import genre_tokens
 from app.library import library_relative, place_file, review_relative, rmdir_empty, unlink_quiet, write_sidecar
 from app.models import Ctx, Identity, TagSet, TrackRecord, identity_from_dict, tagset_from_dict
 from app.tags import overlay_tagset, read_cover, read_tagset, write_tags
@@ -220,6 +221,8 @@ async def relocate_track(
     staged: Path | None = None,
 ) -> TrackRecord:
     local = staged if staged and staged.is_file() else await ensure_local_flac(ctx, track)
+    if tags.genre:
+        tags = replace(tags, genre=ctx.genre.classify(genre_tokens(tags.genre)))
     cover, mime = await asyncio.to_thread(read_cover, local)
     await asyncio.to_thread(write_tags, local, tags, cover, mime)
 

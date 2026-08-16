@@ -4,7 +4,18 @@ from pathlib import Path
 
 import yaml
 
+from app.util import html_esc
+
 BUCKETS = ("genres", "moods", "languages", "instruments")
+
+
+def genre_tokens(value: str) -> list[str]:
+    out: list[str] = []
+    for chunk in (value or "").replace(",", "|").split("|"):
+        token = " ".join(chunk.split()).strip()
+        if token:
+            out.append(token)
+    return out
 
 
 class GenreMapper:
@@ -46,6 +57,36 @@ class GenreMapper:
         parts: list[str] = []
         for bucket in BUCKETS:
             parts.extend(ordered[bucket])
+        return " | ".join(parts)
+
+    def is_allowed(self, raw: str) -> bool:
+        token = self._normalize(raw)
+        return bool(token) and self._bucket_for(token) is not None
+
+    def merge_typed(self, current: str, typed: str) -> str:
+        allowed_raw: list[str] = []
+        unknown: list[str] = []
+        seen_unknown: set[str] = set()
+        for raw in genre_tokens(typed):
+            if self.is_allowed(raw):
+                allowed_raw.append(raw)
+                continue
+            key = raw.casefold()
+            if key in seen_unknown:
+                continue
+            seen_unknown.add(key)
+            unknown.append(raw)
+        allowed = self.classify(allowed_raw) if allowed_raw else self.classify(genre_tokens(current))
+        if unknown:
+            extra = " | ".join(unknown)
+            return f"{allowed} | {extra}" if allowed else extra
+        return allowed
+
+    def format_html(self, value: str) -> str:
+        parts: list[str] = []
+        for raw in genre_tokens(value):
+            esc = html_esc(raw)
+            parts.append(esc if self.is_allowed(raw) else f"<s>{esc}</s>")
         return " | ".join(parts)
 
     def _normalize(self, raw: str) -> str:
