@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -94,30 +95,51 @@ async def _authorized(message: Message, ctx: Ctx) -> bool:
     return await is_forum_member(ctx, message.from_user.id)
 
 
+def _not_modified(exc: BaseException) -> bool:
+    return "message is not modified" in str(exc).lower()
+
+
+async def _deliver_list(message: Message, text: str, markup=None, *, edit: bool = False) -> None:
+    kwargs: dict = {"parse_mode": "HTML"}
+    if markup is not None:
+        kwargs["reply_markup"] = markup
+    if edit:
+        edit_text = getattr(message, "edit_text", None)
+        if callable(edit_text):
+            try:
+                await edit_text(text, **kwargs)
+                return
+            except TelegramBadRequest as exc:
+                if _not_modified(exc):
+                    return
+                log.debug("review list edit failed: %s", exc)
+            except Exception:
+                log.debug("review list edit failed", exc_info=True)
+    thread_id = getattr(message, "message_thread_id", None)
+    if thread_id:
+        kwargs["message_thread_id"] = thread_id
+    try:
+        if not edit:
+            try:
+                await message.reply(text, **kwargs)
+                return
+            except TelegramBadRequest as exc:
+                log.debug("review list reply failed: %s", exc)
+        await message.answer(text, **kwargs)
+    except TelegramBadRequest as exc:
+        log.warning("review list send failed: %s", exc)
+
+
 async def _show_list(message: Message, ctx: Ctx, page: int = 0, *, edit: bool = False) -> None:
     await _sync_drive_review(ctx)
     items = ctx.catalog.list_review_tracks()
     if not items:
-        text = "Review queue is empty."
-        if edit and message.chat:
-            try:
-                await message.edit_text(text)
-            except Exception:
-                await message.answer(text)
-        else:
-            await message.reply(text)
+        await _deliver_list(message, "Review queue is empty.", edit=edit)
         return
     pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, pages - 1))
     text = f"<b>Review queue</b> — page {page + 1}/{pages}\nPick a song, then react on the info card."
-    markup = review_list_keyboard(items, page)
-    if edit:
-        try:
-            await message.edit_text(text, parse_mode="HTML", reply_markup=markup)
-            return
-        except Exception:
-            pass
-    await message.reply(text, parse_mode="HTML", reply_markup=markup)
+    await _deliver_list(message, text, review_list_keyboard(items, page), edit=edit)
 
 
 async def _send_card(callback: CallbackQuery, ctx: Ctx, track: TrackRecord) -> None:
@@ -154,7 +176,10 @@ def build_review_command_router() -> Router:
             return
         page = int((callback.data or "rvp:0").split(":", 1)[1])
         await callback.answer()
-        await _show_list(callback.message, ctx, page, edit=True)
+        try:
+            await _show_list(callback.message, ctx, page, edit=True)
+        except Exception:
+            log.exception("review page failed")
 
     @router.callback_query(F.data.regexp(r"^rvt:\d+$"))
     async def review_pick(callback: CallbackQuery, ctx: Ctx) -> None:
@@ -174,6 +199,9 @@ def build_review_command_router() -> Router:
             await _send_card(callback, ctx, track)
         except Exception:
             log.exception("review card send failed track=%s", track_id)
-            await callback.message.answer("Could not load that song from Drive. Try again.")
+            try:
+                await callback.message.answer("Could not load that song from Drive. Try again.")
+            except TelegramBadRequest:
+                log.debug("review card error reply failed", exc_info=True)
 
     return router

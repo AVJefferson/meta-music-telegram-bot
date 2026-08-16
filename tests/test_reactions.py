@@ -587,3 +587,67 @@ class EnsureLocalFlacTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first, second)
             self.assertTrue(first.is_file())
             catalog.close()
+
+
+class ReviewListDeliverTests(unittest.IsolatedAsyncioTestCase):
+    def _bad(self, message: str):
+        from aiogram.exceptions import TelegramBadRequest
+
+        return TelegramBadRequest(method="sendMessage", message=message)
+
+    async def test_edit_not_modified_is_success(self) -> None:
+        from app.review_cmd import _deliver_list
+
+        outer = self
+
+        class Msg:
+            message_thread_id = None
+
+            async def edit_text(self, *args, **kwargs):
+                raise outer._bad("Telegram server says - Bad Request: message is not modified")
+
+            async def reply(self, *args, **kwargs):
+                raise AssertionError("should not reply")
+
+            async def answer(self, *args, **kwargs):
+                raise AssertionError("should not answer")
+
+        await _deliver_list(Msg(), "Review queue", edit=True)
+
+    async def test_edit_receiver_invalid_falls_back_to_answer(self) -> None:
+        from app.review_cmd import _deliver_list
+
+        outer = self
+        calls: list[str] = []
+
+        class Msg:
+            message_thread_id = 12
+
+            async def edit_text(self, *args, **kwargs):
+                raise outer._bad("Telegram server says - Bad Request: RECEIVER_ID_INVALID")
+
+            async def reply(self, *args, **kwargs):
+                raise AssertionError("callback edit must not reply")
+
+            async def answer(self, text, **kwargs):
+                calls.append(text)
+                outer.assertEqual(kwargs.get("message_thread_id"), 12)
+
+        await _deliver_list(Msg(), "page 2", edit=True)
+        self.assertEqual(calls, ["page 2"])
+
+    async def test_answer_receiver_invalid_is_swallowed(self) -> None:
+        from app.review_cmd import _deliver_list
+
+        outer = self
+
+        class Msg:
+            message_thread_id = None
+
+            async def edit_text(self, *args, **kwargs):
+                raise outer._bad("Bad Request: RECEIVER_ID_INVALID")
+
+            async def answer(self, *args, **kwargs):
+                raise outer._bad("Bad Request: RECEIVER_ID_INVALID")
+
+        await _deliver_list(Msg(), "page 2", edit=True)
