@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import logging
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
+
+from PIL import Image
 
 from app.enrich import _fit_cover, fetch_cover, list_caa_fronts, list_itunes_album_cover
 from app.models import Ctx, Identity, TagSet
@@ -18,6 +21,7 @@ COVER_NAME = "cover.jpg"
 COVER_TTL = timedelta(days=7)
 MAX_COVER_OPTIONS = 10
 _PLACEHOLDER_ALBUMS = {"", "unknown", "unknown album"}
+SOURCE_LABELS = {"file": "file", "caa": "CAA", "itunes": "iTunes"}
 
 
 @dataclass
@@ -37,6 +41,9 @@ class CoverOption:
     digest: str
     caa_release: str | None = None
     url: str | None = None
+    width: int | None = None
+    height: int | None = None
+    sources: list[str] = field(default_factory=list)
 
 
 def is_shareable_album(album: str) -> bool:
@@ -120,6 +127,78 @@ def _jpeg_bytes(data: bytes) -> tuple[bytes, str] | None:
         return None
 
 
+def _image_px(data: bytes) -> tuple[int, int] | None:
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            return image.size
+    except Exception:
+        return None
+
+
+def source_display_label(sources: list[str]) -> str:
+    names: list[str] = []
+    for source in sources:
+        name = SOURCE_LABELS.get(source, source)
+        if name not in names:
+            names.append(name)
+    return " == ".join(names) if names else "cover"
+
+
+def add_cover_option(
+    options: list[CoverOption],
+    data: bytes,
+    source: str,
+    *,
+    caa_release: str | None = None,
+    url: str | None = None,
+) -> None:
+    fitted = _jpeg_bytes(data)
+    if not fitted:
+        return
+    payload, out_mime = fitted
+    digest = hashlib.sha256(payload).hexdigest()
+    for existing in options:
+        if existing.digest != digest:
+            continue
+        if source not in existing.sources:
+            existing.sources.append(source)
+            existing.label = source_display_label(existing.sources)
+        return
+    if len(options) >= MAX_COVER_OPTIONS:
+        return
+    px = _image_px(data)
+    options.append(
+        CoverOption(
+            data=payload,
+            mime=out_mime,
+            source=source,
+            label=source_display_label([source]),
+            digest=digest,
+            caa_release=caa_release,
+            url=url or None,
+            width=px[0] if px else None,
+            height=px[1] if px else None,
+            sources=[source],
+        )
+    )
+
+
+def finalize_cover_labels(options: list[CoverOption]) -> None:
+    caa_only = [opt for opt in options if opt.sources == ["caa"]]
+    if len(caa_only) <= 1:
+        return
+    for index, opt in enumerate(caa_only, start=1):
+        opt.label = f"CAA {index}"
+
+
+def cover_wait_role(album_key: str, busy_leader_album_key: str | None) -> str:
+    if busy_leader_album_key is None:
+        return "leader"
+    if busy_leader_album_key == album_key:
+        return "follower"
+    return "queued"
+
+
 def _download_drive_cover(ctx: Ctx, topic: str, albumartist: str, album: str) -> tuple[bytes, str] | None:
     parts = album_folder_parts(topic, albumartist, album)
     if not parts:
@@ -177,50 +256,16 @@ async def list_cover_candidates(
     file_cover: tuple[bytes, str] | None,
 ) -> list[CoverOption]:
     options: list[CoverOption] = []
-    seen: set[str] = set()
-
-    def add(
-        data: bytes,
-        _mime: str | None,
-        source: str,
-        label: str,
-        caa_release: str | None = None,
-        url: str | None = None,
-    ) -> None:
-        if len(options) >= MAX_COVER_OPTIONS:
-            return
-        fitted = _jpeg_bytes(data)
-        if not fitted:
-            return
-        payload, out_mime = fitted
-        digest = hashlib.sha256(payload).hexdigest()
-        if digest in seen:
-            return
-        seen.add(digest)
-        options.append(
-            CoverOption(
-                data=payload,
-                mime=out_mime,
-                source=source,
-                label=label,
-                digest=digest,
-                caa_release=caa_release,
-                url=url or None,
-            )
-        )
 
     if file_cover and file_cover[0]:
-        add(file_cover[0], file_cover[1], "file", "file")
+        add_cover_option(options, file_cover[0], "file")
     for cover, mbid, url in await list_caa_fronts(ctx.http, identity):
-        add(cover[0], cover[1], "caa", "CAA", mbid, url)
+        add_cover_option(options, cover[0], "caa", caa_release=mbid, url=url)
     itunes = await list_itunes_album_cover(ctx.http, identity)
     if itunes:
         cover, url = itunes
-        add(cover[0], cover[1], "itunes", "iTunes", url=url)
-    caa_opts = [opt for opt in options if opt.source == "caa"]
-    if len(caa_opts) > 1:
-        for index, opt in enumerate(caa_opts, start=1):
-            opt.label = f"CAA {index}"
+        add_cover_option(options, cover[0], "itunes", url=url)
+    finalize_cover_labels(options)
     return options
 
 

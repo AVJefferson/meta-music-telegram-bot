@@ -27,7 +27,8 @@ FIELDS: list[tuple[str, str]] = [
 ]
 FIELD_KEYS = {key for key, _ in FIELDS}
 MULTI_VALUE_FIELDS = {"artist", "albumartist", "composer"}
-_CALLBACK = re.compile(r"^p(\d+):(ok|rev|cancel|dr|dk|ds|cv(\d+)|c(\d+)|t:([a-z]+)|uf|ur)$")
+SPARSE_FILL_FIELDS = {"composer", "genre", "year"}
+_CALLBACK = re.compile(r"^p(\d+):(ok|rev|cancel|back|dr|dk|ds|cv(\d+)|c(\d+)|t:([a-z]+)|uf|ur)$")
 
 
 @dataclass
@@ -52,6 +53,8 @@ def parse_callback(data: str | None) -> PendingAction | None:
         return PendingAction(pending_id, "rev")
     if rest == "cancel":
         return PendingAction(pending_id, "cancel")
+    if rest == "back":
+        return PendingAction(pending_id, "back")
     if rest == "dr":
         return PendingAction(pending_id, "drive_replace")
     if rest == "dk":
@@ -82,6 +85,22 @@ def _values_match(key: str, left: str, right: str) -> bool:
     if left == right:
         return True
     return key in MULTI_VALUE_FIELDS and same_artist_names(left, right)
+
+
+def _shows_choice(key: str, file_val: str, rec_val: str) -> bool:
+    if key in SPARSE_FILL_FIELDS and (not file_val or not rec_val):
+        return False
+    return not _values_match(key, file_val, rec_val)
+
+
+def cover_option_text(index: int, option: dict[str, Any]) -> str:
+    label = str(option.get("label") or "")
+    width = option.get("width")
+    height = option.get("height")
+    size = ""
+    if width and height:
+        size = f" ({int(width)}x{int(height)})"
+    return f"{index + 1}. {label}{size}"
 
 
 def set_field(data: dict[str, Any], key: str, value: str) -> dict[str, Any]:
@@ -136,7 +155,13 @@ def format_summary(
         file_val = _get_field(original, key)
         rec_val = _get_field(recommended, key)
         now_val = _get_field(working, key)
-        if _values_match(key, file_val, rec_val):
+        if key in SPARSE_FILL_FIELDS and (not file_val or not rec_val):
+            shown = rec_val or file_val
+            line = f"<b>{label}</b>: {html_esc(shown) or '—'}"
+            if now_val != shown:
+                line += f"\n  now: {html_esc(now_val) or '—'}"
+            lines.append(line)
+        elif _values_match(key, file_val, rec_val):
             line = f"<b>{label}</b>: {html_esc(rec_val) or '—'}"
             if file_val != rec_val:
                 line += " (reordered)"
@@ -189,7 +214,7 @@ def _any_field_differs(
     recommended: dict[str, Any] | TagSet,
 ) -> bool:
     return any(
-        not _values_match(key, _get_field(original, key), _get_field(recommended, key))
+        _shows_choice(key, _get_field(original, key), _get_field(recommended, key))
         for key, _ in FIELDS
     )
 
@@ -203,12 +228,22 @@ def bulk_choice(
     source = original if use_file else recommended
     chosen = asdict(source) if isinstance(source, TagSet) else dict(source)
     if not use_file:
+        for key in SPARSE_FILL_FIELDS:
+            rec_val = _get_field(recommended, key)
+            file_val = _get_field(original, key)
+            if not rec_val and file_val:
+                chosen = set_field(chosen, key, file_val)
         return chosen
     for key in MULTI_VALUE_FIELDS:
         file_val = _get_field(original, key)
         rec_val = _get_field(recommended, key)
         if file_val != rec_val and _values_match(key, file_val, rec_val):
             chosen = set_field(chosen, key, rec_val)
+    for key in SPARSE_FILL_FIELDS:
+        file_val = _get_field(original, key)
+        rec_val = _get_field(recommended, key)
+        if not file_val or not rec_val:
+            chosen = set_field(chosen, key, rec_val or file_val)
     return chosen
 
 
@@ -232,7 +267,7 @@ def review_keyboard(
     for key, label in FIELDS:
         file_val = _get_field(original, key)
         rec_val = _get_field(recommended, key)
-        if _values_match(key, file_val, rec_val):
+        if not _shows_choice(key, file_val, rec_val):
             continue
         now_val = _get_field(working, key)
         pick = "file" if now_val == file_val else "rec"
@@ -250,21 +285,32 @@ def review_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def cover_keyboard(pending_id: int, options: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+def cover_keyboard(
+    pending_id: int,
+    options: list[dict[str, Any]],
+    *,
+    from_review: bool = False,
+    waiting: bool = False,
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    for index, option in enumerate(options):
-        label = str(option.get("label") or f"{index + 1}")
-        row = [
-            InlineKeyboardButton(
-                text=f"{index + 1} {label}",
-                callback_data=f"p{pending_id}:cv{index}",
-            )
-        ]
-        url = str(option.get("url") or "")
-        if url.startswith("http://") or url.startswith("https://"):
-            row.append(InlineKeyboardButton(text="view", url=url))
-        rows.append(row)
-    rows.append([InlineKeyboardButton(text="Cancel", callback_data=f"p{pending_id}:cancel")])
+    if not waiting:
+        for index, option in enumerate(options):
+            label = str(option.get("label") or f"{index + 1}")
+            row = [
+                InlineKeyboardButton(
+                    text=f"{index + 1} {label}",
+                    callback_data=f"p{pending_id}:cv{index}",
+                )
+            ]
+            url = str(option.get("url") or "")
+            if url.startswith("http://") or url.startswith("https://"):
+                row.append(InlineKeyboardButton(text="view", url=url))
+            rows.append(row)
+    controls: list[InlineKeyboardButton] = []
+    if from_review:
+        controls.append(InlineKeyboardButton(text="Back", callback_data=f"p{pending_id}:back"))
+    controls.append(InlineKeyboardButton(text="Cancel", callback_data=f"p{pending_id}:cancel"))
+    rows.append(controls)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -275,8 +321,16 @@ def format_cover_prompt(
     filename: str,
     *,
     waiting: bool = False,
+    queued: bool = False,
     rights_warning: bool = False,
 ) -> str:
+    if queued:
+        return _clip(
+            f"<b>Waiting for album cover</b>\n"
+            f"{html_esc(albumartist)} — {html_esc(album)}\n"
+            f"File: <code>{html_esc(filename)}</code>\n\n"
+            "Waiting — another cover pick is in progress."
+        )
     if waiting:
         return _clip(
             f"<b>Waiting for album cover</b>\n"
@@ -291,12 +345,12 @@ def format_cover_prompt(
         "",
     ]
     for index, option in enumerate(options):
-        label = html_esc(str(option.get("label") or ""))
+        desc = html_esc(cover_option_text(index, option))
         href = safe_link(option.get("url"))
         if href:
-            lines.append(f'{index + 1}. {label} — <a href="{href}">preview</a>')
+            lines.append(f'{desc} — <a href="{href}">preview</a>')
         else:
-            lines.append(f"{index + 1}. {label}")
+            lines.append(desc)
     lines.append("")
     lines.append("Later tracks of this album reuse the pick.")
     if rights_warning:

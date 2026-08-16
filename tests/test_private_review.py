@@ -204,6 +204,27 @@ class UiTests(unittest.TestCase):
         assert action is not None
         self.assertEqual(action.op, "cancel")
 
+    def test_cover_keyboard_back_only_from_review(self) -> None:
+        plain = cover_keyboard(2, [{"label": "file"}])
+        review = cover_keyboard(2, [{"label": "file"}], from_review=True)
+        waiting = cover_keyboard(2, [{"label": "file"}], from_review=True, waiting=True)
+        def _ops(keyboard):
+            return {
+                button.callback_data
+                for row in keyboard.inline_keyboard
+                for button in row
+                if button.callback_data
+            }
+        self.assertNotIn("p2:back", _ops(plain))
+        self.assertIn("p2:back", _ops(review))
+        self.assertIn("p2:cancel", _ops(review))
+        self.assertIn("p2:back", _ops(waiting))
+        self.assertNotIn("p2:cv0", _ops(waiting))
+        action = parse_callback("p2:back")
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action.op, "back")
+
     def test_private_keyboards_always_offer_cancel(self) -> None:
         for keyboard in (
             _topic_keyboard(3, [(1, "General")], 0),

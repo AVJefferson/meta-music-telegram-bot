@@ -469,6 +469,22 @@ class Catalog:
             ).fetchall()
         return [_row_to_pending(row) for row in rows]
 
+    def list_pending_by_phase(self, phase: str, *statuses: str) -> list[PendingReview]:
+        with self._lock:
+            if statuses:
+                placeholders = ",".join("?" for _ in statuses)
+                rows = self._conn.execute(
+                    f"SELECT * FROM pending_reviews WHERE phase=? AND status IN "
+                    f"({placeholders}) ORDER BY id",
+                    (phase, *statuses),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM pending_reviews WHERE phase=? ORDER BY id",
+                    (phase,),
+                ).fetchall()
+        return [_row_to_pending(row) for row in rows]
+
     def get_waiting_for_chat(self, chat_id: int) -> PendingReview | None:
         with self._lock:
             row = self._conn.execute(

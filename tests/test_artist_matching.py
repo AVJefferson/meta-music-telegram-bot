@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import unittest
 
+from app.models import TagSet
 from app.review_ui import bulk_choice, format_summary, review_keyboard
+from app.tags import fill_sparse_tags
 from app.util import format_artist_list, same_artist_names, split_artist_field
 
 
@@ -81,6 +83,69 @@ class ReviewUiTests(unittest.TestCase):
         recommended = {"title": "New title", "artist": "A & B"}
         chosen = bulk_choice(original, recommended, use_file=False)
         self.assertEqual(chosen, recommended)
+
+    def test_sparse_empty_file_or_rec_emits_no_toggle(self) -> None:
+        original = {"title": "Song", "composer": "Bach", "genre": "", "date": "1999"}
+        recommended = {"title": "Song", "composer": "", "genre": "Rock", "date": ""}
+        keyboard = review_keyboard(1, original, recommended, recommended)
+        self.assertEqual(_toggle_fields(keyboard), set())
+
+    def test_sparse_both_nonempty_still_emits_toggle(self) -> None:
+        original = {"title": "Song", "genre": "Jazz", "date": "1998"}
+        recommended = {"title": "Song", "genre": "Rock", "date": "1999"}
+        keyboard = review_keyboard(1, original, recommended, recommended)
+        self.assertEqual(_toggle_fields(keyboard), {"genre", "year"})
+
+    def test_artist_empty_vs_rec_still_emits_toggle(self) -> None:
+        original = {"title": "Song", "artist": ""}
+        recommended = {"title": "Song", "artist": "A"}
+        keyboard = review_keyboard(1, original, recommended, recommended)
+        self.assertEqual(_toggle_fields(keyboard), {"artist"})
+
+    def test_summary_sparse_one_empty_is_single_line(self) -> None:
+        original = {"title": "Song", "genre": "", "composer": "Bach"}
+        recommended = {"title": "Song", "genre": "Rock", "composer": ""}
+        summary = format_summary(original, recommended, recommended)
+        self.assertIn("<b>Genre</b>: Rock", summary)
+        self.assertIn("<b>Composer</b>: Bach", summary)
+        self.assertNotIn("file: Bach", summary)
+        self.assertNotIn("rec: Rock", summary)
+
+    def test_use_file_keeps_nonempty_sparse_fields(self) -> None:
+        original = {"title": "Old", "genre": "", "date": "1999", "composer": ""}
+        recommended = {"title": "New", "genre": "Rock", "date": "", "composer": "Bach"}
+        chosen = bulk_choice(original, recommended, use_file=True)
+        self.assertEqual(chosen["title"], "Old")
+        self.assertEqual(chosen["genre"], "Rock")
+        self.assertEqual(chosen["date"], "1999")
+        self.assertEqual(chosen["composer"], "Bach")
+
+    def test_use_recommended_keeps_file_sparse_when_rec_empty(self) -> None:
+        original = {"title": "Old", "genre": "Jazz", "composer": "Bach"}
+        recommended = {"title": "New", "genre": "", "composer": ""}
+        chosen = bulk_choice(original, recommended, use_file=False)
+        self.assertEqual(chosen["title"], "New")
+        self.assertEqual(chosen["genre"], "Jazz")
+        self.assertEqual(chosen["composer"], "Bach")
+
+
+class FillSparseTagsTests(unittest.TestCase):
+    def test_fills_empty_rec_from_file(self) -> None:
+        file_tags = TagSet(composer="Bach", genre="Jazz", date="1999", artist="A")
+        rec = TagSet(composer="", genre="", date="", artist="B")
+        filled = fill_sparse_tags(file_tags, rec)
+        self.assertEqual(filled.composer, "Bach")
+        self.assertEqual(filled.genre, "Jazz")
+        self.assertEqual(filled.date, "1999")
+        self.assertEqual(filled.artist, "B")
+
+    def test_keeps_nonempty_rec(self) -> None:
+        file_tags = TagSet(composer="File", genre="Jazz", date="1998")
+        rec = TagSet(composer="Rec", genre="Rock", date="1999")
+        filled = fill_sparse_tags(file_tags, rec)
+        self.assertEqual(filled.composer, "Rec")
+        self.assertEqual(filled.genre, "Rock")
+        self.assertEqual(filled.date, "1999")
 
 
 class FormatRoundTripTests(unittest.TestCase):

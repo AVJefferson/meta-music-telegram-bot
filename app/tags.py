@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from mutagen.flac import FLAC, Picture
@@ -19,6 +20,7 @@ ALLOWED = (
     "DISCNUMBER",
     "LYRICS",
 )
+SPARSE_TAG_FIELDS = ("composer", "genre", "date")
 
 
 def _first(audio: FLAC, *keys: str) -> str:
@@ -109,6 +111,14 @@ def identity_to_tags(identity: Identity, enrichment: Enrichment) -> TagSet:
         discnumber=identity.discnumber,
         lyrics=lyrics or "",
     )
+
+
+def fill_sparse_tags(file_tags: TagSet, rec: TagSet) -> TagSet:
+    updates = {}
+    for key in SPARSE_TAG_FIELDS:
+        if not (getattr(rec, key) or "") and (getattr(file_tags, key) or ""):
+            updates[key] = getattr(file_tags, key)
+    return replace(rec, **updates) if updates else rec
 
 
 def write_tags(path: Path, tags: TagSet, cover: bytes | None, cover_mime: str | None) -> None:
