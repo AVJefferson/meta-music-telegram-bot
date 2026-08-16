@@ -178,4 +178,4 @@ Lint with `ruff check .` (config in `pyproject.toml`). Push and pull requests ru
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+see [LICENSE](LICENSE).
