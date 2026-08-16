@@ -121,10 +121,7 @@ async def _show_list(message: Message, ctx: Ctx, page: int = 0, *, edit: bool = 
 
 
 async def _send_card(callback: CallbackQuery, ctx: Ctx, track: TrackRecord) -> None:
-    try:
-        track = await hydrate_track_tags(ctx, track)
-    except Exception:
-        log.exception("review card hydrate failed track=%s", track.id)
+    track = await hydrate_track_tags(ctx, track)
     text = format_song_card(track)
     kwargs: dict = {"text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     assert callback.message is not None
@@ -177,6 +174,6 @@ def build_review_command_router() -> Router:
             await _send_card(callback, ctx, track)
         except Exception:
             log.exception("review card send failed track=%s", track_id)
-            await callback.message.answer("Could not load that song.")
+            await callback.message.answer("Could not load that song from Drive. Try again.")
 
     return router

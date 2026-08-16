@@ -13,6 +13,15 @@ from app.tags import overlay_tagset, read_cover, read_tagset, write_tags
 from app.util import sanitize_filename
 
 log = logging.getLogger(__name__)
+_FLAC_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _flac_lock(track_id: int) -> asyncio.Lock:
+    lock = _FLAC_LOCKS.get(track_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _FLAC_LOCKS[track_id] = lock
+    return lock
 
 
 def _loads(text: str | None, default: object):
@@ -96,6 +105,11 @@ async def _resolve_drive_file_id(ctx: Ctx, track: TrackRecord) -> str | None:
 
 
 async def ensure_local_flac(ctx: Ctx, track: TrackRecord) -> Path:
+    async with _flac_lock(track.id):
+        return await _ensure_local_flac_locked(ctx, ctx.catalog.get_track(track.id) or track)
+
+
+async def _ensure_local_flac_locked(ctx: Ctx, track: TrackRecord) -> Path:
     candidates: list[Path] = []
     if track.local_path:
         candidates.append(Path(track.local_path))

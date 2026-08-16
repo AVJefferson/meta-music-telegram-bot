@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,6 +75,38 @@ def _escape_query(value: str) -> str:
 
 def _quota_error(exc: HttpError) -> bool:
     return exc.resp.status == 403 and "storageQuotaExceeded" in str(exc)
+
+
+def retry_drive_io[T](
+    op: Callable[[], T],
+    *,
+    attempts: int = 3,
+    label: str = "drive",
+    wrap_http: Callable[[HttpError], Exception] | None = None,
+    on_fail: Callable[[], None] | None = None,
+) -> T:
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return op()
+        except DriveAccessError:
+            raise
+        except HttpError as exc:
+            last = wrap_http(exc) if wrap_http else exc
+            if exc.resp.status in _NO_RETRY_STATUS or isinstance(last, DriveAccessError):
+                if on_fail:
+                    on_fail()
+                raise last from exc
+            log.warning("%s attempt %s failed: %s", label, i + 1, last)
+        except Exception as exc:
+            last = exc
+            log.warning("%s attempt %s failed: %s", label, i + 1, exc)
+        if on_fail:
+            on_fail()
+        if i + 1 < attempts:
+            time.sleep(2**i)
+    assert last is not None
+    raise last
 
 
 class DriveClient:
@@ -289,24 +322,43 @@ class DriveClient:
             parent = found.id
         return parent
 
-    def download_bytes(self, file_id: str) -> bytes:
+    def _download_media(self, file_id: str, stream) -> None:
         request = self._service.files().get_media(fileId=file_id, supportsAllDrives=True)
-        buf = io.BytesIO()
-        downloader = MediaIoBaseDownload(buf, request)
+        downloader = MediaIoBaseDownload(stream, request)
         done = False
         while not done:
             _status, done = downloader.next_chunk()
-        return buf.getvalue()
+
+    def download_bytes(self, file_id: str) -> bytes:
+        def op() -> bytes:
+            buf = io.BytesIO()
+            self._download_media(file_id, buf)
+            return buf.getvalue()
+
+        return retry_drive_io(
+            op,
+            label=f"drive download id={file_id}",
+            wrap_http=self._wrap_http_error,
+        )
 
     def download_to(self, file_id: str, destination: Path) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        request = self._service.files().get_media(fileId=file_id, supportsAllDrives=True)
-        with destination.open("wb") as stream:
-            downloader = MediaIoBaseDownload(stream, request)
-            done = False
-            while not done:
-                _status, done = downloader.next_chunk()
-        return destination
+
+        def op() -> Path:
+            with destination.open("wb") as stream:
+                self._download_media(file_id, stream)
+            return destination
+
+        try:
+            return retry_drive_io(
+                op,
+                label=f"drive download id={file_id}",
+                wrap_http=self._wrap_http_error,
+                on_fail=lambda: destination.unlink(missing_ok=True),
+            )
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
 
     def list_review_items(self, root_id: str) -> list[DriveReviewItem]:
         items: list[DriveReviewItem] = []

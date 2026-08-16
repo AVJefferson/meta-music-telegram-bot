@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -441,4 +443,52 @@ class EnsureLocalFlacTests(unittest.IsolatedAsyncioTestCase):
             refreshed = catalog.get_track(track_id)
             assert refreshed is not None
             self.assertEqual(refreshed.drive_file_id, "found-id")
+            catalog.close()
+
+    async def test_concurrent_downloads_share_one_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = Catalog(root / "state.sqlite")
+            track_id = catalog.insert_pending(
+                kind="review",
+                mb_recording_id=None,
+                acoustid=None,
+                local_path="",
+                sidecar_path=None,
+                relative_path="2026-08-16/a.flac",
+                bit_depth=None,
+                sample_rate=None,
+                title="Go",
+                artist="A",
+                album="LP",
+                status="uploaded",
+                drive_file_id="drive-1",
+            )
+            track = catalog.get_track(track_id)
+            assert track is not None
+            calls: list[str] = []
+
+            class Drive:
+                def download_to(self, file_id: str, dest: Path) -> Path:
+                    calls.append(file_id)
+                    time.sleep(0.05)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(b"flac")
+                    return dest
+
+            ctx = SimpleNamespace(
+                settings=SimpleNamespace(
+                    library_root=root / "library",
+                    review_root=root / "review",
+                    pending_root=root / "pending",
+                    gdrive_folder_id="lib",
+                    gdrive_review_folder_id="rev",
+                ),
+                catalog=catalog,
+                drive=Drive(),
+            )
+            first, second = await asyncio.gather(ensure_local_flac(ctx, track), ensure_local_flac(ctx, track))
+            self.assertEqual(calls, ["drive-1"])
+            self.assertEqual(first, second)
+            self.assertTrue(first.is_file())
             catalog.close()
