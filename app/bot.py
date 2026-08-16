@@ -32,6 +32,11 @@ from app.util import html_esc
 
 log = logging.getLogger(__name__)
 
+# Telegram's default getUpdates list omits message_reaction (and chat_member,
+# message_reaction_count) to save bandwidth. An empty allowed_updates is that
+# default — reaction events never arrive unless we name them.
+REQUIRED_ALLOWED_UPDATES = ("message", "message_reaction")
+
 NOISY_LOGGERS = (
     "musicbrainzngs",
     "httpx",
@@ -66,6 +71,16 @@ class CtxMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: TelegramObject, data: dict):
         data["ctx"] = self.ctx
         return await handler(event, data)
+
+
+def polling_allowed_updates(dp: Dispatcher) -> list[str]:
+    """Update types sent to getUpdates.
+
+    Starts from handlers actually registered (message, callback_query, …) and
+    always includes message + message_reaction. Passing only those two would
+    drop callback_query and break review/edit buttons.
+    """
+    return sorted(set(dp.resolve_used_update_types()) | set(REQUIRED_ALLOWED_UPDATES))
 
 
 def intake_expires_at() -> str:
@@ -271,10 +286,9 @@ async def main() -> None:
     try:
         await wait_for_telegram(bot)
         await recover_interrupted(ctx, jobs)
-        log.info("polling allowed_chat_id=%s", settings.allowed_chat_id)
-        allowed = set(dp.resolve_used_update_types())
-        allowed.add("message_reaction")
-        await dp.start_polling(bot, allowed_updates=list(allowed))
+        allowed = polling_allowed_updates(dp)
+        log.info("polling allowed_updates=%s allowed_chat_id=%s", allowed, settings.allowed_chat_id)
+        await dp.start_polling(bot, allowed_updates=allowed)
     finally:
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

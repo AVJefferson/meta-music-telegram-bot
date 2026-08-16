@@ -7,6 +7,10 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from aiogram import Dispatcher, Router
+from aiogram.types import Message
+
+from app.bot import polling_allowed_updates
 from app.catalog import Catalog
 from app.edit_ui import (
     apply_suggestion,
@@ -27,12 +31,32 @@ from app.reactions import (
     THUMBS_UP,
     WRITING,
     added_emojis,
+    build_reactions_router,
     normalize_emoji,
     parse_react_callback,
     removed_emojis,
 )
 from app.relocate import ensure_local_flac
 from app.review_cmd import review_label
+
+
+class PollingAllowedUpdatesTests(unittest.TestCase):
+    def test_always_requests_message_and_reaction(self) -> None:
+        dp = Dispatcher()
+        self.assertEqual(polling_allowed_updates(dp), ["message", "message_reaction"])
+
+    def test_keeps_callback_query_from_handlers(self) -> None:
+        dp = Dispatcher()
+        dp.include_router(build_reactions_router())
+        messages = Router()
+
+        @messages.message()
+        async def _unused(message: Message) -> None:
+            del message
+
+        dp.include_router(messages)
+        allowed = polling_allowed_updates(dp)
+        self.assertEqual(allowed, ["callback_query", "message", "message_reaction"])
 
 
 class EmojiReactionTests(unittest.TestCase):
