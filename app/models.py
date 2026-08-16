@@ -105,6 +105,7 @@ class Ctx:
     genre: Any
     bot: Any
     mb: Any
+    jobs: Any = None
 
 
 @dataclass
@@ -127,6 +128,15 @@ class TrackRecord:
     error: str | None
     created_at: str
     uploaded_at: str | None
+    telegram_file_id: str | None = None
+    source_report_json: str | None = None
+    tags_json: str | None = None
+    identity_json: str | None = None
+    topic_name: str | None = None
+    file_name: str | None = None
+    drive_sidecar_id: str | None = None
+    drive_log_id: str | None = None
+    thread_id: int | None = None
 
     @property
     def local(self) -> Path | None:

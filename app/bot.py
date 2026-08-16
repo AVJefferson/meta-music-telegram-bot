@@ -19,11 +19,14 @@ from app.catalog import Catalog
 from app.cleanup import run_cleanup, run_expire_pending
 from app.config import Settings
 from app.drive import DriveClient
+from app.edit_ui import build_edit_router
 from app.genre import GenreMapper
 from app.identify import MBClient
 from app.models import Ctx, Job
 from app.private_ui import build_private_router
 from app.queue import recover_interrupted, worker
+from app.reactions import build_reactions_router
+from app.review_cmd import build_review_command_router
 from app.review_ui import build_review_router
 from app.util import html_esc
 
@@ -239,11 +242,23 @@ async def main() -> None:
     session = AiohttpSession(api=api, timeout=3600)
     bot = Bot(token=settings.bot_token, session=session)
     jobs: asyncio.Queue[Job] = asyncio.Queue()
-    ctx = Ctx(settings=settings, catalog=catalog, drive=drive, http=http, genre=genre, bot=bot, mb=mb)
+    ctx = Ctx(
+        settings=settings,
+        catalog=catalog,
+        drive=drive,
+        http=http,
+        genre=genre,
+        bot=bot,
+        mb=mb,
+        jobs=jobs,
+    )
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.middleware(CtxMiddleware(ctx))
     dp.include_router(build_private_router(jobs))
+    dp.include_router(build_review_command_router())
+    dp.include_router(build_edit_router())
+    dp.include_router(build_reactions_router())
     dp.include_router(build_router(jobs))
     dp.include_router(build_review_router())
 
@@ -257,7 +272,9 @@ async def main() -> None:
         await wait_for_telegram(bot)
         await recover_interrupted(ctx, jobs)
         log.info("polling allowed_chat_id=%s", settings.allowed_chat_id)
-        await dp.start_polling(bot)
+        allowed = set(dp.resolve_used_update_types())
+        allowed.add("message_reaction")
+        await dp.start_polling(bot, allowed_updates=list(allowed))
     finally:
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

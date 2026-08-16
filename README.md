@@ -9,6 +9,7 @@ Audio is never re-encoded. FLAC uses Vorbis comments (not ID3).
 1. Bot from [@BotFather](https://t.me/BotFather)
    - `/setprivacy` → **Disable** (otherwise the bot only sees commands)
    - Add the bot to the forum group. Grant **Photos** and **Files** (make it admin, or enable those in group permissions) — cover previews need them.
+   - Keep it as an **admin**. Reaction updates (`message_reaction`) are only delivered to admins. Enable these group reactions: 👍 👎 💩 🙉 🙏 ✍️.
    - Keep it as an admin if using private chat. DM access is limited to current members of this forum and is checked with `getChatMember`.
 2. `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org) (local Bot API, required for files over 20MB)
 3. Free [AcoustID application key](https://acoustid.org/new-application)
@@ -73,7 +74,7 @@ flowchart TD
     Identify[fpcalc, AcoustID, MusicBrainz] --> Enrich
     Enrich[LRCLIB, iTunes, Last.fm, genre map] --> Confidence{Confidence}
     Confidence -->|high| Dedup{Already in catalog}
-    Confidence -->|low| Review[Tag review or typed editor]
+    Confidence -->|low| Review[Tag review or button editor]
     Dedup -->|"same or worse quality"| Skip[Skip]
     Dedup -->|"better or new"| Cover
     Review -->|confirm| Cover
@@ -131,19 +132,26 @@ Artist, album artist, and composer are compared as name sets, so a list that onl
 4. LRCLIB for synced lyrics
 5. iTunes + Last.fm tags filtered through `genre_map.yaml`
 
-High AcoustID score and a single recording → library. Anything else pauses for review; forum flow can send it to the review folder, while private chat opens typed editing.
+High AcoustID score and a single recording → library. Anything else pauses for review; forum flow can send it to the review folder, while private chat opens a button editor.
+
+After a track is saved, react on the bot's info card (forum Saved message, or a card from `/review`):
+
+- 👍 — confirm, then move to library (local + Drive)
+- 👎 — confirm, then move to review (local + Drive)
+- 💩 or 🙉 — confirm, then delete local + Drive
+- 🙏 — confirm, then re-identify from the original Telegram file
+- ✍️ — start the button editor. Removing ✍️ does **not** write Drive; it asks Cancel / Save draft / Commit to library. Cancel discards the session. Save draft writes Drive review. Commit to library writes Drive library.
+- Removing 👍 👎 💩 🙉 🙏 does nothing.
 
 ## Private chat and Drive review
 
 Current forum members can chat directly with the bot:
 
 - Send a FLAC, then pick one of the forum topics. Bot uses that topic as the library folder and runs the same identification pipeline as a forum upload.
-- High-confidence matches continue automatically. Low-confidence matches open a typed editor.
-- Run `/reviews` to browse FLACs in the Drive review folder, download one for editing, and promote it to the library.
+- High-confidence matches continue automatically. Low-confidence matches open a button editor (tap a field, type a value or pick a song.log suggestion).
+- `/review` (alias `/reviews`) lists the review queue as `Artist — Album — Title`. Pick one to get a full info card, then react on that card.
 
-Typed editing asks for title, artist, album, album artist, composer, genre, date, track/disc numbers, lyrics, and album art. Type replacement content directly. `/keep` preserves a value, `/clear` empties it, and `/back` returns to the prior field. Album art accepts a Telegram photo/image document or a public HTTP(S) image URL; `/remove` removes it.
-
-Every private step has a **Cancel** button. Forum tag review, cover selection, and Drive-conflict prompts also have **Cancel**. Cancelling deletes only pending local files. A recalled Drive review remains untouched unless library upload succeeds; successful promotion then removes its review FLAC and JSON sidecar from Drive.
+Every private pre-save step has **Cancel**. Forum tag review, cover selection, and Drive-conflict prompts also have **Cancel**. Cancelling deletes only pending local files, not a saved library/review track.
 
 ## Development
 

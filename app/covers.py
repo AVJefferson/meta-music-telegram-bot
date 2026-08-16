@@ -21,7 +21,7 @@ COVER_NAME = "cover.jpg"
 COVER_TTL = timedelta(days=7)
 MAX_COVER_OPTIONS = 10
 _PLACEHOLDER_ALBUMS = {"", "unknown", "unknown album"}
-SOURCE_LABELS = {"file": "file", "caa": "CAA", "itunes": "iTunes"}
+SOURCE_LABELS = {"file": "file", "caa": "CAA", "itunes": "iTunes", "drive": "Drive", "cache": "Drive"}
 
 
 @dataclass
@@ -265,6 +265,24 @@ async def list_cover_candidates(
     if itunes:
         cover, url = itunes
         add_cover_option(options, cover[0], "itunes", url=url)
+    finalize_cover_labels(options)
+    return options
+
+
+async def list_edit_cover_candidates(
+    ctx: Ctx,
+    identity: Identity,
+    tags: TagSet,
+    topic: str,
+    file_cover: tuple[bytes, str] | None,
+) -> list[CoverOption]:
+    ident = cover_identity(identity, tags)
+    options = await list_cover_candidates(ctx, ident, file_cover)
+    existing = await existing_album_cover(
+        ctx, topic, tags.album, tags.albumartist or tags.artist
+    )
+    if existing and existing.data:
+        add_cover_option(options, existing.data, "drive")
     finalize_cover_labels(options)
     return options
 

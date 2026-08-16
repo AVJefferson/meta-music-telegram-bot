@@ -51,6 +51,7 @@ genres:
   - techno
   - trance
   - world
+  - NCS
 
 moods:
   - acoustic
@@ -120,3 +121,7 @@ aliases:
   malayalam: malayalam
   "film": filmi
   "indian film": filmi
+  ncs: ncs
+  "no copyright sounds": ncs
+  nocopyrightsounds: ncs
+  "no-copyright-sounds": ncs

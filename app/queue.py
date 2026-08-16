@@ -286,9 +286,17 @@ async def process_job(job: Job, ctx: Ctx) -> None:
         # Writing now would only add a full mutagen rewrite of a large FLAC.
         report = _build_report(hints, identity, enrichment, tags)
 
+        restart_replace = None
+        restart_old_drive = None
+        if job.source_pending_id:
+            pending_row = ctx.catalog.get_pending_review(job.source_pending_id)
+            if pending_row and pending_row.replace_id:
+                restart_replace = pending_row.replace_id
+                restart_old_drive = pending_row.old_drive_id
+
         if identity.confidence == "high" and identity.mb_recording_id:
             existing = ctx.catalog.find_library_by_mbid(identity.mb_recording_id)
-            if existing:
+            if existing and existing.id != restart_replace:
                 new_q = quality(identity.bit_depth, identity.sample_rate)
                 old_q = quality(existing.bit_depth, existing.sample_rate)
                 if existing.status == "uploaded" and new_q <= old_q:
@@ -327,6 +335,8 @@ async def process_job(job: Job, ctx: Ctx) -> None:
             tags=tags,
             identity=identity,
             report=report,
+            replace_id=restart_replace,
+            old_drive_id=restart_old_drive,
             file_cover=file_cover,
             pending_id=job.source_pending_id,
         )
@@ -390,12 +400,12 @@ async def start_tag_review(
             expires_at=_expires_at(),
         )
     if job.private:
-        ctx.catalog.update_pending_review(pending_id, phase="edit:0")
-        from app.private_ui import show_editor_prompt
+        ctx.catalog.update_pending_review(pending_id, phase="edit:fields")
+        from app.edit_ui import show_field_menu
 
         row = ctx.catalog.get_pending_review(pending_id)
         if row:
-            await show_editor_prompt(ctx, row)
+            await show_field_menu(ctx, row)
         status_id = job.status_message_id
     else:
         text = format_summary(original, tags, tags, reason=identity.confidence_reason)
@@ -545,10 +555,12 @@ def _cover_caption(index: int, option: dict, album: str, albumartist: str) -> st
     return caption[:1024]
 
 
-def _gallery_kwargs(job: Job) -> dict:
+def _gallery_kwargs(job: Job, reply_to_message_id: int | None = None) -> dict:
     kwargs: dict = {"chat_id": job.chat_id}
     if job.thread_id:
         kwargs["message_thread_id"] = job.thread_id
+    if reply_to_message_id:
+        kwargs["reply_to_message_id"] = reply_to_message_id
     return kwargs
 
 
@@ -608,6 +620,7 @@ async def _send_cover_gallery(
     options: list[dict],
     album: str,
     albumartist: str,
+    reply_to_message_id: int | None = None,
 ) -> list[int]:
     ready: list[tuple[int, dict, Path]] = []
     for index, option in enumerate(options):
@@ -620,7 +633,7 @@ async def _send_cover_gallery(
         log.warning("cover gallery empty album=%s options=%s", album, len(options))
         return []
 
-    base = _gallery_kwargs(job)
+    base = _gallery_kwargs(job, reply_to_message_id)
     if len(ready) >= 2:
         media = []
         for index, option, path in ready:
@@ -1617,7 +1630,7 @@ async def _commit_upload(
             file_id, url = await asyncio.to_thread(ctx.drive.replace_file, replace_file_id, dest, "audio/flac")
         else:
             file_id, url = await asyncio.to_thread(ctx.drive.create_file, dest, parent_id, filename, "audio/flac")
-        await _upload_sidecars(
+        sidecar_id, log_id = await _upload_sidecars(
             ctx,
             parent_id=parent_id,
             dest=dest,
@@ -1628,6 +1641,24 @@ async def _commit_upload(
             kind=kind,
         )
         ctx.catalog.mark_uploaded(track_id, file_id, url)
+        telegram_file_id = job.file_id or None
+        if pending_id is not None:
+            completed = ctx.catalog.get_pending_review(pending_id)
+            if completed and completed.telegram_file_id:
+                telegram_file_id = completed.telegram_file_id
+        ctx.catalog.update_track(
+            track_id,
+            telegram_file_id=telegram_file_id,
+            source_report_json=_dumps(source_report),
+            tags_json=_dumps(asdict(tags)),
+            identity_json=_dumps(asdict(identity)),
+            topic_name=job.topic_name,
+            file_name=job.file_name,
+            drive_sidecar_id=sidecar_id,
+            drive_log_id=log_id,
+            thread_id=job.thread_id,
+            kind=kind,
+        )
         if old_drive_id and old_drive_id != file_id and conflict_action != "keep_both":
             await asyncio.to_thread(ctx.drive.delete_file, old_drive_id)
         if pending_id is not None:
@@ -1673,6 +1704,8 @@ async def _commit_upload(
         f"{tag_preview(tags)}{link}\n"
         f"<code>{html_esc(relative.as_posix())}</code>",
     )
+    if job.status_message_id:
+        ctx.catalog.bind_track_message(track_id, job.chat_id, job.status_message_id)
     log.info("saved %s kind=%s confidence=%s path=%s", job.file_name, dest_label, identity.confidence, relative)
     return dest
 
@@ -1764,7 +1797,7 @@ async def _upload_sidecars(
     tags: TagSet,
     identity: Identity,
     kind: str,
-) -> None:
+) -> tuple[str | None, str | None]:
     if kind == "library":
         cover, mime = await asyncio.to_thread(read_cover, dest)
         if cover:
@@ -1772,27 +1805,31 @@ async def _upload_sidecars(
                 await asyncio.to_thread(upload_album_cover_if_missing, ctx, parent_id, cover, mime)
             except Exception:
                 log.warning("album cover upload failed", exc_info=True)
+    sidecar_id: str | None = None
+    log_id: str | None = None
     json_name = dest.with_suffix(".json").name
     log_name = dest.with_suffix(".log").name
     if sidecar_path and sidecar_path.exists():
         json_hits = await asyncio.to_thread(ctx.drive.find_name_conflicts, parent_id, json_name)
         try:
             if json_hits:
-                await asyncio.to_thread(ctx.drive.replace_file, json_hits[0].id, sidecar_path, "application/json")
+                sidecar_id, _url = await asyncio.to_thread(
+                    ctx.drive.replace_file, json_hits[0].id, sidecar_path, "application/json"
+                )
             else:
-                await asyncio.to_thread(
+                sidecar_id, _url = await asyncio.to_thread(
                     ctx.drive.create_file, sidecar_path, parent_id, json_name, "application/json"
                 )
         except Exception:
             log.warning("sidecar json upload failed", exc_info=True)
     if not ctx.settings.enable_log_per_music_file:
-        return
+        return sidecar_id, log_id
     report = apply_chosen(source_report, tags, identity)
     payload = render_songlog(report).encode("utf-8")
     log_hits = await asyncio.to_thread(ctx.drive.find_name_conflicts, parent_id, log_name)
     replace_log_id = log_hits[0].id if log_hits else None
     try:
-        await asyncio.to_thread(
+        log_id, _url = await asyncio.to_thread(
             ctx.drive.upload_bytes,
             payload,
             parent_id,
@@ -1802,6 +1839,7 @@ async def _upload_sidecars(
         )
     except Exception:
         log.warning("song log upload failed", exc_info=True)
+    return sidecar_id, log_id
 
 
 def _load_pending_state(row: PendingReview) -> tuple[dict, dict, dict, Identity, dict, list]:
@@ -1959,6 +1997,19 @@ async def cancel_pending(ctx: Ctx, row: PendingReview) -> None:
     await _clear_cover_artifacts(ctx, row)
     local = Path(row.local_path) if row.local_path else None
     sidecar = Path(row.sidecar_path) if row.sidecar_path else None
+    pending_root = Path(ctx.settings.pending_root).resolve()
+
+    def _staged(path: Path | None) -> Path | None:
+        if path is None:
+            return None
+        try:
+            path.resolve().relative_to(pending_root)
+        except ValueError:
+            return None
+        return path
+
+    local = _staged(local)
+    sidecar = _staged(sidecar)
     unlink_quiet(sidecar)
     if local and row.local_path:
         unlink_quiet(local.parent / "manual-cover.jpg")
@@ -2240,13 +2291,28 @@ async def expire_pending(ctx: Ctx) -> None:
                     conflict_action="skip",
                     track_id=row.track_id,
                 )
+            elif row.phase == "react_exit":
+                from app.reactions import expire_react_exit
+
+                await expire_react_exit(ctx, row)
             else:
                 local = Path(row.local_path) if row.local_path else None
+                if local:
+                    try:
+                        local.resolve().relative_to(Path(ctx.settings.pending_root).resolve())
+                    except ValueError:
+                        local = None
                 if local:
                     unlink_quiet(local)
                     unlink_quiet(local.parent / "manual-cover.jpg")
                 if row.sidecar_path:
-                    unlink_quiet(Path(row.sidecar_path))
+                    sidecar = Path(row.sidecar_path)
+                    try:
+                        sidecar.resolve().relative_to(Path(ctx.settings.pending_root).resolve())
+                    except ValueError:
+                        sidecar = None
+                    else:
+                        unlink_quiet(sidecar)
                 ctx.catalog.update_pending_review(row.id, status="expired")
                 await edit_status(ctx, job, "Expired after 24 hours. Start again.")
         except Exception:

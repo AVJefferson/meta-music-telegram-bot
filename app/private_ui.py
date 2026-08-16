@@ -26,6 +26,7 @@ from aiogram.types import (
 from PIL import Image
 
 from app.botapi import discard_download
+from app.edit_ui import EDITOR_FIELDS, current_edit_field, handle_edit_text, show_field_menu
 from app.membership import is_forum_member
 from app.models import Ctx, Identity, Job, PendingReview, tagset_from_dict
 from app.tags import audio_info, read_cover, read_tagset, write_tags
@@ -34,18 +35,6 @@ from app.util import format_bytes, html_esc, sanitize_filename
 log = logging.getLogger(__name__)
 PAGE_SIZE = 8
 TOPIC_PAGE_SIZE = 10
-EDITOR_FIELDS = [
-    ("title", "Title"),
-    ("artist", "Artist"),
-    ("album", "Album"),
-    ("albumartist", "Album artist"),
-    ("composer", "Composer"),
-    ("genre", "Genre"),
-    ("date", "Date / year"),
-    ("tracknumber", "Track number"),
-    ("discnumber", "Disc number"),
-    ("lyrics", "Lyrics"),
-]
 
 
 class FlacMessageFilter(BaseFilter):
@@ -197,57 +186,13 @@ async def _show_reviews(ctx: Ctx, row: PendingReview, page: int = 0) -> None:
 
 
 async def show_editor_prompt(ctx: Ctx, row: PendingReview) -> None:
-    try:
-        index = int(row.phase.split(":", 1)[1])
-    except (IndexError, ValueError):
-        index = 0
-    index = max(0, min(index, len(EDITOR_FIELDS) - 1))
-    key, label = EDITOR_FIELDS[index]
-    tags = tagset_from_dict(_loads(row.working_json, {}))
-    value = getattr(tags, key)
-    shown = html_esc(value) if value else "—"
-    if len(shown) > 2500:
-        shown = shown[:2500] + "…"
-    text = (
-        f"<b>Edit {label}</b> ({index + 1}/{len(EDITOR_FIELDS)})\n"
-        f"Current:\n<pre>{shown}</pre>\n"
-        "Type replacement content.\n"
-        "<code>/keep</code> keeps it; <code>/clear</code> removes it."
-    )
-    from app.queue import edit_status
-
-    job = Job(
-        chat_id=row.chat_id,
-        thread_id=None,
-        topic_name=row.topic_name,
-        file_id="",
-        file_name=row.file_name,
-        status_message_id=row.status_message_id,
-        private=True,
-    )
-    status_id = await edit_status(
-        ctx, job, text, _control_keyboard(row.id, back=index > 0)
-    )
-    if status_id != row.status_message_id:
-        ctx.catalog.update_pending_review(row.id, status_message_id=status_id)
+    await show_field_menu(ctx, row)
 
 
 async def _show_cover_prompt(ctx: Ctx, row: PendingReview) -> None:
-    cover, _mime = await asyncio.to_thread(read_cover, Path(row.local_path))
-    text = (
-        "<b>Edit album art</b>\n"
-        f"Current: {'present' if cover else 'none'}\n"
-        "Send a photo, image document, or public image URL.\n"
-        "<code>/keep</code> keeps current art; <code>/remove</code> removes it."
-    )
-    from app.queue import edit_status
+    from app.edit_ui import show_cover_prompt
 
-    await edit_status(
-        ctx,
-        Job(row.chat_id, None, row.topic_name, "", row.file_name, row.status_message_id, private=True),
-        text,
-        _control_keyboard(row.id),
-    )
+    await show_cover_prompt(ctx, row)
 
 
 async def _show_confirm(ctx: Ctx, row: PendingReview) -> None:
@@ -387,16 +332,15 @@ async def _store_manual_cover(
     path = Path(row.local_path).parent / "manual-cover.jpg"
     path.write_bytes(payload)
     report = _loads(row.source_report_json, {})
-    report["manual_cover"] = {"mode": "replace", "path": path.name}
+    report["manual_cover"] = {"mode": "replace", "path": path.name, "label": "upload"}
     ctx.catalog.update_pending_review(
         row.id,
-        phase="edit:confirm",
         source_report_json=_dumps(report),
         status="waiting",
     )
     refreshed = ctx.catalog.get_pending_review(row.id)
     if refreshed:
-        await _show_confirm(ctx, refreshed)
+        await show_field_menu(ctx, refreshed)
 
 
 async def _cancel(ctx: Ctx, row: PendingReview) -> None:
@@ -441,7 +385,7 @@ async def _run_private_claimed(ctx: Ctx, row: PendingReview, operation) -> None:
     except Exception:
         log.exception("private pending action failed id=%s phase=%s", row.id, row.phase)
         ctx.catalog.update_pending_review(
-            row.id, phase="edit:confirm", status="waiting"
+            row.id, phase="edit:fields", status="waiting"
         )
         await ctx.bot.send_message(
             row.chat_id, "Action failed. Nothing was discarded; retry or cancel."
@@ -507,55 +451,8 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
         if not await _require_private(message, ctx):
             return
         await message.reply(
-            "Send a FLAC to run tagging, or use /reviews to edit tracks in Drive review."
+            "Send a FLAC to run tagging, or /review to open the review queue."
         )
-
-    @router.message(F.chat.type == "private", Command("reviews"))
-    async def reviews(message: Message, ctx: Ctx) -> None:
-        if not await _require_private(message, ctx):
-            return
-        active = ctx.catalog.get_active_for_chat(message.chat.id)
-        if active:
-            await message.reply("Finish or cancel current action first.")
-            return
-        try:
-            items = await asyncio.to_thread(
-                ctx.drive.list_review_items, ctx.settings.gdrive_review_folder_id
-            )
-        except Exception:
-            log.exception("Drive review listing failed")
-            await message.reply("Could not load Drive review list. Check logs.")
-            return
-        if not items:
-            await message.reply("Drive review list is empty.")
-            return
-        sent = await message.reply("Loading Drive review list…")
-        try:
-            pending_id = ctx.catalog.insert_pending_review(
-                phase="review_list",
-                local_path="",
-                sidecar_path=None,
-                relative_path=None,
-                kind="review",
-                original_json="{}",
-                recommended_json="{}",
-                working_json="{}",
-                candidates_json=_dumps([asdict(item) for item in items]),
-                identity_json="{}",
-                source_report_json="{}",
-                chat_id=message.chat.id,
-                thread_id=None,
-                status_message_id=sent.message_id,
-                topic_name="",
-                file_name="Drive reviews",
-                expires_at=_expires_at(),
-            )
-        except RuntimeError:
-            await sent.edit_text("Another private action is already active.")
-            return
-        row = ctx.catalog.get_pending_review(pending_id)
-        if row:
-            await _show_reviews(ctx, row)
 
     @router.message(F.chat.type == "private", FlacMessageFilter())
     async def private_media(message: Message, ctx: Ctx) -> None:
@@ -598,6 +495,7 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
                 status_message_id=status.message_id,
                 topic_name="",
                 file_name=file_name,
+                telegram_file_id=file_id,
                 expires_at=_expires_at(),
             )
         except RuntimeError:
@@ -659,7 +557,7 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
                     chat_id=row.chat_id,
                     thread_id=None,
                     topic_name=topic,
-                    file_id="",
+                    file_id=row.telegram_file_id or "",
                     file_name=row.file_name,
                     status_message_id=row.status_message_id,
                     local_path=row.local_path,
@@ -710,7 +608,16 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
     @router.message(F.chat.type == "private", F.photo | F.document)
     async def private_cover(message: Message, ctx: Ctx) -> None:
         row = ctx.catalog.get_waiting_for_chat(message.chat.id)
-        if not row or row.phase != "edit:cover" or not await _require_private(message, ctx):
+        if not row or not await _require_private(message, ctx):
+            return
+        if (
+            current_edit_field(row) != "cover"
+            and row.phase != "edit:cover"
+            and (
+                not message.reply_to_message
+                or message.reply_to_message.message_id != row.status_message_id
+            )
+        ):
             return
         media = message.photo[-1] if message.photo else message.document
         if not media or (message.document and not (message.document.mime_type or "").startswith("image/")):
@@ -734,81 +641,26 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
             ctx.catalog.update_pending_review(row.id, status="waiting")
             await message.reply("Invalid image. Send JPEG, PNG, or WebP.")
 
-    @router.message(F.chat.type == "private", F.text)
+    @router.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
     async def private_text(message: Message, ctx: Ctx) -> None:
+        if not await _require_private(message, ctx):
+            return
         row = ctx.catalog.get_waiting_for_chat(message.chat.id)
-        if not row or not row.phase.startswith("edit:") or not await _require_private(message, ctx):
-            return
-        if not ctx.catalog.claim_pending(row.id, "processing"):
-            return
-        text = message.text or ""
-        command = text.strip().lower()
-        if command == "/cancel":
-            await _cancel(ctx, row)
-            return
-        if command == "/back":
-            ctx.catalog.update_pending_review(
-                row.id,
-                phase=_previous_editor_phase(row.phase),
-                status="waiting",
-            )
-            refreshed = ctx.catalog.get_pending_review(row.id)
-            if refreshed:
-                if refreshed.phase == "edit:cover":
-                    await _show_cover_prompt(ctx, refreshed)
-                else:
-                    await show_editor_prompt(ctx, refreshed)
-            return
-        if row.phase == "edit:cover":
-            report = _loads(row.source_report_json, {})
-            if command == "/keep":
-                report["manual_cover"] = {"mode": "keep"}
-            elif command == "/remove":
-                report["manual_cover"] = {"mode": "remove"}
-            elif text.startswith(("http://", "https://")):
+        if row and current_edit_field(row) == "cover":
+            text = (message.text or "").strip()
+            if not ctx.catalog.claim_pending(row.id, "processing"):
+                return
+            if text.startswith(("http://", "https://")):
                 try:
-                    data = await _fetch_image(text.strip())
+                    data = await _fetch_image(text)
                     await _store_manual_cover(ctx, row, data, normalized=True)
                 except Exception as exc:
                     ctx.catalog.update_pending_review(row.id, status="waiting")
                     await message.reply(f"Could not load image: {html_esc(exc)}", parse_mode="HTML")
                 return
-            else:
-                ctx.catalog.update_pending_review(row.id, status="waiting")
-                await message.reply("Send image/URL, or use /keep or /remove.")
-                return
-            ctx.catalog.update_pending_review(
-                row.id,
-                phase="edit:confirm",
-                source_report_json=_dumps(report),
-                status="waiting",
-            )
-            refreshed = ctx.catalog.get_pending_review(row.id)
-            if refreshed:
-                await _show_confirm(ctx, refreshed)
-            return
-        if row.phase == "edit:confirm":
             ctx.catalog.update_pending_review(row.id, status="waiting")
+            await message.reply("Send a photo, image document, or public image URL.")
             return
-        index = int(row.phase.split(":", 1)[1])
-        key, _label = EDITOR_FIELDS[index]
-        tags = asdict(tagset_from_dict(_loads(row.working_json, {})))
-        if command == "/clear":
-            tags[key] = ""
-        elif command != "/keep":
-            tags[key] = text
-        next_phase = _next_editor_phase(index)
-        ctx.catalog.update_pending_review(
-            row.id,
-            phase=next_phase,
-            working_json=_dumps(tags),
-            status="waiting",
-        )
-        refreshed = ctx.catalog.get_pending_review(row.id)
-        if refreshed:
-            if next_phase == "edit:cover":
-                await _show_cover_prompt(ctx, refreshed)
-            else:
-                await show_editor_prompt(ctx, refreshed)
+        await handle_edit_text(message, ctx)
 
     return router
