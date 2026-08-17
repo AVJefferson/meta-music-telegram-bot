@@ -235,13 +235,26 @@ class EditUiTests(unittest.TestCase):
 
 class LyricsPreviewTests(unittest.TestCase):
     def test_preview_and_clock(self) -> None:
-        from app.enrich import lyrics_preview
+        from app.enrich import lyrics_card_text, lyrics_preview
         from app.util import format_clock
 
         lrc = "[ar:Sam]\n[00:12.00] Guess it's true\n[00:16.50] I'm not good\n[00:20.00] At a one night stand"
         self.assertEqual(lyrics_preview(lrc), "Guess it's true\nI'm not good\nAt a one night stand")
-        self.assertEqual(format_clock(172), "00:02:52")
+        self.assertEqual(
+            lyrics_preview(lrc, keep_time=True),
+            "00:12  Guess it's true\n00:16  I'm not good\n00:20  At a one night stand",
+        )
+        self.assertEqual(format_clock(172), "02\u223652")
+        self.assertEqual(format_clock(3725), "1\u223602\u223605")
+        self.assertEqual(format_clock(172, seekable=True), "02:52")
         self.assertEqual(format_clock(None), "")
+        self.assertEqual(
+            lyrics_card_text(lrc),
+            "Lyrics:\n00:12  Guess it's true\n00:16  I'm not good\n00:20  At a one night stand",
+        )
+        self.assertEqual(lyrics_card_text(""), "Lyrics: none")
+        plain = "Hello world\nSecond line\nThird line\nFourth"
+        self.assertEqual(lyrics_card_text(plain), "Lyrics:\nHello world\nSecond line\nThird line")
 
 
 class GenreNcsTests(unittest.TestCase):

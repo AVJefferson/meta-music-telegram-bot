@@ -181,7 +181,7 @@ def file_stem_hints(filename: str) -> str:
     return stem.strip()
 
 
-def format_clock(seconds: float | None) -> str:
+def format_clock(seconds: float | None, *, seekable: bool = False) -> str:
     if seconds is None:
         return ""
     total = round(float(seconds))
@@ -189,7 +189,10 @@ def format_clock(seconds: float | None) -> str:
         return ""
     hours, rem = divmod(total, 3600)
     minutes, secs = divmod(rem, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    sep = ":" if seekable else "\u2236"
+    if hours:
+        return f"{hours}{sep}{minutes:02d}{sep}{secs:02d}"
+    return f"{minutes:02d}{sep}{secs:02d}"
 
 
 def format_tech_lines(

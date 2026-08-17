@@ -10,7 +10,7 @@ from PIL import Image
 
 from app.genre import GenreMapper
 from app.models import Enrichment, Identity
-from app.util import is_synced_lrc, normalize_match_text
+from app.util import format_clock, is_synced_lrc, normalize_match_text
 
 log = logging.getLogger(__name__)
 
@@ -27,16 +27,50 @@ class LyricsHit:
     instrumental: bool = False
 
 
-def lyrics_preview(text: str, *, lines: int = 3) -> str:
+def _stamp_seconds(stamp: str) -> float | None:
+    inner = stamp.strip().strip("[]")
+    parts = re.split(r"[:.]", inner)
+    if len(parts) < 2:
+        return None
+    try:
+        minutes = int(parts[0])
+        secs = int(parts[1])
+    except ValueError:
+        return None
+    frac = 0.0
+    if len(parts) >= 3 and parts[2]:
+        try:
+            frac = float(f"0.{parts[2]}")
+        except ValueError:
+            frac = 0.0
+    return minutes * 60 + secs + frac
+
+
+def lyrics_preview(text: str, *, lines: int = 3, keep_time: bool = False) -> str:
     out: list[str] = []
     for raw in (text or "").splitlines():
+        stamp = _LRC_STAMP.search(raw)
         line = _LRC_STAMP.sub("", raw).strip()
         if not line or (line.startswith("[") and line.endswith("]")):
             continue
+        if keep_time and stamp:
+            clock = format_clock(_stamp_seconds(stamp.group(0)), seekable=True)
+            if clock:
+                line = f"{clock}  {line}"
         out.append(line)
         if len(out) >= lines:
             break
     return "\n".join(out)
+
+
+def lyrics_card_text(text: str | None, *, lines: int = 3) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return "Lyrics: none"
+    preview = lyrics_preview(raw, lines=lines, keep_time=is_synced_lrc(raw))
+    if not preview:
+        return "Lyrics: present"
+    return f"Lyrics:\n{preview}"
 
 
 def _fit_cover(data: bytes) -> tuple[bytes, str]:

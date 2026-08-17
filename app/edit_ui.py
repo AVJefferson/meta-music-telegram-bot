@@ -258,8 +258,6 @@ PREVIEW_FIELDS = [
 
 
 def _preview_value(key: str, value: str) -> str:
-    if key == "lyrics":
-        return "present" if (value or "").strip() else "none"
     return (value or "").strip()
 
 
@@ -283,9 +281,14 @@ def format_edit_card(
     for key, label in PREVIEW_FIELDS:
         old_raw = getattr(original, key, "") or ""
         new_raw = getattr(working, key, "") or ""
+        if key == "lyrics":
+            from app.enrich import lyrics_card_text
+
+            lines.append(html_esc(lyrics_card_text(new_raw)))
+            continue
         old = _preview_value(key, old_raw)
         new = _preview_value(key, new_raw)
-        changed = old_raw != new_raw if key != "lyrics" else old != new
+        changed = old_raw != new_raw
         old_html = html_esc(old) if old else "—"
         new_html = html_esc(new) if new else "—"
         if key == "composer":

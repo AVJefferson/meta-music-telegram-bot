@@ -154,9 +154,24 @@ class HydrateTrackTagsTests(unittest.IsolatedAsyncioTestCase):
 class AudioCardTests(unittest.TestCase):
     def test_tech_lines_pipe_quality(self) -> None:
         text = format_tech_lines(duration=172, bit_depth=16, sample_rate=44100, bitrate_kbps=987)
-        self.assertEqual(text, "Format: FLAC\nDuration: 00:02:52\n987 kbps | 44.1 kHz | 16 bits")
+        self.assertEqual(text, "Format: FLAC\nDuration: 02\u223652\n987 kbps | 44.1 kHz | 16 bits")
         preview = tag_preview(TagSet(title="Stay"), AudioMetrics(172, 16, 44100, 987))
         self.assertIn("Format: FLAC", preview)
-        self.assertIn("Duration: 00:02:52", preview)
+        self.assertIn("Duration: 02\u223652", preview)
+        self.assertNotIn("Duration: 02:52", preview)
         self.assertIn("987 kbps | 44.1 kHz | 16 bits", preview)
         self.assertIn("<b>Stay</b>", preview)
+        self.assertIn("Lyrics: none", preview)
+
+    def test_tag_preview_includes_synced_lyric_lines(self) -> None:
+        lrc = "[ar:Sam]\n[00:12.00] Guess it's true\n[00:16.50] I'm not good\n[00:20.00] At a one night stand\n[00:24.00] skipped"
+        preview = tag_preview(
+            TagSet(title="Stay", lyrics=lrc),
+            AudioMetrics(172, 16, 44100, 987),
+        )
+        self.assertIn("Lyrics:", preview)
+        self.assertIn("00:12  Guess it's true", preview)
+        self.assertIn("00:16  I'm not good", preview)
+        self.assertIn("00:20  At a one night stand", preview)
+        self.assertNotIn("skipped", preview)
+        self.assertIn("Duration: 02\u223652", preview)

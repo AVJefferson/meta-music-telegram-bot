@@ -29,7 +29,7 @@ from app.covers import (
     resolve_album_cover,
     upload_album_cover_if_missing,
 )
-from app.enrich import enrich
+from app.enrich import enrich, lyrics_card_text
 from app.identify import identify_file, identity_from_mbid
 from app.library import library_relative, place_file, review_relative, unlink_quiet, write_sidecar
 from app.membership import is_forum_member
@@ -79,7 +79,6 @@ def quality(bit_depth: int | None, sample_rate: int | None) -> tuple[int, int]:
 
 
 def tag_preview(tags: TagSet, metrics: AudioMetrics | None = None) -> str:
-    lyrics = "present" if tags.lyrics else "none"
     return (
         f"<b>{html_esc(tags.title)}</b>\n"
         f"Artist: {html_esc(tags.artist)}\n"
@@ -88,7 +87,7 @@ def tag_preview(tags: TagSet, metrics: AudioMetrics | None = None) -> str:
         f"Composer: {html_esc(tags.composer)}\n"
         f"Genre: {html_esc(tags.genre)}\n"
         f"Year: {html_esc(tags.date)}\n"
-        f"Lyrics: {lyrics}\n"
+        f"{html_esc(lyrics_card_text(tags.lyrics))}\n"
         f"{format_audio_block(metrics)}"
     )
 
