@@ -94,6 +94,7 @@ class Job:
     local_path: str | None = None
     private: bool = False
     source_pending_id: int | None = None
+    fallback_send: bool = True
 
 
 @dataclass

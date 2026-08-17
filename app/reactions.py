@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiogram import F, Router
-from aiogram.types import CallbackQuery, MessageReactionUpdated
+from aiogram.types import CallbackQuery, FSInputFile, MessageReactionUpdated
 
 from app.edit_ui import (
     drive_confirm_keyboard,
@@ -46,7 +46,7 @@ _OP_LABELS = {
     "library": "Move this track to the library on Google Drive?",
     "review": "Move this track to the review folder on Google Drive?",
     "delete": "Delete this track from local disk and Google Drive?",
-    "restart": "Re-identify from the original Telegram file? A successful run replaces the Drive copy.",
+    "restart": "Re-identify from Telegram, local, or Drive? A successful run replaces the Drive copy.",
 }
 
 
@@ -292,11 +292,6 @@ async def _confirm_reaction(ctx: Ctx, event: MessageReactionUpdated, track: Trac
         op = "delete"
     else:
         op = "restart"
-        if not track.telegram_file_id:
-            await _reply_card(
-                ctx, event, "Original Telegram file is unknown. Cannot restart.", None, thread_id=track.thread_id
-            )
-            return
     tags = read_tags_for_card(track)
     identity = identity_from_track(track)
     report = _report_op(_loads(track.source_report_json, {}), op)
@@ -307,7 +302,7 @@ async def _confirm_reaction(ctx: Ctx, event: MessageReactionUpdated, track: Trac
         phase="react_confirm",
         op=op,
         staged=None,
-        status_message_id=0,
+        status_message_id=event.message_id if op == "restart" else 0,
         expires_at=_far_expires(),
         working_json=_dumps(asdict(tags)),
         original_json=_dumps(asdict(tags)),
@@ -317,6 +312,19 @@ async def _confirm_reaction(ctx: Ctx, event: MessageReactionUpdated, track: Trac
     if not row:
         return
     ctx.catalog.update_pending_review(row.id, candidates_json=_dumps({"op": op}))
+    if op == "restart":
+        from app.queue import _job_from_pending, edit_status
+
+        refreshed = ctx.catalog.get_pending_review(row.id) or row
+        await edit_status(
+            ctx,
+            _job_from_pending(refreshed),
+            _OP_LABELS[op],
+            drive_confirm_keyboard(row.id),
+            fallback_send=event.chat.id > 0,
+        )
+        ctx.catalog.bind_track_message(track.id, event.chat.id, event.message_id)
+        return
     status_id = await _reply_card(
         ctx, event, _OP_LABELS[op], drive_confirm_keyboard(row.id), thread_id=track.thread_id
     )
@@ -420,14 +428,19 @@ async def _handle_confirm(ctx: Ctx, row: PendingReview, action: str) -> None:
     from app.queue import _job_from_pending, edit_status
 
     job = _job_from_pending(row)
+    op = str((_loads(row.candidates_json, {}) or {}).get("op") or _loads(row.source_report_json, {}).get("react_op") or "")
     if action == "no":
         ctx.catalog.update_pending_review(row.id, status="cancelled")
-        await edit_status(ctx, job, "Cancelled. No Drive change.")
+        if op == "restart" and row.track_id:
+            from app.edit_ui import show_saved_card
+
+            await show_saved_card(ctx, row, fallback_send=row.chat_id > 0)
+        else:
+            await edit_status(ctx, job, "Cancelled. No Drive change.")
         return
     if action != "yes":
         ctx.catalog.update_pending_review(row.id, status="waiting")
         return
-    op = str((_loads(row.candidates_json, {}) or {}).get("op") or _loads(row.source_report_json, {}).get("react_op") or "")
     track = ctx.catalog.get_track(row.track_id) if row.track_id else None
     if track is None:
         ctx.catalog.update_pending_review(row.id, status="failed")
@@ -487,18 +500,67 @@ async def _handle_confirm(ctx: Ctx, row: PendingReview, action: str) -> None:
     ctx.catalog.update_pending_review(row.id, status="done")
 
 
+async def _restart_source(ctx: Ctx, track: TrackRecord) -> Path:
+    from app.botapi import discard_download
+
+    name = sanitize_filename(Path(track.file_name or track.relative_path or "track.flac").name)
+    if not name.lower().endswith(".flac"):
+        name = f"{name}.flac"
+    dest = ctx.settings.pending_root / str(uuid.uuid4()) / name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if track.telegram_file_id:
+        try:
+            file = await ctx.bot.get_file(track.telegram_file_id)
+            await ctx.bot.download(file, destination=dest)
+            await asyncio.to_thread(discard_download, file.file_path)
+            if dest.is_file() and dest.stat().st_size > 0:
+                log.info("restart source=telegram track=%s", track.id)
+                return dest
+        except Exception:
+            log.warning("telegram original unavailable track=%s", track.id, exc_info=True)
+            shutil.rmtree(dest.parent, ignore_errors=True)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+    local = await ensure_local_flac(ctx, track)
+    await asyncio.to_thread(shutil.copy2, local, dest)
+    log.info("restart source=local/drive track=%s path=%s", track.id, dest)
+    return dest
+
+
+async def _send_listen_copy(ctx: Ctx, chat_id: int, path: Path) -> None:
+    try:
+        await ctx.bot.send_document(
+            chat_id=chat_id,
+            document=FSInputFile(path, filename=path.name),
+        )
+    except Exception:
+        log.warning("dm listen send failed chat=%s", chat_id, exc_info=True)
+
+
 async def _restart_track(ctx: Ctx, row: PendingReview, track: TrackRecord) -> None:
+    from app.edit_ui import show_saved_card
     from app.queue import _job_from_pending, edit_status
 
     job = _job_from_pending(row)
-    if not track.telegram_file_id or ctx.jobs is None:
+    reuse_card = row.chat_id < 0
+    if ctx.jobs is None:
         ctx.catalog.update_pending_review(row.id, status="waiting")
-        await edit_status(ctx, job, "Cannot restart: missing original file.")
+        await show_saved_card(ctx, row, prefix="Cannot restart: worker unavailable.", fallback_send=not reuse_card)
         return
+    await edit_status(ctx, job, "Looking up original file…", fallback_send=not reuse_card)
+    try:
+        source = await _restart_source(ctx, track)
+    except Exception:
+        log.exception("restart source failed track=%s", track.id)
+        ctx.catalog.update_pending_review(row.id, status="waiting")
+        await show_saved_card(ctx, row, prefix="Cannot restart: no Telegram, local, or Drive file.", fallback_send=not reuse_card)
+        return
+    if row.chat_id > 0:
+        await _send_listen_copy(ctx, row.chat_id, source)
     ctx.catalog.update_pending_review(
         row.id,
         phase="intake",
         status="queued",
+        local_path=str(source),
         telegram_file_id=track.telegram_file_id,
         replace_id=track.id,
         old_drive_id=track.drive_file_id,
@@ -509,13 +571,16 @@ async def _restart_track(ctx: Ctx, row: PendingReview, track: TrackRecord) -> No
             chat_id=row.chat_id,
             thread_id=row.thread_id,
             topic_name=row.topic_name or track.topic_name or "General",
-            file_id=track.telegram_file_id,
-            file_name=row.file_name or track.file_name or "track.flac",
+            file_id="",
+            file_name=row.file_name or track.file_name or source.name,
             status_message_id=row.status_message_id,
+            local_path=str(source),
+            private=row.chat_id > 0,
             source_pending_id=row.id,
+            fallback_send=not reuse_card,
         )
     )
-    await edit_status(ctx, job, "Restarting from the original file…")
+    await edit_status(ctx, job, "Restarting from the original file…", fallback_send=not reuse_card)
 
 
 async def _apply_manual_cover(row: PendingReview, tags, local: Path) -> None:

@@ -666,3 +666,186 @@ class ClipHtmlTests(unittest.TestCase):
         self.assertIn("</b>", out)
         self.assertTrue(out.endswith("…"))
         self.assertLess(out.count("<b>"), 2)
+
+
+class RestartSourceTests(unittest.IsolatedAsyncioTestCase):
+    def _ctx(self, root: Path, track, bot=None):
+        return SimpleNamespace(
+            bot=bot or SimpleNamespace(),
+            settings=SimpleNamespace(
+                pending_root=root / "pending",
+                library_root=root / "library",
+                review_root=root / "review",
+                gdrive_folder_id="lib",
+                gdrive_review_folder_id="rev",
+            ),
+            catalog=SimpleNamespace(
+                get_track=lambda _id: track,
+                update_track=lambda *_a, **_k: None,
+            ),
+            drive=SimpleNamespace(),
+            jobs=asyncio.Queue(),
+        )
+
+    def _track(self, **kwargs):
+        base = dict(
+            id=7,
+            telegram_file_id=None,
+            local_path="",
+            relative_path="",
+            file_name="song.flac",
+            kind="review",
+            drive_file_id=None,
+        )
+        base.update(kwargs)
+        return SimpleNamespace(**base)
+
+    async def test_uses_local_when_telegram_missing(self) -> None:
+        from app.reactions import _restart_source
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            flac = root / "song.flac"
+            flac.write_bytes(b"fLaC")
+            track = self._track(local_path=str(flac))
+            path = await _restart_source(self._ctx(root, track), track)
+            self.assertNotEqual(path, flac)
+            self.assertTrue(path.is_relative_to(root / "pending"))
+            self.assertEqual(path.read_bytes(), b"fLaC")
+            self.assertTrue(flac.is_file())
+
+    async def test_falls_back_to_local_when_telegram_fails(self) -> None:
+        from app.reactions import _restart_source
+
+        class Bot:
+            async def get_file(self, file_id):
+                raise RuntimeError("file gone")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            flac = root / "song.flac"
+            flac.write_bytes(b"fLaC")
+            track = self._track(id=8, telegram_file_id="tg-expired", local_path=str(flac))
+            path = await _restart_source(self._ctx(root, track, Bot()), track)
+            self.assertNotEqual(path, flac)
+            self.assertEqual(path.read_bytes(), b"fLaC")
+            self.assertTrue(flac.is_file())
+
+    async def test_prefers_telegram_when_download_works(self) -> None:
+        from app.reactions import _restart_source
+
+        class File:
+            file_path = "/tmp/not-bot-api.bin"
+
+        class Bot:
+            async def get_file(self, file_id):
+                return File()
+
+            async def download(self, file, destination):
+                Path(destination).parent.mkdir(parents=True, exist_ok=True)
+                Path(destination).write_bytes(b"from-tg")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "old.flac"
+            local.write_bytes(b"old")
+            track = self._track(id=9, telegram_file_id="tg-ok", local_path=str(local))
+            path = await _restart_source(self._ctx(root, track, Bot()), track)
+            self.assertNotEqual(path, local)
+            self.assertEqual(path.read_bytes(), b"from-tg")
+            self.assertEqual(local.read_bytes(), b"old")
+
+    async def test_falls_back_to_drive_when_local_missing(self) -> None:
+        from app.reactions import _restart_source
+
+        class Drive:
+            def download_to(self, file_id, dest):
+                Path(dest).parent.mkdir(parents=True, exist_ok=True)
+                Path(dest).write_bytes(b"from-drive")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            track = self._track(
+                id=10,
+                local_path=str(root / "gone.flac"),
+                relative_path="English/A/LP/a.flac",
+                drive_file_id="drive-1",
+                kind="library",
+            )
+            ctx = self._ctx(root, track)
+            ctx.drive = Drive()
+            path = await _restart_source(ctx, track)
+            self.assertTrue(path.is_relative_to(root / "pending"))
+            self.assertEqual(path.read_bytes(), b"from-drive")
+
+
+class RestartTrackListenTests(unittest.IsolatedAsyncioTestCase):
+    async def _run(self, chat_id: int) -> list:
+        from app.reactions import _restart_track
+
+        sent: list = []
+
+        class Bot:
+            async def send_document(self, **kwargs):
+                sent.append(kwargs)
+
+            async def edit_message_text(self, *args, **kwargs):
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            flac = root / "song.flac"
+            flac.write_bytes(b"fLaC")
+            track = SimpleNamespace(
+                id=11,
+                telegram_file_id=None,
+                local_path=str(flac),
+                relative_path="",
+                file_name="song.flac",
+                kind="review",
+                drive_file_id="drv",
+                topic_name="English",
+            )
+            row = SimpleNamespace(
+                id=3,
+                chat_id=chat_id,
+                thread_id=1 if chat_id < 0 else None,
+                topic_name="English",
+                file_name="song.flac",
+                status_message_id=99,
+            )
+            jobs: asyncio.Queue = asyncio.Queue()
+            ctx = SimpleNamespace(
+                bot=Bot(),
+                jobs=jobs,
+                settings=SimpleNamespace(
+                    pending_root=root / "pending",
+                    library_root=root / "library",
+                    review_root=root / "review",
+                    gdrive_folder_id="lib",
+                    gdrive_review_folder_id="rev",
+                ),
+                catalog=SimpleNamespace(
+                    get_track=lambda _id: track,
+                    update_track=lambda *_a, **_k: None,
+                    update_pending_review=lambda *_a, **_k: None,
+                ),
+            )
+            await _restart_track(ctx, row, track)
+            job = jobs.get_nowait()
+            self.assertEqual(job.local_path, str(Path(job.local_path)))
+            self.assertTrue(Path(job.local_path).is_file())
+            self.assertEqual(job.source_pending_id, 3)
+            self.assertEqual(job.file_id, "")
+            self.assertEqual(job.private, chat_id > 0)
+            self.assertEqual(job.fallback_send, chat_id > 0)
+            return sent
+
+    async def test_dm_sends_flac_for_listening(self) -> None:
+        sent = await self._run(chat_id=42)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["chat_id"], 42)
+
+    async def test_group_does_not_send_flac(self) -> None:
+        sent = await self._run(chat_id=-100)
+        self.assertEqual(sent, [])

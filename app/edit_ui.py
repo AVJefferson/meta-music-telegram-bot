@@ -448,18 +448,18 @@ async def _clear_edit_cover(ctx: Ctx, row: PendingReview) -> dict:
     return report
 
 
-async def show_saved_card(ctx: Ctx, row: PendingReview, *, prefix: str = "") -> None:
+async def show_saved_card(ctx: Ctx, row: PendingReview, *, prefix: str = "", fallback_send: bool = True) -> None:
     from app.queue import _job_from_pending, edit_status
     from app.review_cmd import format_song_card
 
     track = ctx.catalog.get_track(row.track_id) if row.track_id else None
     if track is None:
-        await edit_status(ctx, _job_from_pending(row), prefix or "Done.")
+        await edit_status(ctx, _job_from_pending(row), prefix or "Done.", fallback_send=fallback_send)
         return
     text = format_song_card(track)
     if prefix:
         text = f"{prefix}\n\n{text}"
-    await edit_status(ctx, _job_from_pending(row), text)
+    await edit_status(ctx, _job_from_pending(row), text, fallback_send=fallback_send)
 
 
 async def show_field_menu(ctx: Ctx, row: PendingReview) -> None:

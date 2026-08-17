@@ -139,7 +139,7 @@ After a track is saved, react on the bot's info card (forum Saved message, or a 
 - 👍 — confirm, then move to library (local + Drive)
 - 👎 — confirm, then move to review (local + Drive)
 - 💩 or 🙉 — confirm, then delete local + Drive
-- 🙏 — confirm, then re-identify from the original Telegram file
+- 🙏 — confirm on the same info card, then re-identify. Uses the Telegram original if it still exists, else the local file, else the Drive copy. In private chat the bot also sends the FLAC so you can listen. Group chats stay on that card — no extra messages.
 - ✍️ — start the button editor. Removing ✍️ does **not** write Drive; it asks Cancel / Save draft / Commit to library. Cancel discards the session. Save draft writes Drive review. Commit to library writes Drive library.
 - Removing 👍 👎 💩 🙉 🙏 does nothing.
 

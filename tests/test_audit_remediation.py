@@ -129,6 +129,27 @@ class GroupJobRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(job.private)
             catalog.close()
 
+    async def test_intake_row_with_local_path_requeues_without_file_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = Catalog(Path(directory) / "state.sqlite")
+            pending_id = catalog.insert_pending_review(
+                **_pending_kwargs(
+                    phase="intake",
+                    status="processing",
+                    local_path="/tmp/drive-copy.flac",
+                    thread_id=7,
+                    telegram_file_id=None,
+                )
+            )
+            jobs: asyncio.Queue = asyncio.Queue()
+            await recover_interrupted(SimpleNamespace(catalog=catalog), jobs)
+            job = jobs.get_nowait()
+            self.assertEqual(job.source_pending_id, pending_id)
+            self.assertEqual(job.file_id, "")
+            self.assertEqual(job.local_path, "/tmp/drive-copy.flac")
+            self.assertEqual(job.thread_id, 7)
+            catalog.close()
+
     async def test_intake_row_without_file_id_fails_instead_of_looping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             catalog = Catalog(Path(directory) / "state.sqlite")

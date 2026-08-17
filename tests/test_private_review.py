@@ -182,6 +182,39 @@ class PromotionCleanupTests(unittest.IsolatedAsyncioTestCase):
             assert recovered is not None
             self.assertEqual(recovered.status, "queued")
 
+    async def test_queued_intake_job_recovers_from_local_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = Catalog(Path(directory) / "state.sqlite")
+            pending_id = catalog.insert_pending_review(
+                phase="intake",
+                local_path="/tmp/drive-copy.flac",
+                sidecar_path=None,
+                relative_path=None,
+                kind="library",
+                original_json="{}",
+                recommended_json="{}",
+                working_json="{}",
+                candidates_json="[]",
+                identity_json="{}",
+                source_report_json="{}",
+                chat_id=-100,
+                thread_id=1,
+                status_message_id=9,
+                topic_name="English",
+                file_name="song.flac",
+                expires_at="2099-01-01T00:00:00+00:00",
+            )
+            catalog.update_pending_review(pending_id, status="processing", telegram_file_id=None)
+            jobs: asyncio.Queue = asyncio.Queue()
+            await recover_interrupted(SimpleNamespace(catalog=catalog), jobs)
+            job = jobs.get_nowait()
+            self.assertEqual(job.local_path, "/tmp/drive-copy.flac")
+            self.assertEqual(job.file_id, "")
+            self.assertEqual(job.source_pending_id, pending_id)
+            recovered = catalog.get_pending_review(pending_id)
+            assert recovered is not None
+            self.assertEqual(recovered.status, "queued")
+
 
 class UiTests(unittest.TestCase):
     def test_cancel_callbacks_exist_in_group_keyboards(self) -> None:

@@ -139,8 +139,10 @@ def _job_from_pending(row: PendingReview) -> Job:
     )
 
 
-async def edit_status(ctx: Ctx, job: Job, text: str, markup=None) -> int:
+async def edit_status(ctx: Ctx, job: Job, text: str, markup=None, *, fallback_send: bool | None = None) -> int:
     markup = empty_markup() if markup is None else markup
+    if fallback_send is None:
+        fallback_send = job.fallback_send
     if job.status_message_id:
         try:
             await ctx.bot.edit_message_text(
@@ -158,6 +160,8 @@ async def edit_status(ctx: Ctx, job: Job, text: str, markup=None) -> int:
             log.warning("status edit failed: %s", exc)
         except Exception:
             log.warning("status edit failed", exc_info=True)
+    if not fallback_send:
+        return job.status_message_id
     try:
         kwargs: dict = {
             "chat_id": job.chat_id,
@@ -233,7 +237,7 @@ async def recover_interrupted(ctx: Ctx, jobs: asyncio.Queue[Job]) -> None:
                 )
                 continue
             if row.phase == "intake" and row.status in {"queued", "processing"}:
-                if not row.telegram_file_id:
+                if not row.telegram_file_id and not row.local_path:
                     log.warning("intake row id=%s has no file id, dropping", row.id)
                     ctx.catalog.update_pending_review(row.id, status="failed")
                     continue
@@ -243,9 +247,11 @@ async def recover_interrupted(ctx: Ctx, jobs: asyncio.Queue[Job]) -> None:
                         chat_id=row.chat_id,
                         thread_id=row.thread_id,
                         topic_name=row.topic_name,
-                        file_id=row.telegram_file_id,
+                        file_id=row.telegram_file_id or "",
                         file_name=row.file_name,
                         status_message_id=row.status_message_id,
+                        local_path=row.local_path,
+                        private=row.chat_id > 0,
                         source_pending_id=row.id,
                     )
                 )
