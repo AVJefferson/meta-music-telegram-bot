@@ -246,6 +246,7 @@ def format_conflict(
     sample_rate: int | None,
     new_size: int | None,
     catalog_note: bool = False,
+    authenticity: str = "",
 ) -> str:
     newest = conflicts[0] if conflicts else {}
     existing_size = format_bytes(newest.get("size"))
@@ -255,6 +256,8 @@ def format_conflict(
         f"Existing: {html_esc(existing_size)}, {html_esc(modified)}",
         f"New:      {html_esc(format_quality(bit_depth, sample_rate, new_size))}",
     ]
+    if authenticity:
+        lines.append(html_esc(authenticity))
     if len(conflicts) > 1:
         lines.append(f"\n{len(conflicts)} files with this name — Replace updates the newest.")
     if catalog_note:

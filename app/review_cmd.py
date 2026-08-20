@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from app.membership import is_forum_member
 from app.models import Ctx, TrackRecord
 from app.queue import tag_preview
-from app.relocate import hydrate_track_tags, metrics_from_track, read_tags_for_card
+from app.relocate import hydrate_track_tags, identity_from_track, metrics_from_track, read_tags_for_card
 from app.util import html_esc, safe_link
 
 log = logging.getLogger(__name__)
@@ -47,13 +48,32 @@ def review_list_keyboard(items: list[TrackRecord], page: int) -> InlineKeyboardM
 
 
 def format_song_card(track: TrackRecord) -> str:
+    from app.authenticity import authenticity_from
+
     tags = read_tags_for_card(track)
     dest_label = "library" if track.kind == "library" else "review"
     href = safe_link(track.drive_url)
     link = f'\nDrive: <a href="{href}">open</a>' if href else ""
     relative = html_esc(track.relative_path or "")
     path_line = f"\n<code>{relative}</code>" if relative else ""
-    return f"{dest_label}\n\n{tag_preview(tags, metrics_from_track(track))}{link}{path_line}"
+    identity = identity_from_track(track)
+    preview = tag_preview(
+        tags,
+        metrics_from_track(track),
+        authenticity=authenticity_from(_loads_report(track), identity),
+    )
+    return f"{dest_label}\n\n{preview}{link}{path_line}"
+
+
+def _loads_report(track: TrackRecord) -> dict:
+    raw = getattr(track, "source_report_json", None)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 async def _sync_drive_review(ctx: Ctx) -> None:

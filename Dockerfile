@@ -8,7 +8,7 @@ ARG APP_UID=101
 ARG APP_GID=101
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libchromaprint-tools \
+    && apt-get install -y --no-install-recommends libchromaprint-tools libsndfile1 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g "${APP_GID}" app \
     && useradd -u "${APP_UID}" -g "${APP_GID}" -M -d /app -s /usr/sbin/nologin app

@@ -10,3 +10,4 @@ pydantic-settings>=2.6,<3
 apscheduler>=3.10,<4
 PyYAML>=6.0,<7
 Pillow>=11.0,<12
+flac-detective>=1.11,<2

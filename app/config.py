@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     enable_log_per_music_file: bool = False
     # Chosen cover photo stays this long before the picker gallery is deleted.
     cover_choice_hold_seconds: float = Field(default=2.0, ge=0)
+    authenticity_check: bool = True
+    # Seconds of audio to analyse. -1 = entire file.
+    authenticity_sample_seconds: float = 15.0
+    authenticity_flag_hires: bool = True
 
     acoustid_api_key: str
     acoustid_min_score: float = 0.8
@@ -38,6 +42,19 @@ class Settings(BaseSettings):
     covers_root: Path = Path("/data/covers")
     cleanup_cron: str = "0 3 * * 0"
     genre_map_path: Path = Field(default_factory=lambda: Path(__file__).resolve().parent.parent / "genre_map.yaml")
+
+    @field_validator("authenticity_sample_seconds", mode="before")
+    @classmethod
+    def _normalize_auth_sample_seconds(cls, value: object) -> float:
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            return 15.0
+        if seconds == -1:
+            return -1.0
+        if seconds >= 1:
+            return seconds
+        return 15.0
 
     @field_validator("log_level", mode="before")
     @classmethod

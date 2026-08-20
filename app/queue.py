@@ -14,6 +14,14 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, InputMediaPhoto
 
+from app.authenticity import (
+    analyze_flac,
+    authenticity_from,
+    stamp_identity,
+    stamp_report,
+    unknown_result,
+)
+from app.authenticity import format_line as format_authenticity_line
 from app.botapi import discard_download
 from app.cleanup import alert_general
 from app.covers import (
@@ -79,7 +87,11 @@ def quality(bit_depth: int | None, sample_rate: int | None) -> tuple[int, int]:
     return (bit_depth or 0, sample_rate or 0)
 
 
-def tag_preview(tags: TagSet, metrics: AudioMetrics | None = None) -> str:
+def tag_preview(tags: TagSet, metrics: AudioMetrics | None = None, authenticity=None) -> str:
+    audio = format_audio_block(metrics)
+    line = format_authenticity_line(authenticity)
+    if line:
+        audio = f"{audio}\n{html_esc(line)}"
     return (
         f"<b>{html_esc(tags.title)}</b>\n"
         f"Artist: {html_esc(tags.artist)}\n"
@@ -89,8 +101,24 @@ def tag_preview(tags: TagSet, metrics: AudioMetrics | None = None) -> str:
         f"Genre: {html_esc(tags.genre)}\n"
         f"Year: {html_esc(tags.date)}\n"
         f"{html_esc(lyrics_card_text(tags.lyrics))}\n"
-        f"{format_audio_block(metrics)}"
+        f"{audio}"
     )
+
+
+def _preview(tags: TagSet, identity, path: Path | None = None, report: dict | None = None) -> str:
+    return tag_preview(
+        tags,
+        _metrics_from_identity(identity, path),
+        authenticity=authenticity_from(report, identity),
+    )
+
+
+def _tech_block(identity, path: Path | None = None, report: dict | None = None) -> str:
+    audio = format_audio_block(_metrics_from_identity(identity, path))
+    line = format_authenticity_line(authenticity_from(report, identity))
+    if line:
+        return f"{audio}\n{html_esc(line)}"
+    return audio
 
 
 def _metrics_from_identity(identity, path: Path | None = None) -> AudioMetrics:
@@ -341,6 +369,20 @@ async def process_job(job: Job, ctx: Ctx) -> None:
         # itself (cover resolution, review confirm, expiry) or discards the file.
         # Writing now would only add a full mutagen rewrite of a large FLAC.
         report = _build_report(hints, identity, enrichment, tags)
+        if settings.authenticity_check:
+            await edit_status(ctx, job, "Checking authenticity…")
+            try:
+                auth = await asyncio.to_thread(
+                    analyze_flac,
+                    tmp,
+                    sample_seconds=settings.authenticity_sample_seconds,
+                    flag_hires=settings.authenticity_flag_hires,
+                )
+            except Exception:
+                log.warning("authenticity check failed", exc_info=True)
+                auth = unknown_result(flag_hires=settings.authenticity_flag_hires)
+            report = stamp_report(report, auth)
+            stamp_identity(identity, auth)
 
         restart_replace = None
         restart_old_drive = None
@@ -360,7 +402,7 @@ async def process_job(job: Job, ctx: Ctx) -> None:
                         ctx,
                         job,
                         "Duplicate — already in library "
-                        f"({old_q[0]}/{old_q[1]}). Skipped.\n\n{tag_preview(tags, _metrics_from_identity(identity, tmp))}",
+                        f"({old_q[0]}/{old_q[1]}). Skipped.\n\n{_preview(tags, identity, tmp, report)}",
                     )
                     return
                 await _library_commit_with_cover(
@@ -470,7 +512,7 @@ async def start_tag_review(
             tags,
             tags,
             reason=identity.confidence_reason,
-            tech=format_audio_block(_metrics_from_identity(identity, dest)),
+            tech=_tech_block(identity, dest, report),
             genre_mapper=ctx.genre,
         )
         markup = review_keyboard(pending_id, original, tags, tags)
@@ -1571,7 +1613,7 @@ async def _commit_upload(
             ctx,
             job,
             "Skipped Drive upload. Kept locally.\n\n"
-            f"{tag_preview(tags, _metrics_from_identity(identity, dest))}\n"
+            f"{_preview(tags, identity, dest, source_report)}\n"
             f"<code>{html_esc(dest)}</code>",
         )
         log.info("drive skip track=%s path=%s", skipped_id, relative)
@@ -1693,7 +1735,7 @@ async def _commit_upload(
             status="uploading",
         )
 
-    await edit_status(ctx, job, f"Uploading to Drive…\n\n{tag_preview(tags, _metrics_from_identity(identity, dest))}")
+    await edit_status(ctx, job, f"Uploading to Drive…\n\n{_preview(tags, identity, dest, source_report)}")
     log.debug("drive upload path=%s parent=%s replace=%s", relative, parent_id, replace_file_id)
     try:
         if replace_file_id:
@@ -1771,7 +1813,7 @@ async def _commit_upload(
         await edit_status(
             ctx,
             job,
-            f"Tagged, but Drive upload failed. Kept locally.\n\n{tag_preview(tags, _metrics_from_identity(identity, dest))}\n\n"
+            f"Tagged, but Drive upload failed. Kept locally.\n\n{_preview(tags, identity, dest, source_report)}\n\n"
             f"<code>{html_esc(dest)}</code>",
         )
         return dest
@@ -1786,7 +1828,7 @@ async def _commit_upload(
         ctx,
         job,
         f"Saved ({dest_label}, {identity.confidence} confidence).{extra}\n\n"
-        f"{tag_preview(tags, _metrics_from_identity(identity, dest))}{link}\n"
+        f"{_preview(tags, identity, dest, source_report)}{link}\n"
         f"<code>{html_esc(relative.as_posix())}</code>",
     )
     if job.source_message_id:
@@ -1837,6 +1879,7 @@ async def _hold_drive_conflict(
         sample_rate=identity.sample_rate,
         new_size=new_size,
         catalog_note=catalog_note,
+        authenticity=format_authenticity_line(authenticity_from(source_report, identity)),
     )
     fields = dict(
         phase="drive",
@@ -1940,7 +1983,7 @@ def _load_pending_state(row: PendingReview) -> tuple[dict, dict, dict, Identity,
 
 
 async def _refresh_tag_ui(ctx: Ctx, row: PendingReview) -> None:
-    original, recommended, working, identity, _report, _candidates = _load_pending_state(row)
+    original, recommended, working, identity, report, _candidates = _load_pending_state(row)
     job = _job_from_pending(row)
     path = Path(row.local_path) if row.local_path else None
     text = format_summary(
@@ -1948,7 +1991,7 @@ async def _refresh_tag_ui(ctx: Ctx, row: PendingReview) -> None:
         recommended,
         working,
         reason=identity.confidence_reason,
-        tech=format_audio_block(_metrics_from_identity(identity, path)),
+        tech=_tech_block(identity, path, report),
         genre_mapper=ctx.genre,
     )
     status_id = await edit_status(ctx, job, text, review_keyboard(row.id, original, recommended, working))
@@ -2151,7 +2194,7 @@ async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
                     ctx,
                     job,
                     "Duplicate — already in library "
-                    f"({old_q[0]}/{old_q[1]}). Skipped.\n\n{tag_preview(tags, _metrics_from_identity(identity, local))}",
+                    f"({old_q[0]}/{old_q[1]}). Skipped.\n\n{_preview(tags, identity, local, report)}",
                 )
                 return
             await _library_commit_with_cover(

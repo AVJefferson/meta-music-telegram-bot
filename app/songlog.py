@@ -166,6 +166,20 @@ def render_songlog(report: dict[str, Any]) -> str:
 
     lastfm_block = _block("lastfm", [_line("tags", ", ".join(report.get("lastfm_tags") or []))])
 
+    auth = report.get("authenticity") or {}
+    if isinstance(auth, dict) and auth:
+        auth_lines = [
+            _line("verdict", auth.get("verdict")),
+            _line("score", auth.get("score")),
+            _line("cutoff_hz", auth.get("cutoff_hz")),
+            _line("hires", auth.get("hires_verdict")),
+            _line("estimated_mp3_bitrate", auth.get("estimated_mp3_bitrate")),
+            _line("reason", auth.get("reason")),
+        ]
+    else:
+        auth_lines = ["(none)"]
+    authenticity_block = _block("authenticity", auth_lines)
+
     caa = report.get("coverartarchive") or {}
     caa_block = _block(
         "coverartarchive",
@@ -204,6 +218,8 @@ def render_songlog(report: dict[str, Any]) -> str:
             itunes_block,
             "",
             lastfm_block,
+            "",
+            authenticity_block,
             "",
             caa_block,
             "",

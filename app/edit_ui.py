@@ -387,37 +387,48 @@ def _card_hint(row: PendingReview, field: str | None) -> str:
 
 
 def _tech_for_row(row: PendingReview) -> str:
+    from app.authenticity import authenticity_from
+    from app.authenticity import format_line as format_authenticity_line
     from app.tags import AudioMetrics, read_audio_metrics
 
+    raw = _loads(row.identity_json, {}) or {}
+    report = _loads(row.source_report_json, {}) or {}
+    if not isinstance(report, dict):
+        report = {}
+    ident_report = raw.get("source_report") if isinstance(raw, dict) else None
+    audio = ""
     if row.local_path:
         path = Path(row.local_path)
         if path.is_file():
             try:
-                return format_audio_block(read_audio_metrics(path))
+                audio = format_audio_block(read_audio_metrics(path))
             except Exception:
                 log.debug("edit card audio metrics failed", exc_info=True)
-    raw = _loads(row.identity_json, {}) or {}
-    report = raw.get("source_report") if isinstance(raw, dict) else None
-    if not isinstance(report, dict):
-        report = _loads(row.source_report_json, {}) or {}
-    bitrate = report.get("bitrate") if isinstance(report, dict) else None
-    try:
-        bitrate_kbps = int(bitrate) if bitrate else None
-    except (TypeError, ValueError):
-        bitrate_kbps = None
-    duration = 0.0
-    if isinstance(raw, dict):
-        duration = float(raw.get("duration") or 0)
-    if not duration and isinstance(report, dict):
-        duration = float(report.get("duration") or 0)
-    return format_audio_block(
-        AudioMetrics(
-            duration=duration,
-            bit_depth=raw.get("bit_depth") if isinstance(raw, dict) else None,
-            sample_rate=raw.get("sample_rate") if isinstance(raw, dict) else None,
-            bitrate_kbps=bitrate_kbps or None,
+    if not audio:
+        bitrate = report.get("bitrate") if isinstance(report, dict) else None
+        if bitrate is None and isinstance(ident_report, dict):
+            bitrate = ident_report.get("bitrate")
+        try:
+            bitrate_kbps = int(bitrate) if bitrate else None
+        except (TypeError, ValueError):
+            bitrate_kbps = None
+        duration = 0.0
+        if isinstance(raw, dict):
+            duration = float(raw.get("duration") or 0)
+        if not duration and isinstance(report, dict):
+            duration = float(report.get("duration") or 0)
+        audio = format_audio_block(
+            AudioMetrics(
+                duration=duration,
+                bit_depth=raw.get("bit_depth") if isinstance(raw, dict) else None,
+                sample_rate=raw.get("sample_rate") if isinstance(raw, dict) else None,
+                bitrate_kbps=bitrate_kbps or None,
+            )
         )
-    )
+    line = format_authenticity_line(authenticity_from(report, ident_report))
+    if line:
+        return f"{audio}\n{html_esc(line)}"
+    return audio
 
 
 def edit_card_text(row: PendingReview, *, field: str | None = None, genre=None) -> str:
