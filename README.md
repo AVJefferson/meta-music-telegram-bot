@@ -14,7 +14,7 @@ Audio is never re-encoded. FLAC uses Vorbis comments (not ID3).
 2. `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org) (local Bot API, required for files over 20MB)
 3. Free [AcoustID application key](https://acoustid.org/new-application)
 4. MusicBrainz user-agent with a real contact email
-5. Optional free [Last.fm API key](https://www.last.fm/api/account/create)
+5. Optional free [Last.fm API key](https://www.last.fm/api/account/create) — required for `/suggest`
 6. Google Cloud project (personal Drive)
    - Enable **Google Drive API**
    - OAuth consent: **External**, test user = your Gmail
@@ -54,7 +54,8 @@ Data:
 - `/data/covers` — album art shortcut, deleted after 7 days
 - `/data/pending` — FLACs parked while waiting on a review, cover pick, or Drive conflict
 - `/data/tmp` — scratch space during tagging, wiped weekly
-- `/data/state.sqlite` — catalog (survives wipes; used for dedup)
+- `/data/state.sqlite` — catalog (survives wipes unless you use `-v`; used for dedup)
+- Drive `Telegram Music/library/tracks.json` — tag index for `/suggest` after a volume wipe
 - Drive music folder — library layout `{Language}/{AlbumArtist}/{Album}/{AlbumArtist} - {Track} - {Title}.flac`
 - Drive album folder also stores `cover.jpg`. First library track of an album sends a photo picker (file art, Cover Art Archive fronts, iTunes). Later tracks reuse that pick. Local copy expires after a week.
 - Drive review folder — low-confidence matches plus a `.json` sidecar
@@ -150,6 +151,7 @@ Current forum members can chat directly with the bot:
 - Send a FLAC, then pick one of the forum topics. Bot uses that topic as the library folder and runs the same identification pipeline as a forum upload.
 - High-confidence matches continue automatically. Low-confidence matches open a button editor (tap a field, type a value or pick a song.log suggestion).
 - `/review` (alias `/reviews`) lists the review queue as `Artist — Album — Title`. Pick one to get a full info card, then react on that card.
+- `/suggest` [genre, mood, artist, or reply to a song card] lists similar songs from Last.fm, mixing about half already-in-library (marked ✓) and half new. In a language-named forum topic (Hindi, Malayalam, …) only that language is used as the seed; DM and General use the whole library. Needs `LASTFM_API_KEY`. Pick a ✓ row to post lyrics (synced when the tags or LRCLIB have them) as a reply on the original FLAC. Pick a new song in DM to get song info plus a `.lrc` file. Drive `Telegram Music/library/tracks.json` stores tag rows used after a `docker compose down -v` wipe: sqlite is filled from that file on boot, or the bot walks Drive FLACs once if the file is missing. New library uploads update `tracks.json` in place (no download; skip if unchanged).
 
 Every private pre-save step has **Cancel**. Forum tag review, cover selection, and Drive-conflict prompts also have **Cancel**. Cancelling deletes only pending local files, not a saved library/review track.
 

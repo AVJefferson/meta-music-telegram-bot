@@ -22,12 +22,14 @@ from app.drive import DriveClient
 from app.edit_ui import build_edit_router
 from app.genre import GenreMapper
 from app.identify import MBClient
+from app.library_index import ensure_library_index
 from app.models import Ctx, Job
 from app.private_ui import build_private_router
 from app.queue import recover_interrupted, worker
 from app.reactions import build_reactions_router
 from app.review_cmd import build_review_command_router
 from app.review_ui import build_review_router
+from app.suggest_cmd import build_suggest_command_router
 from app.util import html_esc
 
 log = logging.getLogger(__name__)
@@ -131,7 +133,10 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
 
     @router.message(Command("start"))
     async def start(message: Message) -> None:
-        await message.reply("Send FLAC files in the configured forum group. I tag, upload to Drive, and file them.")
+        await message.reply(
+            "Send FLAC files in the configured forum group. I tag, upload to Drive, and file them. "
+            "/suggest finds similar songs from Last.fm. ✓ rows are already in the library."
+        )
 
     @router.message(Command("chatid"))
     async def chatid(message: Message) -> None:
@@ -193,6 +198,7 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
             topic_name=topic_name,
             file_name=file_name,
             telegram_file_id=file_id,
+            source_message_id=message.message_id,
             expires_at=intake_expires_at(),
         )
         await jobs.put(
@@ -204,6 +210,7 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
                 file_name=file_name,
                 status_message_id=status_id,
                 source_pending_id=pending_id,
+                source_message_id=message.message_id,
             )
         )
 
@@ -272,6 +279,7 @@ async def main() -> None:
     dp.update.middleware(CtxMiddleware(ctx))
     dp.include_router(build_private_router(jobs))
     dp.include_router(build_review_command_router())
+    dp.include_router(build_suggest_command_router())
     dp.include_router(build_edit_router())
     dp.include_router(build_reactions_router())
     dp.include_router(build_router(jobs))
@@ -286,6 +294,11 @@ async def main() -> None:
     try:
         await wait_for_telegram(bot)
         await recover_interrupted(ctx, jobs)
+        try:
+            source = await asyncio.to_thread(ensure_library_index, ctx)
+            log.info("library tag index ready source=%s", source)
+        except Exception:
+            log.warning("library tag index startup failed", exc_info=True)
         allowed = polling_allowed_updates(dp)
         log.info("polling allowed_updates=%s allowed_chat_id=%s", allowed, settings.allowed_chat_id)
         await dp.start_polling(bot, allowed_updates=allowed)

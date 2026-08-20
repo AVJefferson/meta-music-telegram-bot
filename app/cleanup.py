@@ -135,6 +135,9 @@ async def run_cleanup(ctx: Ctx) -> None:
     pruned = ctx.catalog.prune_finished_pending()
     if pruned:
         log.info("pruned %s finished pending row(s)", pruned)
+    suggest_pruned = ctx.catalog.prune_suggest_state()
+    if suggest_pruned:
+        log.info("pruned %s expired suggest cache row(s)", suggest_pruned)
     await _prune_drive_review_folders(ctx)
     log.info("weekly cleanup done")
 

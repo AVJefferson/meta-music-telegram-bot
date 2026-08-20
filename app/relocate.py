@@ -232,6 +232,7 @@ async def relocate_track(
     old_kind = track.kind
     old_relative = Path(track.relative_path) if track.relative_path else None
     old_local = Path(track.local_path) if track.local_path else None
+    from app.library_index import remember_library_tags, remove_library_index
 
     if kind == "library":
         relative = library_relative(topic_name, tags)
@@ -312,13 +313,34 @@ async def relocate_track(
         file_name=file_name,
         error=None,
     )
+    if old_kind == "library" and old_relative and (
+        kind != "library" or old_relative.as_posix() != relative.as_posix()
+    ):
+        await asyncio.to_thread(remove_library_index, ctx, old_relative.as_posix())
+    await asyncio.to_thread(
+        remember_library_tags,
+        ctx,
+        kind=kind,
+        relative_path=relative.as_posix(),
+        drive_file_id=file_id,
+        topic_name=topic_name,
+        tags=tags,
+        telegram_file_id=track.telegram_file_id,
+        chat_id=track.source_chat_id,
+        message_id=track.source_message_id,
+        thread_id=track.thread_id,
+    )
     refreshed = ctx.catalog.get_track(track.id)
     assert refreshed is not None
     return refreshed
 
 
 async def delete_track(ctx: Ctx, track: TrackRecord) -> None:
+    from app.library_index import remove_library_index
+
     relative = Path(track.relative_path) if track.relative_path else None
+    if track.kind == "library" and track.relative_path:
+        await asyncio.to_thread(remove_library_index, ctx, track.relative_path)
     await _delete_drive_named(
         ctx,
         track.kind,

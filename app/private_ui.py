@@ -463,7 +463,8 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
         if not await _require_private(message, ctx):
             return
         await message.reply(
-            "Send a FLAC to run tagging, or /review to open the review queue."
+            "Send a FLAC to run tagging, /review to open the review queue, "
+            "or /suggest for similar songs (✓ = already in the library)."
         )
 
     @router.message(F.chat.type == "private", FlacMessageFilter())
@@ -508,6 +509,7 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
                 topic_name="",
                 file_name=file_name,
                 telegram_file_id=file_id,
+                source_message_id=message.message_id,
                 expires_at=_expires_at(),
             )
         except RuntimeError:
@@ -575,6 +577,7 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
                     local_path=row.local_path,
                     private=True,
                     source_pending_id=row.id,
+                    source_message_id=getattr(row, "source_message_id", None) or 0,
                 )
             )
             try:

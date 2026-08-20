@@ -42,6 +42,7 @@ class DriveReviewItem:
     relative_path: str
     size: int | None
     modified: str | None
+    log_id: str | None = None
 
 
 def _child_from_meta(meta: dict) -> DriveChild:
@@ -360,33 +361,66 @@ class DriveClient:
             destination.unlink(missing_ok=True)
             raise
 
-    def list_review_items(self, root_id: str) -> list[DriveReviewItem]:
+    def _list_flac_items(
+        self,
+        folder_id: str,
+        parts: tuple[str, ...],
+        *,
+        skip_folders: frozenset[str] | None = None,
+    ) -> list[DriveReviewItem]:
         items: list[DriveReviewItem] = []
+        skip = {name.casefold() for name in (skip_folders or ())}
 
-        def walk(folder_id: str, parts: tuple[str, ...]) -> None:
-            children = self.list_children(folder_id)
+        def walk(current_id: str, current_parts: tuple[str, ...]) -> None:
+            children = self.list_children(current_id)
             files = {child.name: child for child in children if not child.is_folder}
             for child in children:
                 if child.is_folder:
-                    walk(child.id, (*parts, child.name))
+                    if not current_parts and child.name.casefold() in skip:
+                        continue
+                    walk(child.id, (*current_parts, child.name))
                     continue
                 if not child.name.lower().endswith(".flac"):
                     continue
-                sidecar = files.get(f"{Path(child.name).stem}.json")
+                stem = Path(child.name).stem
+                sidecar = files.get(f"{stem}.json")
+                songlog = files.get(f"{stem}.log")
                 items.append(
                     DriveReviewItem(
                         file_id=child.id,
                         sidecar_id=sidecar.id if sidecar else None,
                         name=child.name,
-                        relative_path="/".join((*parts, child.name)),
+                        relative_path="/".join((*current_parts, child.name)),
                         size=child.size,
                         modified=child.modified,
+                        log_id=songlog.id if songlog else None,
                     )
                 )
 
-        walk(root_id, ())
+        walk(folder_id, parts)
         items.sort(key=lambda item: (item.modified or "", item.relative_path), reverse=True)
         return items
+
+    def list_review_items(self, root_id: str) -> list[DriveReviewItem]:
+        return self._list_flac_items(root_id, ())
+
+    def list_library_items(self, root_id: str, *, topic: str | None = None) -> list[DriveReviewItem]:
+        """FLACs under the library root. Skips the tag-index folder. Optional topic limits to that language folder."""
+        skip = frozenset({"library"})
+        name = (topic or "").strip()
+        if name and name.casefold() != "general":
+            folder = next(
+                (
+                    child
+                    for child in self.list_children(root_id)
+                    if child.is_folder and child.name.casefold() == name.casefold()
+                ),
+                None,
+            )
+            if folder is None:
+                return []
+            return self._list_flac_items(folder.id, (folder.name,), skip_folders=skip)
+        return self._list_flac_items(root_id, (), skip_folders=skip)
 
     def create_file(
         self,

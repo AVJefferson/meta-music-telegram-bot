@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import yaml
@@ -129,6 +130,56 @@ class GenreMapper:
                 keys.add(label.casefold())
                 keys.add(display.casefold())
         return {key for key in keys if key}
+
+    def token_bucket(self, raw: str) -> str | None:
+        token = self._normalize(raw)
+        return self._bucket_for(token) if token else None
+
+    def canonical_label(self, raw: str) -> str | None:
+        token = self._normalize(raw)
+        if not token:
+            return None
+        bucket = self._bucket_for(token)
+        if not bucket:
+            return None
+        label = self._sets[bucket].get(token, token)
+        return self._display(bucket, label)
+
+    def language_from_topic(self, topic: str) -> str | None:
+        token = self._normalize(topic)
+        if not token or self._bucket_for(token) != "languages":
+            return None
+        label = self._sets["languages"].get(token, token)
+        return self._display("languages", label)
+
+    def extract_query_tokens(self, text: str) -> tuple[list[str], str]:
+        remaining = " ".join((text or "").split())
+        if not remaining:
+            return [], ""
+        labels: list[str] = list(self._alias)
+        for bucket in BUCKETS:
+            labels.extend(self._sets[bucket].values())
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for label in sorted(labels, key=lambda item: (-len(item), item.casefold())):
+            key = label.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(label)
+        matched: list[str] = []
+        matched_keys: set[str] = set()
+        for label in ordered:
+            pattern = re.compile(rf"(?<!\w){re.escape(label)}(?!\w)", re.IGNORECASE)
+            if not pattern.search(remaining):
+                continue
+            canonical = self.canonical_label(label) or label
+            key = canonical.casefold()
+            if key not in matched_keys:
+                matched.append(canonical)
+                matched_keys.add(key)
+            remaining = " ".join(pattern.sub(" ", remaining).split())
+        return matched, remaining
 
     def _normalize(self, raw: str) -> str:
         token = " ".join((raw or "").strip().casefold().split())

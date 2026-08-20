@@ -5,7 +5,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from app.models import PendingReview, TrackRecord
+from app.models import PendingReview, SuggestSession, TrackRecord
 
 
 def _utc_now() -> str:
@@ -51,6 +51,8 @@ def _row_to_track(row: sqlite3.Row) -> TrackRecord:
         drive_sidecar_id=_row_get(row, "drive_sidecar_id"),
         drive_log_id=_row_get(row, "drive_log_id"),
         thread_id=_row_get(row, "thread_id"),
+        source_chat_id=_row_get(row, "source_chat_id"),
+        source_message_id=_row_get(row, "source_message_id"),
     )
 
 
@@ -82,6 +84,20 @@ def _row_to_pending(row: sqlite3.Row) -> PendingReview:
         source_drive_file_id=row["source_drive_file_id"],
         source_drive_sidecar_id=row["source_drive_sidecar_id"],
         telegram_file_id=row["telegram_file_id"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+        source_message_id=_row_get(row, "source_message_id"),
+    )
+
+
+def _row_to_suggest(row: sqlite3.Row) -> SuggestSession:
+    return SuggestSession(
+        id=row["id"],
+        user_id=row["user_id"],
+        chat_id=row["chat_id"],
+        thread_id=row["thread_id"],
+        query=row["query"],
+        results_json=row["results_json"],
         created_at=row["created_at"],
         expires_at=row["expires_at"],
     )
@@ -167,6 +183,36 @@ class Catalog:
                   PRIMARY KEY (chat_id, message_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_track_messages_track ON track_messages(track_id);
+                CREATE TABLE IF NOT EXISTS suggest_sessions (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER NOT NULL,
+                  chat_id INTEGER NOT NULL,
+                  thread_id INTEGER,
+                  query TEXT NOT NULL DEFAULT '',
+                  results_json TEXT NOT NULL DEFAULT '[]',
+                  created_at TEXT NOT NULL,
+                  expires_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_suggest_sessions_expires ON suggest_sessions(expires_at);
+                CREATE TABLE IF NOT EXISTS suggest_shown (
+                  user_id INTEGER NOT NULL,
+                  owned_key TEXT NOT NULL,
+                  shown_at TEXT NOT NULL,
+                  PRIMARY KEY (user_id, owned_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_suggest_shown_user ON suggest_shown(user_id, shown_at);
+                CREATE TABLE IF NOT EXISTS lastfm_cache (
+                  cache_key TEXT PRIMARY KEY,
+                  payload_json TEXT NOT NULL,
+                  expires_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS library_tag_index (
+                  id INTEGER PRIMARY KEY CHECK (id = 1),
+                  payload_json TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  drive_file_id TEXT,
+                  payload_sha TEXT
+                );
                 """
             )
             pending_columns = {
@@ -194,6 +240,18 @@ class Catalog:
                     self._conn.execute(f"ALTER TABLE tracks ADD COLUMN {name} TEXT")
             if "thread_id" not in track_columns:
                 self._conn.execute("ALTER TABLE tracks ADD COLUMN thread_id INTEGER")
+            for name in ("source_chat_id", "source_message_id"):
+                if name not in track_columns:
+                    self._conn.execute(f"ALTER TABLE tracks ADD COLUMN {name} INTEGER")
+            if "source_message_id" not in pending_columns:
+                self._conn.execute("ALTER TABLE pending_reviews ADD COLUMN source_message_id INTEGER")
+            index_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(library_tag_index)").fetchall()
+            }
+            for name in ("drive_file_id", "payload_sha"):
+                if name not in index_columns:
+                    self._conn.execute(f"ALTER TABLE library_tag_index ADD COLUMN {name} TEXT")
             self._conn.commit()
 
     def upsert_topic(self, thread_id: int, name: str) -> None:
@@ -414,6 +472,7 @@ class Catalog:
         source_drive_file_id: str | None = None,
         source_drive_sidecar_id: str | None = None,
         telegram_file_id: str | None = None,
+        source_message_id: int | None = None,
         expires_at: str,
     ) -> int:
         with self._lock:
@@ -433,9 +492,10 @@ class Catalog:
                     identity_json, source_report_json, drive_conflicts_json, drive_root_id,
                     chat_id, thread_id, status_message_id, topic_name, file_name,
                     track_id, replace_id, old_drive_id, source_drive_file_id,
-                    source_drive_sidecar_id, telegram_file_id, created_at, expires_at
+                    source_drive_sidecar_id, telegram_file_id, source_message_id,
+                    created_at, expires_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -464,6 +524,7 @@ class Catalog:
                     source_drive_file_id,
                     source_drive_sidecar_id,
                     telegram_file_id,
+                    source_message_id,
                     _utc_now(),
                     expires_at,
                 ),
@@ -507,6 +568,7 @@ class Catalog:
             "source_drive_file_id",
             "source_drive_sidecar_id",
             "telegram_file_id",
+            "source_message_id",
             "topic_name",
             "thread_id",
             "file_name",
@@ -681,6 +743,8 @@ class Catalog:
             "thread_id",
             "mb_recording_id",
             "acoustid",
+            "source_chat_id",
+            "source_message_id",
         }
         cols = []
         values = []
@@ -707,6 +771,14 @@ class Catalog:
                 (chat_id, message_id, track_id),
             )
             self._conn.commit()
+
+    def list_track_messages(self, track_id: int) -> list[tuple[int, int]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT chat_id, message_id FROM track_messages WHERE track_id=? ORDER BY message_id",
+                (track_id,),
+            ).fetchall()
+        return [(int(row["chat_id"]), int(row["message_id"])) for row in rows]
 
     def get_track_by_message(self, chat_id: int, message_id: int) -> TrackRecord | None:
         with self._lock:
@@ -741,6 +813,155 @@ class Catalog:
                 (track_id,),
             ).fetchone()
         return _row_to_pending(row) if row else None
+
+    def list_library_tracks(self) -> list[TrackRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tracks WHERE kind='library' "
+                "AND status IN ('uploaded', 'pending', 'failed', 'awaiting_drive') "
+                "ORDER BY id DESC"
+            ).fetchall()
+        return [_row_to_track(row) for row in rows]
+
+    def list_owned_tracks(self) -> list[TrackRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tracks WHERE kind IN ('library', 'review') "
+                "AND status NOT IN ('deleted', 'skipped') "
+                "ORDER BY id"
+            ).fetchall()
+        return [_row_to_track(row) for row in rows]
+
+    def insert_suggest_session(
+        self,
+        *,
+        user_id: int,
+        chat_id: int,
+        thread_id: int | None,
+        query: str,
+        results_json: str,
+        expires_at: str,
+    ) -> int:
+        self.prune_suggest_state()
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO suggest_sessions (
+                    user_id, chat_id, thread_id, query, results_json, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, chat_id, thread_id, query, results_json, _utc_now(), expires_at),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def get_suggest_session(self, session_id: int) -> SuggestSession | None:
+        now = _utc_now()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM suggest_sessions WHERE id=? AND expires_at>?",
+                (session_id, now),
+            ).fetchone()
+        return _row_to_suggest(row) if row else None
+
+    def list_suggest_shown(self, user_id: int, limit: int = 50) -> set[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT owned_key FROM suggest_shown WHERE user_id=? "
+                "ORDER BY shown_at DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        return {str(row["owned_key"]) for row in rows}
+
+    def mark_suggest_shown(self, user_id: int, keys: list[str], keep: int = 50) -> None:
+        if not keys:
+            return
+        now = _utc_now()
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO suggest_shown(user_id, owned_key, shown_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id, owned_key) DO UPDATE SET shown_at=excluded.shown_at",
+                [(user_id, key, now) for key in keys if key],
+            )
+            extra = self._conn.execute(
+                "SELECT owned_key FROM suggest_shown WHERE user_id=? "
+                "ORDER BY shown_at DESC",
+                (user_id,),
+            ).fetchall()
+            overflow = [row["owned_key"] for row in extra[keep:]]
+            if overflow:
+                placeholders = ",".join("?" for _ in overflow)
+                self._conn.execute(
+                    f"DELETE FROM suggest_shown WHERE user_id=? AND owned_key IN ({placeholders})",
+                    (user_id, *overflow),
+                )
+            self._conn.commit()
+
+    def get_lastfm_cache(self, cache_key: str) -> str | None:
+        now = _utc_now()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payload_json FROM lastfm_cache WHERE cache_key=? AND expires_at>?",
+                (cache_key, now),
+            ).fetchone()
+        return str(row["payload_json"]) if row else None
+
+    def set_lastfm_cache(self, cache_key: str, payload_json: str, expires_at: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO lastfm_cache(cache_key, payload_json, expires_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(cache_key) DO UPDATE SET payload_json=excluded.payload_json, "
+                "expires_at=excluded.expires_at",
+                (cache_key, payload_json, expires_at),
+            )
+            self._conn.commit()
+
+    def prune_suggest_state(self) -> int:
+        now = _utc_now()
+        with self._lock:
+            sessions = self._conn.execute(
+                "DELETE FROM suggest_sessions WHERE expires_at<=?", (now,)
+            )
+            cache = self._conn.execute(
+                "DELETE FROM lastfm_cache WHERE expires_at<=?", (now,)
+            )
+            self._conn.commit()
+        return (sessions.rowcount or 0) + (cache.rowcount or 0)
+
+    def get_library_tag_index(self) -> str | None:
+        payload, _drive_id, _sha = self.get_library_tag_index_meta()
+        return payload
+
+    def get_library_tag_index_meta(self) -> tuple[str | None, str | None, str | None]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payload_json, drive_file_id, payload_sha FROM library_tag_index WHERE id=1"
+            ).fetchone()
+        if not row:
+            return None, None, None
+        payload = str(row["payload_json"]) if row["payload_json"] else None
+        drive_id = str(row["drive_file_id"]) if row["drive_file_id"] else None
+        sha = str(row["payload_sha"]) if row["payload_sha"] else None
+        return payload, drive_id, sha
+
+    def set_library_tag_index(
+        self,
+        payload_json: str,
+        *,
+        drive_file_id: str | None = None,
+        payload_sha: str | None = None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO library_tag_index(id, payload_json, updated_at, drive_file_id, payload_sha) "
+                "VALUES (1, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json, "
+                "updated_at=excluded.updated_at, "
+                "drive_file_id=COALESCE(excluded.drive_file_id, library_tag_index.drive_file_id), "
+                "payload_sha=COALESCE(excluded.payload_sha, library_tag_index.payload_sha)",
+                (payload_json, _utc_now(), drive_file_id, payload_sha),
+            )
+            self._conn.commit()
 
     def close(self) -> None:
         with self._lock:

@@ -32,6 +32,7 @@ from app.covers import (
 from app.enrich import enrich, lyrics_card_text
 from app.identify import identify_file, identity_from_mbid
 from app.library import library_relative, place_file, review_relative, unlink_quiet, write_sidecar
+from app.library_index import remember_library_tags
 from app.membership import is_forum_member
 from app.models import (
     Ctx,
@@ -135,6 +136,7 @@ def _job_from_pending(row: PendingReview) -> Job:
         file_name=row.file_name,
         status_message_id=row.status_message_id or 0,
         private=row.chat_id > 0,
+        source_message_id=getattr(row, "source_message_id", None) or 0,
     )
 
 
@@ -232,6 +234,7 @@ async def recover_interrupted(ctx: Ctx, jobs: asyncio.Queue[Job]) -> None:
                         local_path=row.local_path,
                         private=True,
                         source_pending_id=row.id,
+                        source_message_id=getattr(row, "source_message_id", None) or 0,
                     )
                 )
                 continue
@@ -252,6 +255,7 @@ async def recover_interrupted(ctx: Ctx, jobs: asyncio.Queue[Job]) -> None:
                         local_path=row.local_path,
                         private=row.chat_id > 0,
                         source_pending_id=row.id,
+                        source_message_id=getattr(row, "source_message_id", None) or 0,
                     )
                 )
                 log.info("re-queued interrupted group job id=%s file=%s", row.id, row.file_name)
@@ -1708,6 +1712,21 @@ async def _commit_upload(
             drive_log_id=log_id,
             thread_id=job.thread_id,
             kind=kind,
+            source_chat_id=job.chat_id,
+            source_message_id=job.source_message_id or None,
+        )
+        await asyncio.to_thread(
+            remember_library_tags,
+            ctx,
+            kind=kind,
+            relative_path=relative.as_posix(),
+            drive_file_id=file_id,
+            topic_name=job.topic_name,
+            tags=tags,
+            telegram_file_id=telegram_file_id,
+            chat_id=job.chat_id,
+            message_id=job.source_message_id or None,
+            thread_id=job.thread_id,
         )
         if old_drive_id and old_drive_id != file_id and conflict_action != "keep_both":
             await asyncio.to_thread(ctx.drive.delete_file, old_drive_id)
@@ -1754,6 +1773,8 @@ async def _commit_upload(
         f"{tag_preview(tags, _metrics_from_identity(identity, dest))}{link}\n"
         f"<code>{html_esc(relative.as_posix())}</code>",
     )
+    if job.source_message_id:
+        ctx.catalog.bind_track_message(track_id, job.chat_id, job.source_message_id)
     if job.status_message_id:
         ctx.catalog.bind_track_message(track_id, job.chat_id, job.status_message_id)
     log.info("saved %s kind=%s confidence=%s path=%s", job.file_name, dest_label, identity.confidence, relative)

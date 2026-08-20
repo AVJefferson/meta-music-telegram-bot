@@ -578,6 +578,7 @@ async def _restart_track(ctx: Ctx, row: PendingReview, track: TrackRecord) -> No
             private=row.chat_id > 0,
             source_pending_id=row.id,
             fallback_send=not reuse_card,
+            source_message_id=getattr(track, "source_message_id", None) or 0,
         )
     )
     await edit_status(ctx, job, "Restarting from the original file…", fallback_send=not reuse_card)

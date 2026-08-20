@@ -116,6 +116,48 @@ class DriveReviewTests(unittest.TestCase):
         self.assertEqual(items[0].relative_path, "2026-08-15/song.flac")
         self.assertEqual(items[0].sidecar_id, "json")
 
+    def test_library_listing_can_scope_to_language_folder(self) -> None:
+        drive = DriveClient.__new__(DriveClient)
+        folder = "application/vnd.google-apps.folder"
+        children = {
+            "root": [
+                DriveChild("en", "English", folder, None, None),
+                DriveChild("ml", "Malayalam", folder, None, None),
+            ],
+            "en": [
+                DriveChild("aa", "Radiohead", folder, None, None),
+            ],
+            "aa": [
+                DriveChild("al", "OK Computer", folder, None, None),
+            ],
+            "al": [
+                DriveChild("flac", "Radiohead - 06 - Karma Police.flac", "audio/flac", 1, None),
+                DriveChild("jpg", "cover.jpg", "image/jpeg", 1, None),
+            ],
+            "ml": [
+                DriveChild("ha", "Harisankar", folder, None, None),
+            ],
+            "ha": [
+                DriveChild("lu", "Lucifer", folder, None, None),
+            ],
+            "lu": [
+                DriveChild("mlf", "Harisankar - 01 - Payaliya.flac", "audio/flac", 1, None),
+            ],
+            "idx": [
+                DriveChild("json", "tracks.json", "application/json", 10, None),
+            ],
+        }
+        children["root"].append(DriveChild("idx", "library", folder, None, None))
+        drive.list_children = lambda folder_id: children[folder_id]  # type: ignore[method-assign]
+        mal = drive.list_library_items("root", topic="Malayalam")
+        self.assertEqual(len(mal), 1)
+        self.assertEqual(mal[0].relative_path, "Malayalam/Harisankar/Lucifer/Harisankar - 01 - Payaliya.flac")
+        all_items = drive.list_library_items("root")
+        self.assertEqual(len(all_items), 2)
+        missing = drive.list_library_items("root", topic="Tamil")
+        self.assertEqual(missing, [])
+        self.assertTrue(all("library" not in item.relative_path.casefold() for item in all_items))
+
 
 class PromotionCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def test_promoted_review_deletes_flac_then_sidecar(self) -> None:

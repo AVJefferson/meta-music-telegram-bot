@@ -95,6 +95,7 @@ class Job:
     private: bool = False
     source_pending_id: int | None = None
     fallback_send: bool = True
+    source_message_id: int = 0
 
 
 @dataclass
@@ -138,6 +139,8 @@ class TrackRecord:
     drive_sidecar_id: str | None = None
     drive_log_id: str | None = None
     thread_id: int | None = None
+    source_chat_id: int | None = None
+    source_message_id: int | None = None
 
     @property
     def local(self) -> Path | None:
@@ -172,6 +175,19 @@ class PendingReview:
     source_drive_file_id: str | None
     source_drive_sidecar_id: str | None
     telegram_file_id: str | None
+    created_at: str
+    expires_at: str
+    source_message_id: int | None = None
+
+
+@dataclass
+class SuggestSession:
+    id: int
+    user_id: int
+    chat_id: int
+    thread_id: int | None
+    query: str
+    results_json: str
     created_at: str
     expires_at: str
 
