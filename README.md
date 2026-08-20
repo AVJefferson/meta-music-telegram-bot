@@ -144,6 +144,8 @@ After a track is saved, react on the bot's info card (forum Saved message, or a 
 - ✍️ — start the button editor. Removing ✍️ does **not** write Drive; it asks Cancel / Save draft / Commit to library. Cancel discards the session. Save draft writes Drive review. Commit to library writes Drive library.
 - Removing 👍 👎 💩 🙉 🙏 does nothing.
 
+After `docker compose down -v`, sqlite is empty. Reacting on an old Saved card still works: the bot reads the card (Drive link, `<code>` path, or reply-to FLAC), rebuilds the catalog row from `tracks.json` / local files / Drive, then runs the usual confirm. First reaction on a forgotten card may briefly post and delete a reply. New library saves store `card_message_id` in `tracks.json` so the next wipe can skip that probe.
+
 ## Private chat and Drive review
 
 Current forum members can chat directly with the bot:

@@ -699,10 +699,22 @@ class Catalog:
         return _row_to_track(row) if row else None
 
     def find_by_drive_file_id(self, drive_file_id: str) -> TrackRecord | None:
+        if not drive_file_id:
+            return None
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM tracks WHERE drive_file_id=? ORDER BY id DESC LIMIT 1",
                 (drive_file_id,),
+            ).fetchone()
+        return _row_to_track(row) if row else None
+
+    def find_by_telegram_file_id(self, telegram_file_id: str) -> TrackRecord | None:
+        if not telegram_file_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM tracks WHERE telegram_file_id=? ORDER BY id DESC LIMIT 1",
+                (telegram_file_id,),
             ).fetchone()
         return _row_to_track(row) if row else None
 

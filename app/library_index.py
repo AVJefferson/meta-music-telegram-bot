@@ -32,6 +32,7 @@ def index_entry(
     telegram_file_id: str | None = None,
     chat_id: int | None = None,
     message_id: int | None = None,
+    card_message_id: int | None = None,
     thread_id: int | None = None,
 ) -> dict[str, str]:
     return {
@@ -46,6 +47,7 @@ def index_entry(
         "telegram_file_id": telegram_file_id or "",
         "chat_id": str(chat_id or "") if chat_id else "",
         "message_id": str(message_id or "") if message_id else "",
+        "card_message_id": str(card_message_id or "") if card_message_id else "",
         "thread_id": str(thread_id) if thread_id is not None else "",
     }
 
@@ -144,7 +146,14 @@ def upsert_entries(entries: list[dict[str, str]], entry: dict[str, str]) -> list
             continue
         merged = dict(item)
         merged.update(entry)
-        for field in ("telegram_file_id", "chat_id", "message_id", "thread_id", "drive_file_id"):
+        for field in (
+            "telegram_file_id",
+            "chat_id",
+            "message_id",
+            "card_message_id",
+            "thread_id",
+            "drive_file_id",
+        ):
             merged[field] = _keep_meta(item, entry, field)
         out.append(merged)
         replaced = True
@@ -305,6 +314,7 @@ def upsert_library_index(
     telegram_file_id: str | None = None,
     chat_id: int | None = None,
     message_id: int | None = None,
+    card_message_id: int | None = None,
     thread_id: int | None = None,
 ) -> None:
     with _INDEX_LOCK:
@@ -325,6 +335,7 @@ def upsert_library_index(
                 telegram_file_id=telegram_file_id,
                 chat_id=chat_id,
                 message_id=message_id,
+                card_message_id=card_message_id,
                 thread_id=thread_id,
             ),
         )
@@ -339,6 +350,23 @@ def remove_library_index(ctx: Ctx, relative_path: str | None) -> None:
         if entries is None:
             return
         persist_index(ctx, remove_entry(entries, relative_path))
+
+
+def find_entry_for_message(
+    entries: list[dict[str, str]], chat_id: int, message_id: int
+) -> dict[str, str] | None:
+    want_chat = str(chat_id)
+    want_msg = str(message_id)
+    found_source = None
+    for item in entries:
+        item_chat = str(item.get("chat_id") or "")
+        if item_chat and item_chat != want_chat:
+            continue
+        if str(item.get("card_message_id") or "") == want_msg:
+            return item
+        if str(item.get("message_id") or "") == want_msg:
+            found_source = item
+    return found_source
 
 
 def extract_item_tags(ctx: Ctx, item: DriveReviewItem, tmp_root: Path) -> TagSet:
@@ -398,6 +426,9 @@ def rebuild_index(ctx: Ctx, *, on_progress: Callable[[int, int], None] | None = 
                 telegram_file_id=str(old.get("telegram_file_id") or "") or None,
                 chat_id=int(old["chat_id"]) if str(old.get("chat_id") or "").lstrip("-").isdigit() else None,
                 message_id=int(old["message_id"]) if str(old.get("message_id") or "").isdigit() else None,
+                card_message_id=int(old["card_message_id"])
+                if str(old.get("card_message_id") or "").isdigit()
+                else None,
                 thread_id=int(old["thread_id"]) if str(old.get("thread_id") or "").lstrip("-").isdigit() else None,
             )
         )
@@ -442,6 +473,7 @@ def remember_library_tags(
     telegram_file_id: str | None = None,
     chat_id: int | None = None,
     message_id: int | None = None,
+    card_message_id: int | None = None,
     thread_id: int | None = None,
 ) -> None:
     if kind != "library" or not relative_path:
@@ -456,6 +488,7 @@ def remember_library_tags(
             telegram_file_id=telegram_file_id,
             chat_id=chat_id,
             message_id=message_id,
+            card_message_id=card_message_id,
             thread_id=thread_id,
         )
     except Exception:

@@ -12,6 +12,7 @@ from pathlib import Path
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, FSInputFile, MessageReactionUpdated
 
+from app.card_resolve import resolve_track_for_reaction
 from app.edit_ui import (
     drive_confirm_keyboard,
     exit_edit_keyboard,
@@ -115,16 +116,20 @@ def build_reactions_router() -> Router:
         removed = removed_emojis(event.old_reaction, event.new_reaction)
         if not added and not removed:
             return
+        want = bool(added & (ADD_ONLY | {WRITING})) or WRITING in removed
         track = ctx.catalog.get_track_by_message(event.chat.id, event.message_id)
         if track is None or track.status == "deleted":
-            log.debug(
-                "reaction ignored chat=%s message=%s added=%s removed=%s",
-                event.chat.id,
-                event.message_id,
-                added,
-                removed,
-            )
-            return
+            if want:
+                track = await resolve_track_for_reaction(ctx, event)
+            if track is None or track.status == "deleted":
+                log.debug(
+                    "reaction ignored chat=%s message=%s added=%s removed=%s",
+                    event.chat.id,
+                    event.message_id,
+                    added,
+                    removed,
+                )
+                return
         try:
             if WRITING in added:
                 await _enter_edit(ctx, event, track)

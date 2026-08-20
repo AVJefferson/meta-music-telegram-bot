@@ -11,7 +11,15 @@ from aiogram import Dispatcher, Router
 from aiogram.types import Message
 
 from app.bot import polling_allowed_updates
+from app.card_resolve import (
+    looks_like_music_card,
+    parse_card_message,
+    parse_drive_file_id,
+    probe_card_message,
+    resolve_track_for_reaction,
+)
 from app.catalog import Catalog
+from app.library_index import dump_index_payload, find_entry_for_message, index_entry, upsert_entries
 from app.edit_ui import (
     apply_suggestion,
     exit_edit_keyboard,
@@ -297,6 +305,11 @@ class CatalogMessageBindTests(unittest.TestCase):
             self.assertEqual(found.id, track_id)
             self.assertEqual(again.id, track_id)
             self.assertEqual(found.telegram_file_id, "tg-1")
+            by_tg = catalog.find_by_telegram_file_id("tg-1")
+            self.assertIsNotNone(by_tg)
+            assert by_tg is not None
+            self.assertEqual(by_tg.id, track_id)
+            self.assertIsNone(catalog.find_by_telegram_file_id(""))
             pending_id = catalog.insert_pending_review(
                 phase="react_edit",
                 local_path="/tmp/stage.flac",
@@ -862,3 +875,325 @@ class RestartTrackListenTests(unittest.IsolatedAsyncioTestCase):
     async def test_group_does_not_send_flac(self) -> None:
         sent = await self._run(chat_id=-100)
         self.assertEqual(sent, [])
+
+
+DRIVE_FILE_ID = "1AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+CARD_PATH = "English/Radiohead/OK Computer/Radiohead - 06 - Karma Police.flac"
+
+
+def _card_message(**kwargs):
+    text = (
+        "Saved (library, high confidence).\n\n"
+        "<b>Karma Police</b>\n"
+        "Artist: Radiohead\n"
+        "Album: OK Computer\n"
+        f'Drive: <a href="https://drive.google.com/file/d/{DRIVE_FILE_ID}/view">open</a>\n'
+        f"<code>{CARD_PATH}</code>"
+    )
+    base = dict(
+        text=text,
+        entities=None,
+        caption=None,
+        caption_entities=None,
+        document=None,
+        audio=None,
+        reply_to_message=None,
+        message_id=88,
+        message_thread_id=12,
+    )
+    base.update(kwargs)
+    return SimpleNamespace(**base)
+
+
+class _ProbeBot:
+    def __init__(self, card):
+        self.card = card
+        self.sent = []
+        self.deleted = []
+
+    async def send_message(self, **kwargs):
+        self.sent.append(kwargs)
+        return SimpleNamespace(message_id=9001, reply_to_message=self.card)
+
+    async def delete_message(self, **kwargs):
+        self.deleted.append(kwargs)
+
+
+class CardParseTests(unittest.TestCase):
+    def test_parse_drive_file_id(self) -> None:
+        self.assertEqual(
+            parse_drive_file_id(f"https://drive.google.com/file/d/{DRIVE_FILE_ID}/view"),
+            DRIVE_FILE_ID,
+        )
+        self.assertEqual(
+            parse_drive_file_id(f"https://drive.google.com/open?id={DRIVE_FILE_ID}"),
+            DRIVE_FILE_ID,
+        )
+        self.assertIsNone(parse_drive_file_id("https://example.com/x"))
+
+    def test_parse_saved_card_html(self) -> None:
+        hint = parse_card_message(_card_message())
+        self.assertTrue(looks_like_music_card(hint))
+        self.assertEqual(hint.kind, "library")
+        self.assertEqual(hint.drive_file_id, DRIVE_FILE_ID)
+        self.assertEqual(hint.relative_path, CARD_PATH)
+        self.assertEqual(hint.title, "Karma Police")
+        self.assertEqual(hint.artist, "Radiohead")
+        self.assertEqual(hint.album, "OK Computer")
+        self.assertEqual(hint.topic_name, "English")
+
+    def test_parse_entities_and_reply_to_flac(self) -> None:
+        url = f"https://drive.google.com/file/d/{DRIVE_FILE_ID}/view"
+        text = (
+            "Karma Police\n"
+            "Artist: Radiohead\n"
+            "Drive: open\n"
+            f"{CARD_PATH}"
+        )
+        entities = [
+            SimpleNamespace(type="bold", offset=0, length=len("Karma Police")),
+            SimpleNamespace(type="text_link", offset=text.index("open"), length=4, url=url),
+            SimpleNamespace(type="code", offset=text.index(CARD_PATH), length=len(CARD_PATH)),
+        ]
+        reply = SimpleNamespace(
+            message_id=55,
+            document=SimpleNamespace(file_id="tg-flac", file_name="song.flac", mime_type="audio/flac"),
+            audio=None,
+            text=None,
+            caption=None,
+            entities=None,
+        )
+        hint = parse_card_message(
+            SimpleNamespace(
+                text=text,
+                entities=entities,
+                caption=None,
+                document=None,
+                audio=None,
+                reply_to_message=reply,
+                message_id=88,
+                message_thread_id=3,
+            )
+        )
+        self.assertEqual(hint.drive_file_id, DRIVE_FILE_ID)
+        self.assertEqual(hint.relative_path, CARD_PATH)
+        self.assertEqual(hint.telegram_file_id, "tg-flac")
+        self.assertEqual(hint.source_message_id, 55)
+        self.assertFalse(hint.is_source_audio)
+        self.assertEqual(hint.thread_id, 3)
+
+    def test_ignore_non_card(self) -> None:
+        hint = parse_card_message(
+            SimpleNamespace(
+                text="nice meme",
+                entities=None,
+                caption=None,
+                document=None,
+                audio=None,
+                reply_to_message=None,
+                message_id=1,
+                message_thread_id=None,
+            )
+        )
+        self.assertFalse(looks_like_music_card(hint))
+
+    def test_upsert_keeps_card_message_id(self) -> None:
+        first = index_entry(
+            relative_path=CARD_PATH,
+            drive_file_id=DRIVE_FILE_ID,
+            topic_name="English",
+            tags=TagSet(title="Karma Police", artist="Radiohead", album="OK Computer"),
+            chat_id=-100,
+            message_id=55,
+            card_message_id=88,
+        )
+        updated = upsert_entries(upsert_entries([], first), {**first, "card_message_id": "", "title": "KP"})
+        self.assertEqual(updated[0]["card_message_id"], "88")
+        self.assertEqual(updated[0]["title"], "KP")
+        found = find_entry_for_message(updated, -100, 88)
+        assert found is not None
+        self.assertEqual(found["drive_file_id"], DRIVE_FILE_ID)
+        source = find_entry_for_message(updated, -100, 55)
+        assert source is not None
+        self.assertEqual(source["message_id"], "55")
+
+
+class CardResolveTests(unittest.IsolatedAsyncioTestCase):
+    def _ctx(self, directory: str, *, bot=None, drive=None):
+        catalog = Catalog(Path(directory) / "state.sqlite")
+        catalog.set_library_tag_index(dump_index_payload([]))
+        drive = drive or SimpleNamespace(
+            find_path=lambda *_a, **_k: None,
+            find_by_name=lambda *_a, **_k: [],
+            find_name_conflicts=lambda *_a, **_k: [],
+            get_child_meta=lambda *_a, **_k: None,
+            ensure_parent=lambda *_a, **_k: "parent",
+            upload_bytes=lambda *_a, **_k: ("jsonid", None),
+            list_library_items=lambda *_a, **_k: (_ for _ in ()).throw(
+                AssertionError("must not walk Drive")
+            ),
+        )
+        return SimpleNamespace(
+            catalog=catalog,
+            bot=bot,
+            drive=drive,
+            settings=SimpleNamespace(
+                library_root=Path(directory) / "library",
+                review_root=Path(directory) / "review",
+                gdrive_folder_id="lib",
+                gdrive_review_folder_id="rev",
+            ),
+        )
+
+    def _event(self, message_id: int = 88, chat_id: int = -100):
+        return SimpleNamespace(chat=SimpleNamespace(id=chat_id), message_id=message_id)
+
+    async def test_index_hit_skips_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ctx = self._ctx(directory, bot=_ProbeBot(_card_message()))
+
+            def boom(*_a, **_k):
+                raise AssertionError("must not probe")
+
+            ctx.bot.send_message = boom
+            ctx.catalog.set_library_tag_index(
+                dump_index_payload(
+                    [
+                        index_entry(
+                            relative_path=CARD_PATH,
+                            drive_file_id=DRIVE_FILE_ID,
+                            topic_name="English",
+                            tags=TagSet(title="Karma Police", artist="Radiohead", album="OK Computer"),
+                            telegram_file_id="tg-flac",
+                            chat_id=-100,
+                            message_id=55,
+                            card_message_id=88,
+                            thread_id=12,
+                        )
+                    ]
+                )
+            )
+            track = await resolve_track_for_reaction(ctx, self._event(88))
+            self.assertIsNotNone(track)
+            assert track is not None
+            self.assertEqual(track.drive_file_id, DRIVE_FILE_ID)
+            self.assertEqual(track.relative_path, CARD_PATH)
+            self.assertEqual(ctx.catalog.get_track_by_message(-100, 88).id, track.id)
+            self.assertEqual(ctx.catalog.get_track_by_message(-100, 55).id, track.id)
+
+    async def test_index_hit_on_source_flac_skips_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ctx = self._ctx(directory, bot=_ProbeBot(_card_message()))
+
+            def boom(*_a, **_k):
+                raise AssertionError("must not probe")
+
+            ctx.bot.send_message = boom
+            ctx.catalog.set_library_tag_index(
+                dump_index_payload(
+                    [
+                        index_entry(
+                            relative_path=CARD_PATH,
+                            drive_file_id=DRIVE_FILE_ID,
+                            topic_name="English",
+                            tags=TagSet(title="Karma Police", artist="Radiohead", album="OK Computer"),
+                            chat_id=-100,
+                            message_id=55,
+                            card_message_id=88,
+                        )
+                    ]
+                )
+            )
+            track = await resolve_track_for_reaction(ctx, self._event(55))
+            self.assertIsNotNone(track)
+            assert track is not None
+            self.assertEqual(ctx.catalog.get_track_by_message(-100, 55).id, track.id)
+            self.assertEqual(ctx.catalog.get_track_by_message(-100, 88).id, track.id)
+
+    async def test_probe_drive_id_materializes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot = _ProbeBot(
+                SimpleNamespace(
+                    text=(
+                        "Saved (library, high confidence).\n\n"
+                        "Karma Police\n"
+                        "Artist: Radiohead\n"
+                        f'Drive: <a href="https://drive.google.com/file/d/{DRIVE_FILE_ID}/view">open</a>'
+                    ),
+                    entities=None,
+                    caption=None,
+                    document=None,
+                    audio=None,
+                    reply_to_message=None,
+                    message_id=88,
+                    message_thread_id=12,
+                )
+            )
+            drive = SimpleNamespace(
+                find_path=lambda *_a, **_k: None,
+                find_by_name=lambda *_a, **_k: [],
+                find_name_conflicts=lambda *_a, **_k: [],
+                get_child_meta=lambda file_id: SimpleNamespace(id=file_id, name="song.flac")
+                if file_id == DRIVE_FILE_ID
+                else None,
+                ensure_parent=lambda *_a, **_k: "parent",
+                upload_bytes=lambda *_a, **_k: ("jsonid", None),
+                list_library_items=lambda *_a, **_k: (_ for _ in ()).throw(
+                    AssertionError("must not walk Drive")
+                ),
+            )
+            ctx = self._ctx(directory, bot=bot, drive=drive)
+            track = await resolve_track_for_reaction(ctx, self._event(88))
+            self.assertIsNotNone(track)
+            assert track is not None
+            self.assertEqual(track.drive_file_id, DRIVE_FILE_ID)
+            self.assertEqual(track.kind, "library")
+            self.assertEqual(len(bot.sent), 1)
+            self.assertEqual(bot.sent[0]["reply_to_message_id"], 88)
+            self.assertTrue(bot.sent[0]["disable_notification"])
+            self.assertEqual(bot.deleted[0]["message_id"], 9001)
+            found = ctx.catalog.get_track_by_message(-100, 88)
+            self.assertIsNotNone(found)
+            assert found is not None
+            self.assertEqual(found.id, track.id)
+
+    async def test_probe_ignores_non_card(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot = _ProbeBot(
+                SimpleNamespace(
+                    text="hello",
+                    entities=None,
+                    caption=None,
+                    document=None,
+                    audio=None,
+                    reply_to_message=None,
+                    message_id=7,
+                    message_thread_id=None,
+                )
+            )
+            ctx = self._ctx(directory, bot=bot)
+            track = await resolve_track_for_reaction(ctx, self._event(7))
+            self.assertIsNone(track)
+            self.assertIsNone(ctx.catalog.get_track_by_message(-100, 7))
+            self.assertEqual(len(bot.sent), 1)
+            self.assertEqual(len(bot.deleted), 1)
+
+    async def test_probe_uses_local_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ctx = self._ctx(directory, bot=_ProbeBot(_card_message()))
+            local = Path(directory) / "library" / CARD_PATH
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_bytes(b"flac")
+            track = await resolve_track_for_reaction(ctx, self._event(88))
+            self.assertIsNotNone(track)
+            assert track is not None
+            self.assertEqual(track.relative_path, CARD_PATH)
+            self.assertEqual(track.local_path, str(local))
+            self.assertEqual(ctx.catalog.get_track_by_message(-100, 88).id, track.id)
+
+    async def test_probe_card_message_deletes_dummy(self) -> None:
+        bot = _ProbeBot(_card_message())
+        card = await probe_card_message(bot, -100, 88)
+        self.assertIs(card, bot.card)
+        self.assertEqual(bot.sent[0]["text"], "\u2060")
+        self.assertEqual(bot.deleted[0]["message_id"], 9001)

@@ -1773,19 +1773,6 @@ async def _commit_upload(
             source_chat_id=job.chat_id,
             source_message_id=job.source_message_id or None,
         )
-        await asyncio.to_thread(
-            remember_library_tags,
-            ctx,
-            kind=kind,
-            relative_path=relative.as_posix(),
-            drive_file_id=file_id,
-            topic_name=job.topic_name,
-            tags=tags,
-            telegram_file_id=telegram_file_id,
-            chat_id=job.chat_id,
-            message_id=job.source_message_id or None,
-            thread_id=job.thread_id,
-        )
         if old_drive_id and old_drive_id != file_id and conflict_action != "keep_both":
             await asyncio.to_thread(ctx.drive.delete_file, old_drive_id)
         if pending_id is not None:
@@ -1830,6 +1817,20 @@ async def _commit_upload(
         f"Saved ({dest_label}, {identity.confidence} confidence).{extra}\n\n"
         f"{_preview(tags, identity, dest, source_report)}{link}\n"
         f"<code>{html_esc(relative.as_posix())}</code>",
+    )
+    await asyncio.to_thread(
+        remember_library_tags,
+        ctx,
+        kind=kind,
+        relative_path=relative.as_posix(),
+        drive_file_id=file_id,
+        topic_name=job.topic_name,
+        tags=tags,
+        telegram_file_id=telegram_file_id,
+        chat_id=job.chat_id,
+        message_id=job.source_message_id or None,
+        card_message_id=job.status_message_id or None,
+        thread_id=job.thread_id,
     )
     if job.source_message_id:
         ctx.catalog.bind_track_message(track_id, job.chat_id, job.source_message_id)
