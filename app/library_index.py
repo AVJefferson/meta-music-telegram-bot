@@ -228,15 +228,21 @@ def _write_cached(
 
 
 def load_index_from_drive(ctx: Ctx) -> tuple[list[dict[str, str]], str] | None:
+    log.info("library tag index: probing Drive %s/%s", INDEX_FOLDER, INDEX_FILE)
     root = ctx.settings.gdrive_folder_id
     parent = ctx.drive.find_path(root, [INDEX_FOLDER])
     if not parent:
+        log.info("library tag index: Drive folder %s missing", INDEX_FOLDER)
         return None
     hits = ctx.drive.find_by_name(parent, INDEX_FILE)
     if not hits:
+        log.info("library tag index: %s missing", INDEX_FILE)
         return None
+    log.info("library tag index: downloading %s id=%s", INDEX_FILE, hits[0].id)
     raw = ctx.drive.download_bytes(hits[0].id).decode("utf-8")
-    return parse_index_payload(raw), hits[0].id
+    entries = parse_index_payload(raw)
+    log.info("library tag index: Drive rows=%s", len(entries))
+    return entries, hits[0].id
 
 
 def save_index_to_drive(ctx: Ctx, payload: bytes, *, replace_id: str | None) -> str | None:
@@ -365,12 +371,20 @@ def extract_item_tags(ctx: Ctx, item: DriveReviewItem, tmp_root: Path) -> TagSet
 
 
 def rebuild_index(ctx: Ctx, *, on_progress: Callable[[int, int], None] | None = None) -> list[dict[str, str]]:
+    log.info("library tag index: walking Drive FLACs (once)")
     items = ctx.drive.list_library_items(ctx.settings.gdrive_folder_id)
     previous = load_index_entries(ctx) or []
     by_path = {(item.get("relative_path") or "").casefold(): item for item in previous}
     entries: list[dict[str, str]] = []
     total = len(items)
+    log.info("library tag index: walk found %s FLACs", total)
     tmp_root = ctx.settings.tmp_root
+
+    def _progress(done: int, all_count: int) -> None:
+        log.info("library tag index: tagged %s/%s", done, all_count)
+        if on_progress:
+            on_progress(done, all_count)
+
     for index, item in enumerate(items, start=1):
         tags = extract_item_tags(ctx, item, tmp_root)
         topic = Path(item.relative_path).parts[0] if item.relative_path else ""
@@ -387,8 +401,8 @@ def rebuild_index(ctx: Ctx, *, on_progress: Callable[[int, int], None] | None = 
                 thread_id=int(old["thread_id"]) if str(old.get("thread_id") or "").lstrip("-").isdigit() else None,
             )
         )
-        if on_progress and (index == 1 or index == total or index % 25 == 0):
-            on_progress(index, total)
+        if index == 1 or index == total or index % 25 == 0:
+            _progress(index, total)
     persist_index(ctx, entries)
     log.info("library tag index rebuilt tracks=%s", len(entries))
     return entries

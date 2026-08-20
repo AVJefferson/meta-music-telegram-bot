@@ -231,6 +231,17 @@ async def wait_for_telegram(bot: Bot) -> None:
     raise RuntimeError(f"telegram-bot-api not ready: {last}")
 
 
+async def _warm_library_index(ctx: Ctx) -> None:
+    log.info("library tag index: starting in background")
+    try:
+        source = await asyncio.to_thread(ensure_library_index, ctx)
+        log.info("library tag index ready source=%s", source)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.warning("library tag index startup failed", exc_info=True)
+
+
 async def main() -> None:
     settings = Settings()
     setup_logging(settings.log_level)
@@ -291,18 +302,19 @@ async def main() -> None:
     scheduler.start()
 
     worker_task = asyncio.create_task(worker("main", jobs, ctx), name="tagger-worker")
+    index_task: asyncio.Task | None = None
     try:
         await wait_for_telegram(bot)
         await recover_interrupted(ctx, jobs)
-        try:
-            source = await asyncio.to_thread(ensure_library_index, ctx)
-            log.info("library tag index ready source=%s", source)
-        except Exception:
-            log.warning("library tag index startup failed", exc_info=True)
         allowed = polling_allowed_updates(dp)
         log.info("polling allowed_updates=%s allowed_chat_id=%s", allowed, settings.allowed_chat_id)
+        index_task = asyncio.create_task(_warm_library_index(ctx), name="library-index")
         await dp.start_polling(bot, allowed_updates=allowed)
     finally:
+        if index_task:
+            index_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await index_task
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task

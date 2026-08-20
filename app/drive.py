@@ -367,11 +367,18 @@ class DriveClient:
         parts: tuple[str, ...],
         *,
         skip_folders: frozenset[str] | None = None,
+        log_progress: bool = False,
     ) -> list[DriveReviewItem]:
         items: list[DriveReviewItem] = []
         skip = {name.casefold() for name in (skip_folders or ())}
+        folders = 0
 
         def walk(current_id: str, current_parts: tuple[str, ...]) -> None:
+            nonlocal folders
+            folders += 1
+            if log_progress and (folders == 1 or folders % 25 == 0):
+                here = "/".join(current_parts) or "/"
+                log.info("drive flac walk folders=%s files=%s at=%s", folders, len(items), here)
             children = self.list_children(current_id)
             files = {child.name: child for child in children if not child.is_folder}
             for child in children:
@@ -408,6 +415,7 @@ class DriveClient:
         """FLACs under the library root. Skips the tag-index folder. Optional topic limits to that language folder."""
         skip = frozenset({"library"})
         name = (topic or "").strip()
+        log.info("listing library FLACs topic=%s", name or "*")
         if name and name.casefold() != "general":
             folder = next(
                 (
@@ -418,9 +426,13 @@ class DriveClient:
                 None,
             )
             if folder is None:
+                log.info("listed library FLACs count=0 missing topic=%s", name)
                 return []
-            return self._list_flac_items(folder.id, (folder.name,), skip_folders=skip)
-        return self._list_flac_items(root_id, (), skip_folders=skip)
+            items = self._list_flac_items(folder.id, (folder.name,), skip_folders=skip, log_progress=True)
+        else:
+            items = self._list_flac_items(root_id, (), skip_folders=skip, log_progress=True)
+        log.info("listed library FLACs count=%s topic=%s", len(items), name or "*")
+        return items
 
     def create_file(
         self,

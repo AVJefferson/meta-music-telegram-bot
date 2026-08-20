@@ -10,7 +10,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, InputMediaPhoto
 
@@ -201,6 +201,12 @@ async def worker(name: str, queue: asyncio.Queue[Job], ctx: Ctx) -> None:
                     unlink_quiet(source)
                     with contextlib.suppress(OSError):
                         source.parent.rmdir()
+        except asyncio.CancelledError:
+            _park_interrupted_job(ctx, job)
+            raise
+        except TelegramNetworkError:
+            log.warning("telegram dropped during job file=%s; queued for retry", job.file_name)
+            _park_interrupted_job(ctx, job)
         except Exception:
             log.exception("job failed for %s", job.file_name)
             if job.source_pending_id:
@@ -211,10 +217,20 @@ async def worker(name: str, queue: asyncio.Queue[Job], ctx: Ctx) -> None:
             queue.task_done()
 
 
+def _park_interrupted_job(ctx: Ctx, job: Job) -> None:
+    if not job.source_pending_id:
+        return
+    row = ctx.catalog.get_pending_review(job.source_pending_id)
+    if row is None or row.status not in {"processing", "queued"}:
+        return
+    ctx.catalog.update_pending_review(job.source_pending_id, status="queued")
+
+
 async def recover_interrupted(ctx: Ctx, jobs: asyncio.Queue[Job]) -> None:
     rows = ctx.catalog.list_pending_by_status(
         "queued", "processing", "uploading", "expiring", "cleanup_pending"
     )
+    log.info("recovering interrupted jobs count=%s", len(rows))
     for row in rows:
         try:
             if row.status == "cleanup_pending":
@@ -272,14 +288,14 @@ async def recover_interrupted(ctx: Ctx, jobs: asyncio.Queue[Job]) -> None:
             ctx.catalog.update_pending_review(row.id, status="waiting")
         except Exception:
             log.exception("pending recovery failed id=%s status=%s", row.id, row.status)
-    # Waiting cover rows keep their buttons, but a crash after posting photos
-    # can leave a gallery with no recorded ids. Drop what we know about and
-    # fall back to preview links so a restart does not post another 10 photos.
-    for row in ctx.catalog.list_waiting_by_phase("cover"):
+    waiting_covers = ctx.catalog.list_waiting_by_phase("cover")
+    log.info("restoring cover prompts count=%s", len(waiting_covers))
+    for row in waiting_covers:
         try:
             await _restore_cover_prompt(ctx, row)
         except Exception:
             log.exception("cover prompt restore failed id=%s", row.id)
+    log.info("recovery done")
 
 
 def _build_report(hints: TagHints, identity: Identity, enrichment, tags: TagSet) -> dict:
