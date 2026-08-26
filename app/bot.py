@@ -15,7 +15,7 @@ from aiogram.types import Message, TelegramObject
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from app.catalog import Catalog
+from app.catalog import Catalog, is_general_topic
 from app.cleanup import run_cleanup, run_expire_pending
 from app.config import Settings
 from app.drive import DriveClient
@@ -171,6 +171,9 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
             return
         file_id, file_name = file_info(message)
         thread_id, topic_name = resolve_topic(message, ctx)
+        if is_general_topic(thread_id, topic_name, is_topic_message=message.is_topic_message):
+            log.info("ignored FLAC in General topic thread_id=%s file=%s", thread_id, file_name)
+            return
         status_id = 0
         try:
             status = await message.reply(f"Queued <code>{html_esc(file_name)}</code>…", parse_mode="HTML")

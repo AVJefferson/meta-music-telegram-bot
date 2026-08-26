@@ -7,6 +7,23 @@ from pathlib import Path
 
 from app.models import PendingReview, SuggestSession, TrackRecord
 
+GENERAL_TOPIC_THREAD_ID = 1
+GENERAL_TOPIC_NAME = "General"
+
+
+def is_general_topic(
+    thread_id: int | None = None,
+    topic_name: str | None = None,
+    *,
+    is_topic_message: bool | None = None,
+) -> bool:
+    """True for Telegram forum General (thread 1, non-topic messages, or that name)."""
+    if is_topic_message is False:
+        return True
+    if thread_id == GENERAL_TOPIC_THREAD_ID:
+        return True
+    return (topic_name or "").strip().casefold() == GENERAL_TOPIC_NAME.casefold()
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -276,9 +293,16 @@ class Catalog:
                 "SELECT thread_id, name FROM topics ORDER BY name COLLATE NOCASE"
             ).fetchall()
         topics = [(int(row["thread_id"]), str(row["name"])) for row in rows]
-        if not any(thread_id == 1 for thread_id, _name in topics):
-            topics.insert(0, (1, "General"))
+        if not any(thread_id == GENERAL_TOPIC_THREAD_ID for thread_id, _name in topics):
+            topics.insert(0, (GENERAL_TOPIC_THREAD_ID, GENERAL_TOPIC_NAME))
         return topics
+
+    def list_library_topics(self) -> list[tuple[int, str]]:
+        return [
+            (thread_id, name)
+            for thread_id, name in self.list_topics()
+            if not is_general_topic(thread_id, name)
+        ]
 
     def find_library_by_mbid(self, mb_recording_id: str) -> TrackRecord | None:
         with self._lock:

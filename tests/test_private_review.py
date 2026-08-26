@@ -10,7 +10,8 @@ from types import SimpleNamespace
 from aiogram.enums import ChatMemberStatus
 from PIL import Image
 
-from app.catalog import Catalog
+from app.bot import resolve_topic
+from app.catalog import Catalog, is_general_topic
 from app.drive import DriveChild, DriveClient
 from app.membership import member_status
 from app.private_ui import (
@@ -32,6 +33,7 @@ class CatalogSessionTests(unittest.TestCase):
             catalog = Catalog(Path(directory) / "state.sqlite")
             catalog.upsert_topic(9, "Malayalam")
             self.assertEqual(catalog.list_topics(), [(1, "General"), (9, "Malayalam")])
+            self.assertEqual(catalog.list_library_topics(), [(9, "Malayalam")])
             pending_id = catalog.insert_pending_review(
                 phase="edit:0",
                 local_path="/tmp/source.flac",
@@ -331,6 +333,43 @@ class UiTests(unittest.TestCase):
     def test_membership_enum_normalizes_to_api_value(self) -> None:
         member = SimpleNamespace(status=ChatMemberStatus.MEMBER)
         self.assertEqual(member_status(member), "member")
+
+
+class GeneralTopicTests(unittest.TestCase):
+    def test_is_general_topic(self) -> None:
+        self.assertTrue(is_general_topic(1, "English"))
+        self.assertTrue(is_general_topic(9, "General"))
+        self.assertTrue(is_general_topic(9, "general"))
+        self.assertTrue(is_general_topic(12, "Malayalam", is_topic_message=False))
+        self.assertFalse(is_general_topic(9, "Malayalam"))
+        self.assertFalse(is_general_topic(9, "Malayalam", is_topic_message=True))
+        self.assertFalse(is_general_topic(None, "", is_topic_message=True))
+
+    def test_forum_general_message_is_ignored(self) -> None:
+        ctx = SimpleNamespace(
+            catalog=SimpleNamespace(get_topic=lambda _tid: None, upsert_topic=lambda *_a: None)
+        )
+        general = SimpleNamespace(message_thread_id=1, is_topic_message=False, reply_to_message=None)
+        thread_id, name = resolve_topic(general, ctx)
+        self.assertTrue(is_general_topic(thread_id, name, is_topic_message=general.is_topic_message))
+        ctx = SimpleNamespace(
+            catalog=SimpleNamespace(
+                get_topic=lambda tid: "Malayalam" if tid == 9 else None,
+                upsert_topic=lambda *_a: None,
+            )
+        )
+        language = SimpleNamespace(message_thread_id=9, is_topic_message=True, reply_to_message=None)
+        thread_id, name = resolve_topic(language, ctx)
+        self.assertEqual(name, "Malayalam")
+        self.assertFalse(is_general_topic(thread_id, name, is_topic_message=language.is_topic_message))
+
+    def test_library_topics_drop_general_even_if_stored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = Catalog(Path(directory) / "state.sqlite")
+            catalog.upsert_topic(1, "General")
+            catalog.upsert_topic(9, "Malayalam")
+            catalog.upsert_topic(12, "English")
+            self.assertEqual(catalog.list_library_topics(), [(12, "English"), (9, "Malayalam")])
 
 
 class UrlSafetyTests(unittest.IsolatedAsyncioTestCase):

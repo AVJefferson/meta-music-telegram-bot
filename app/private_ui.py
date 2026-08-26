@@ -124,7 +124,7 @@ def _topic_keyboard(
 
 
 async def _show_topics(ctx: Ctx, row: PendingReview, page: int = 0) -> None:
-    topics = ctx.catalog.list_topics()
+    topics = ctx.catalog.list_library_topics()
     text = (
         f"Choose library topic for <code>{html_esc(row.file_name)}</code>."
         if topics
@@ -564,7 +564,13 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
             await _show_topics(ctx, row, int(action.split(":", 1)[1]))
         elif action.startswith("topic:") and row.phase == "dm_topic":
             thread_id = int(action.split(":", 1)[1])
-            topic = dict(ctx.catalog.list_topics()).get(thread_id, "General")
+            topic = dict(ctx.catalog.list_library_topics()).get(thread_id)
+            if not topic:
+                ctx.catalog.update_pending_review(row.id, status="waiting")
+                refreshed = ctx.catalog.get_pending_review(row.id)
+                if refreshed:
+                    await _show_topics(ctx, refreshed)
+                return
             ctx.catalog.update_pending_review(
                 row.id, status="queued", topic_name=topic, thread_id=None
             )
