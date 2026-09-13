@@ -114,6 +114,7 @@ class Ctx:
     mb: Any
     jobs: Any = None
     index_user_id: int = 0
+    hifi_client: Any = None
 
 
 @dataclass

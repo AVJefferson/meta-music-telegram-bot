@@ -22,7 +22,12 @@ class TelethonHifi:
         path = Path(getattr(ctx.settings, "hifi_session_path", "/data/hifi.session"))
         api_id = int(getattr(ctx.settings, "telegram_api_id", 0) or 0)
         api_hash = str(getattr(ctx.settings, "telegram_api_hash", "") or "")
-        if not api_id or not api_hash or not path.exists():
+        if not api_id or not api_hash:
+            log.warning("hifi unavailable: TELEGRAM_API_ID/HASH missing")
+            raise AppError("unavailable")
+        session_file = path if path.suffix == ".session" else path.with_suffix(".session")
+        if not path.exists() and not session_file.exists():
+            log.warning("hifi unavailable: session file missing path=%s", path)
             raise AppError("unavailable")
         try:
             from telethon import TelegramClient
@@ -32,6 +37,7 @@ class TelethonHifi:
         await client.connect()
         if not await client.is_user_authorized():
             await client.disconnect()
+            log.warning("hifi unavailable: session not authorized")
             raise AppError("unavailable")
         try:
             path.chmod(0o600)

@@ -20,6 +20,17 @@ def _since_iso(ctx: Ctx) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=30 * months)).isoformat(timespec="seconds")
 
 
+def format_since_date(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw[:10]
+    return dt.strftime("%y-%m-%d")
+
+
 def _admin_kb_users(ctx: Ctx, rows) -> InlineKeyboardMarkup:
     admin_id = int(ctx.settings.admin_telegram_user_id)
     buttons: list[list[InlineKeyboardButton]] = []
@@ -65,11 +76,8 @@ def build_admin_router() -> Router:
         rows = ctx.catalog.list_active_users(_since_iso(ctx))
         lines = ["<b>Active users</b>"]
         for user in rows[:40]:
-            mark = " blocked" if ctx.catalog.is_user_blacklisted(user.telegram_user_id) else ""
-            email = html_esc(user.google_email or "")
             lines.append(
-                f"<code>{user.telegram_user_id}</code> since {html_esc(user.first_seen_at)} "
-                f"edited={user.songs_edited} {email}{mark}"
+                f"<code>{user.telegram_user_id}</code> since {html_esc(format_since_date(user.first_seen_at))}"
             )
         await send_private(
             ctx,

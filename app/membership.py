@@ -67,8 +67,18 @@ def message_from_bot(message: Any, bot: Any | None = None) -> bool:
     via_id = getattr(via, "id", None) if via is not None else None
     bot_id = getattr(bot, "id", None) if bot is not None else None
     if _same_id(via_id, bot_id):
-        return True
+        # Inline @bot search posts text as via_bot; allow that. Drop media so FLACs cannot echo.
+        if _message_has_media(message):
+            return True
+        return False
     return getattr(message, "sender_business_bot", None) is not None
+
+
+def _message_has_media(message: Any) -> bool:
+    return any(
+        getattr(message, name, None) is not None
+        for name in ("document", "audio", "voice", "video", "video_note", "sticker")
+    )
 
 
 def ignore_bot_update(update: Any, bot: Any | None = None) -> bool:

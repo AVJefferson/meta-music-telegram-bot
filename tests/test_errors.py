@@ -51,6 +51,87 @@ class ErrorRedactTests(unittest.TestCase):
         self.assertNotIn("traceback", str(payload).casefold())
 
 
+class ErrorHandlerCtxTests(unittest.IsolatedAsyncioTestCase):
+    async def test_workflow_ctx_reaches_error_handler(self) -> None:
+        from datetime import datetime, timezone
+
+        from aiogram import Bot, Dispatcher, Router
+        from aiogram.client.session.base import BaseSession
+        from aiogram.types import Chat, Message, Update, User
+
+        seen: list[object] = []
+        ctx_obj = SimpleNamespace(marker="ctx")
+
+        class _Session(BaseSession):
+            async def close(self) -> None:
+                return None
+
+            async def make_request(self, bot, method, timeout=None):
+                raise AssertionError("no network")
+
+            async def stream_content(
+                self,
+                url: str,
+                headers: dict | None = None,
+                timeout: int = 30,
+                chunk_size: int = 65536,
+                raise_for_status: bool = True,
+            ):
+                if False:
+                    yield b""
+                raise AssertionError("no network")
+
+        bot = Bot(token="1:AAEtest", session=_Session())
+        dp = Dispatcher(ctx=ctx_obj)
+        router = Router()
+
+        @router.message()
+        async def boom(message: Message) -> None:
+            raise RuntimeError("boom")
+
+        @dp.errors()
+        async def on_error(event, ctx) -> None:
+            seen.append(ctx)
+            del event
+
+        dp.include_router(router)
+        msg = Message(
+            message_id=1,
+            date=datetime.now(timezone.utc),
+            chat=Chat(id=9, type="private"),
+            from_user=User(id=9, is_bot=False, first_name="t"),
+            text="/login",
+        )
+        await dp.feed_update(bot, Update(update_id=1, message=msg))
+        await bot.session.close()
+        self.assertEqual(seen, [ctx_obj])
+
+    async def test_handle_update_error_notifies(self) -> None:
+        from datetime import datetime, timezone
+
+        from aiogram.types import Chat, ErrorEvent, Message, Update, User
+
+        from app.bot import handle_update_error
+
+        sent: list[tuple] = []
+
+        async def send_message(chat_id, text, **kwargs):
+            sent.append((chat_id, text))
+            return SimpleNamespace(message_id=1, chat=SimpleNamespace(id=chat_id))
+
+        ctx = SimpleNamespace(bot=SimpleNamespace(send_message=send_message))
+        msg = Message(
+            message_id=1,
+            date=datetime.now(timezone.utc),
+            chat=Chat(id=9, type="private"),
+            from_user=User(id=9, is_bot=False, first_name="t"),
+            text="/login",
+        )
+        event = ErrorEvent(update=Update(update_id=1, message=msg), exception=RuntimeError("nope"))
+        await handle_update_error(event, ctx)
+        self.assertEqual(sent, [(9, "Failed. Retry.")])
+
+
 class RateLimitTests(unittest.TestCase):
     def setUp(self) -> None:
         reset()

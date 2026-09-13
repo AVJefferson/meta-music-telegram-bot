@@ -21,7 +21,7 @@ from app.cleanup import run_cleanup, run_expire_pending
 from app.config import Settings
 from app.drive import DriveHub
 from app.edit_ui import build_edit_router
-from app.errors import AppError, log_error, to_app_error
+from app.errors import AppError, to_app_error
 from app.genre import GenreMapper
 from app.hifi import build_hifi_router
 from app.http_app import start_http
@@ -29,7 +29,7 @@ from app.identify import MBClient
 from app.library_index import ensure_library_index
 from app.membership import allow_user, ignore_bot_update, message_from_bot, touch
 from app.models import Ctx, Job
-from app.notify import notify_user
+from app.notify import notify_error, notify_user
 from app.private_ui import build_private_router
 from app.queue import recover_interrupted, worker
 from app.reactions import build_reactions_router
@@ -80,6 +80,23 @@ class CtxMiddleware(BaseMiddleware):
             log.debug("ignored bot-originated update")
             return None
         return await handler(event, data)
+
+
+async def handle_update_error(event: ErrorEvent, ctx: Ctx) -> None:
+    exc = event.exception
+    if isinstance(exc, asyncio.CancelledError):
+        raise exc
+    user_id = None
+    chat_id = None
+    update = event.update
+    if update.message and update.message.from_user:
+        user_id = update.message.from_user.id
+        chat_id = update.message.chat.id
+    elif update.callback_query and update.callback_query.from_user:
+        user_id = update.callback_query.from_user.id
+        if update.callback_query.message:
+            chat_id = update.callback_query.message.chat.id
+    await notify_error(ctx, user_id, exc, chat_id=chat_id)
 
 
 def polling_allowed_updates(dp: Dispatcher) -> list[str]:
@@ -287,28 +304,11 @@ async def main() -> None:
         jobs=jobs,
     )
 
-    dp = Dispatcher(storage=MemoryStorage())
+    # ctx must live in workflow_data: error handlers skip update inner middleware,
+    # so CtxMiddleware never injects it there (aiogram unpacks a copy).
+    dp = Dispatcher(storage=MemoryStorage(), ctx=ctx)
     dp.update.middleware(CtxMiddleware(ctx))
-
-    @dp.errors()
-    async def on_error(event: ErrorEvent, ctx: Ctx) -> None:
-        exc = event.exception
-        if isinstance(exc, asyncio.CancelledError):
-            raise exc
-        err = to_app_error(exc)
-        user_id = None
-        chat_id = None
-        update = event.update
-        if update.message and update.message.from_user:
-            user_id = update.message.from_user.id
-            chat_id = update.message.chat.id
-        elif update.callback_query and update.callback_query.from_user:
-            user_id = update.callback_query.from_user.id
-            if update.callback_query.message:
-                chat_id = update.callback_query.message.chat.id
-        log_error(err.code, user_id=user_id, chat_id=chat_id, exc=exc)
-        if user_id:
-            await notify_user(ctx, user_id, err.user_message, chat_id=chat_id)
+    dp.errors.register(handle_update_error)
 
     dp.include_router(build_admin_router())
     dp.include_router(build_user_command_router())

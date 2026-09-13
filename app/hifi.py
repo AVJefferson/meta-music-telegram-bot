@@ -18,6 +18,7 @@ log = logging.getLogger(__name__)
 _NEXT = ("next", "prev", "previous", "➡️", "⬅️", "»", "«", "▶", "◀")
 _lock = asyncio.Lock()
 _sessions: dict[str, dict[str, Any]] = {}
+_hifi_alerted = False
 
 
 def is_nav_label(text: str) -> bool:
@@ -123,13 +124,41 @@ async def pick_song(ctx: Ctx, user_id: int, pick_id: str) -> str:
     return path
 
 
+async def _alert_hifi_missing(ctx: Ctx) -> None:
+    global _hifi_alerted
+    if _hifi_alerted:
+        return
+    _hifi_alerted = True
+    from app.notify import alert_admin
+
+    await alert_admin(
+        ctx,
+        "HiFi session missing or unauthorized. Search is down. "
+        "Run: docker compose run --rm -it bot python -m app.hifi_login",
+    )
+
+
 async def _client(ctx: Ctx):
     factory = getattr(ctx, "hifi_factory", None)
     if callable(factory):
         return await factory()
+    cached = getattr(ctx, "hifi_client", None)
+    tele = getattr(cached, "client", None) if cached is not None else None
+    connected = False
+    if tele is not None:
+        check = getattr(tele, "is_connected", None)
+        connected = bool(check() if callable(check) else check)
+    if cached is not None and connected:
+        return cached
     from app.hifi_telethon import TelethonHifi
 
-    return await TelethonHifi.connect(ctx)
+    try:
+        client = await TelethonHifi.connect(ctx)
+    except AppError:
+        await _alert_hifi_missing(ctx)
+        raise
+    ctx.hifi_client = client
+    return client
 
 
 def build_hifi_router() -> Router:

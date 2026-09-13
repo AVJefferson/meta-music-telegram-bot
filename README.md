@@ -35,7 +35,7 @@ cp .env.example .env
 
 `DM_REQUIRES_KNOWN_CHAT=true` (default): DMs only work if the user is in a known, non-blacklisted group/channel (or is the env admin).
 
-`PUBLIC_BASE_URL` must be `https://…` (or `http://localhost` for dev). OAuth/Mini App links are built from this value only; `Host` is ignored.
+`PUBLIC_BASE_URL` must be `https://…` (or `http://localhost` for dev). OAuth/Mini App links are built from this value only; `Host` is ignored. Telegram Mini App **buttons** need HTTPS; localhost falls back to a normal link (works on this machine’s Telegram Desktop, not on a phone).
 
 ## Run
 
@@ -63,7 +63,7 @@ That profile mounts `/data/cache` only. Never sqlite, refresh tokens, or `hifi.s
 Admin (env admin only, private/ephemeral lists): `/listusers` `/listgroups` `/listchannels` `/blockuser` `/unblockuser`
 
 Everyone allowed: `/start` `/login` `/settings` `/review` `/suggest`  
-Search: DM any non-command text; group `@bot name` or `/get name`. Upload a FLAC anywhere allowed.
+Search: **off** until a user Telethon session can talk to HiFiAudioBot (`SEARCH_ENABLED` in `app/user_cmd.py`). Send a FLAC instead. `/get`, DM song names, and `@bot` search reply with that.
 
 Mini App for login/settings/review/suggest. DM fallback if Mini App fails. Never paste an OAuth URL in a public group.
 
@@ -126,6 +126,12 @@ No live Google, HiFi, or Telegram in CI.
 **Ephemeral missing.** Local Bot API older than 10.2; UI falls back to DM. User must `/start` the bot first.
 
 **Cover picker shows no images.** Bot lacks photo permission in that group.
+
+**Search is off.** `/get` and song-name DMs are gated by `SEARCH_ENABLED` in `app/user_cmd.py` until HiFi has a user Telethon session. Send a FLAC.
+
+**Search says Service unavailable.** No HiFi session at `/data/hifi.session`. Run `docker compose run --rm -it bot python -m app.hifi_login` with a **user phone**, not `BOT_TOKEN`.
+
+**`@bot` opens a search panel.** Search results are empty while search is off. To mention as a normal group message: BotFather → `/setinline` → Disable.
 
 ## License
 

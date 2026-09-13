@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import logging
+import secrets
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+    Message,
+    WebAppInfo,
+)
 
 from app.ephemeral import send_private
 from app.errors import AppError
@@ -15,12 +24,20 @@ from app.util import html_esc
 
 log = logging.getLogger(__name__)
 
+# Flip True when a USER Telethon session can talk to HiFiAudioBot again.
+SEARCH_ENABLED = False
+SEARCH_DISABLED_TEXT = "Song search is temporarily off. Send a FLAC instead."
+
 
 def _webapp_url(ctx: Ctx, page: str) -> str | None:
     try:
-        return f"{public_base_url(ctx.settings)}/app/{page}"
+        base = public_base_url(ctx.settings)
     except AppError:
         return None
+    # Telegram WebAppInfo rejects anything but HTTPS, including http://localhost.
+    if not base.lower().startswith("https://"):
+        return None
+    return f"{base}/app/{page}"
 
 
 def _web_or_url_keyboard(ctx: Ctx, page: str, url: str | None, label: str) -> InlineKeyboardMarkup | None:
@@ -32,6 +49,39 @@ def _web_or_url_keyboard(ctx: Ctx, page: str, url: str | None, label: str) -> In
     if url:
         return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label, url=url)]])
     return None
+
+
+def mentions_bot(message: Message, me) -> bool:
+    username = (getattr(me, "username", None) or "").casefold()
+    bot_id = getattr(me, "id", None)
+    raw = message.text or ""
+    if username and f"@{username}".casefold() in raw.casefold():
+        return True
+    for entity in message.entities or []:
+        if entity.type == "text_mention" and getattr(entity, "user", None) and entity.user.id == bot_id:
+            return True
+        if entity.type == "mention" and username:
+            chunk = raw[entity.offset : entity.offset + entity.length]
+            if chunk.casefold() == f"@{username}":
+                return True
+    return False
+
+
+def inline_search_results(query: str) -> list[InlineQueryResultArticle]:
+    q = " ".join((query or "").split())
+    if not q:
+        return []
+    title = f"Search {q}"
+    if len(title) > 64:
+        title = title[:61] + "..."
+    return [
+        InlineQueryResultArticle(
+            id=secrets.token_urlsafe(8),
+            title=title,
+            description="Send search to this chat",
+            input_message_content=InputTextMessageContent(message_text=f"/get {q}"[:4096]),
+        )
+    ]
 
 
 def build_user_command_router() -> Router:
@@ -48,10 +98,13 @@ def build_user_command_router() -> Router:
         user = ctx.catalog.touch_user(message.from_user.id)
         months = int(getattr(ctx.settings, "user_inactive_months", 6) or 6)
         cmds = ["/start", "/login", "/settings", "/review", "/suggest"]
-        if message.chat.type == "private":
-            cmds.append("send a song name or FLAC")
+        if SEARCH_ENABLED:
+            if message.chat.type == "private":
+                cmds.append("send a song name or FLAC")
+            else:
+                cmds.append("/get <song> or @mention the bot")
         else:
-            cmds.append("/get <song> or @mention the bot")
+            cmds.append("send a FLAC")
         if is_admin(ctx, message.from_user.id):
             cmds.extend(["/listusers", "/listgroups", "/listchannels", "/blockuser"])
         if not user.logged_in:
@@ -123,6 +176,9 @@ def build_user_command_router() -> Router:
             return
         if not await allow_user(ctx, message.from_user.id, message.chat):
             return
+        if not SEARCH_ENABLED:
+            await _start_search(ctx, message, "")
+            return
         query = (command.args or "").strip()
         if not query:
             await send_private(
@@ -138,6 +194,11 @@ async def _start_search(ctx: Ctx, message: Message, query: str) -> None:
     if not message.from_user or user_is_bot(message.from_user, ctx.bot):
         return
     user_id = message.from_user.id
+    if not SEARCH_ENABLED:
+        await send_private(
+            ctx, chat_id=message.chat.id, user_id=user_id, text=SEARCH_DISABLED_TEXT
+        )
+        return
     touch(ctx, user_id)
     try:
         check_search_rate(ctx, user_id)
@@ -187,23 +248,33 @@ def build_search_text_router() -> Router:
         if not await allow_user(ctx, message.from_user.id, message.chat):
             return
         me = await ctx.bot.get_me()
-        username = (me.username or "").casefold()
-        raw = message.text.strip()
-        mentioned = False
-        if username and f"@{username}".casefold() in raw.casefold():
-            mentioned = True
-        for entity in message.entities or []:
-            if entity.type == "mention":
-                mentioned = True
-            if entity.type == "text_mention" and getattr(entity, "user", None) and entity.user.id == me.id:
-                mentioned = True
-        if not mentioned:
+        if not mentions_bot(message, me):
             return
+        raw = message.text.strip()
         query = raw
+        username = (me.username or "").casefold()
         if username:
             query = raw.replace(f"@{me.username}", "").replace(f"@{username}", "").strip()
         if not query:
             return
         await _start_search(ctx, message, query)
+
+    @router.inline_query()
+    async def on_inline(query: InlineQuery, ctx: Ctx) -> None:
+        if not query.from_user or user_is_bot(query.from_user, ctx.bot):
+            await query.answer(results=[], cache_time=1, is_personal=True)
+            return
+        if not await allow_user(ctx, query.from_user.id):
+            await query.answer(results=[], cache_time=10, is_personal=True)
+            return
+        if not SEARCH_ENABLED:
+            await query.answer(results=[], cache_time=30, is_personal=True)
+            return
+        results = inline_search_results(query.query or "")
+        kwargs: dict = {"results": results, "cache_time": 1, "is_personal": True}
+        if not results:
+            kwargs["switch_pm_text"] = "Search in private chat"
+            kwargs["switch_pm_parameter"] = "search"
+        await query.answer(**kwargs)
 
     return router
