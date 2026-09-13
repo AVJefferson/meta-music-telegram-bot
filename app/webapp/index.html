@@ -1,0 +1,107 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MetaMusic</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 1rem; }
+    button { margin: 0.25rem 0; }
+    .row { padding: 0.4rem 0; border-bottom: 1px solid #ddd; }
+    .err { color: #b00; }
+  </style>
+</head>
+<body>
+  <h1 id="title">MetaMusic</h1>
+  <p id="status">Loading…</p>
+  <pre id="err" class="err"></pre>
+  <div id="settings"></div>
+  <div id="review"></div>
+  <div id="suggest"></div>
+  <script>
+    const tg = window.Telegram && window.Telegram.WebApp;
+    if (tg) tg.ready();
+    const page = (location.pathname.split("/").pop() || "home");
+    async function api(path, opts) {
+      const headers = Object.assign({"X-Telegram-Init-Data": tg ? tg.initData : ""}, (opts && opts.headers) || {});
+      const res = await fetch(path, Object.assign({}, opts, {headers}));
+      const data = await res.json();
+      if (!data.ok) throw data;
+      return data;
+    }
+    function showErr(e) {
+      document.getElementById("err").textContent = (e && e.error) || "Failed";
+    }
+    (async () => {
+      try {
+        const me = await api("/api/me");
+        document.getElementById("status").textContent =
+          "Since " + me.user_since + " · edited " + me.songs_edited +
+          (me.logged_in ? (" · " + (me.google_email || "Drive on")) : " · Drive off");
+        if (page === "settings" || page === "login") {
+          const box = document.getElementById("settings");
+          if (page === "login" && !me.logged_in) {
+            try {
+              const data = await api("/api/login");
+              if (data.url) {
+                if (tg && tg.openLink) tg.openLink(data.url);
+                else location.href = data.url;
+              }
+            } catch (e) { showErr(e); }
+          }
+          box.innerHTML = "<p>Inactive after " + me.inactive_months + " months.</p>" +
+            (me.logged_in
+              ? "<button id=unlink>Unlink Drive</button>"
+              : "<p>Use /login in Telegram if this screen did not open Google.</p>") +
+            "<p>Default save</p>" +
+            "<button data-d=library>library</button>" +
+            "<button data-d=review>review</button>" +
+            "<button data-d=none>none</button>";
+          const unlink = document.getElementById("unlink");
+          if (unlink) unlink.onclick = async () => {
+            await api("/api/settings", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({unlink:true})});
+            location.reload();
+          };
+          box.querySelectorAll("button[data-d]").forEach(btn => {
+            btn.onclick = async () => {
+              await api("/api/settings", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({default_dest: btn.dataset.d})});
+            };
+          });
+        }
+        if (page === "review") {
+          const data = await api("/api/review");
+          const box = document.getElementById("review");
+          if (!data.tracks.length) box.textContent = "Review folder empty.";
+          data.tracks.forEach(t => {
+            const div = document.createElement("div");
+            div.className = "row";
+            div.textContent = (t.artist || "") + " — " + (t.album || "") + " — " + (t.title || "");
+            ["library","draft","cancel"].forEach(act => {
+              const b = document.createElement("button");
+              b.textContent = act;
+              b.onclick = async () => {
+                await api("/api/review/" + t.id + "/action", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({action: act})});
+                location.reload();
+              };
+              div.appendChild(b);
+            });
+            box.appendChild(div);
+          });
+        }
+        if (page === "suggest") {
+          const q = new URLSearchParams(location.search).get("q") || "";
+          const data = await api("/api/suggest?q=" + encodeURIComponent(q));
+          const box = document.getElementById("suggest");
+          (data.results || []).forEach(r => {
+            const div = document.createElement("div");
+            div.className = "row";
+            div.textContent = JSON.stringify(r);
+            box.appendChild(div);
+          });
+        }
+      } catch (e) { showErr(e); }
+    })();
+  </script>
+</body>
+</html>

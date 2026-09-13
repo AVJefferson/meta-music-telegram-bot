@@ -152,6 +152,13 @@ class QueryParseTests(unittest.TestCase):
         self.assertIsNone(genre.language_from_topic("General"))
         self.assertIsNone(genre.language_from_topic("Topic 12"))
 
+    def test_query_language_from_tokens_not_forum(self) -> None:
+        tokens, leftover = mapper().extract_query_tokens("malayalam jazz")
+        labels = [item.casefold() for item in tokens]
+        self.assertIn("malayalam", labels)
+        self.assertIn("jazz", labels)
+        self.assertFalse(leftover)
+
 
 class DrivePathTests(unittest.TestCase):
     def test_filename_with_and_without_track_number(self) -> None:

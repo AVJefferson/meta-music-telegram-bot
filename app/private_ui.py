@@ -28,7 +28,7 @@ from PIL import Image
 from app.botapi import discard_download
 from app.edit_ui import EDITOR_FIELDS, current_edit_field, handle_edit_text, show_field_menu
 from app.genre import genre_tokens
-from app.membership import is_forum_member
+from app.membership import allow_user, message_from_bot, user_is_bot
 from app.models import Ctx, Identity, Job, PendingReview, tagset_from_dict
 from app.tags import audio_info, normalize_tagset, read_cover, read_tagset, write_tags
 from app.util import format_bytes, html_esc, sanitize_filename
@@ -88,13 +88,15 @@ def _control_keyboard(
 async def is_authorized_private(message: Message, ctx: Ctx) -> bool:
     if message.chat.type != "private" or not message.from_user:
         return False
-    return await is_forum_member(ctx, message.from_user.id)
+    if user_is_bot(message.from_user, ctx.bot):
+        return False
+    return await allow_user(ctx, message.from_user.id, message.chat)
 
 
 async def _require_private(message: Message, ctx: Ctx) -> bool:
     if await is_authorized_private(message, ctx):
         return True
-    await message.reply("Private access requires current membership in configured forum group.")
+    await message.reply("Private access requires membership in a known group.")
     return False
 
 
@@ -217,7 +219,7 @@ async def _show_confirm(ctx: Ctx, row: PendingReview) -> None:
         ctx,
         Job(row.chat_id, None, row.topic_name, "", row.file_name, row.status_message_id, private=True),
         f"<b>Confirm changes</b>\n\n{preview}\nCover: {html_esc(cover_mode)}\n"
-        f"Library topic: {html_esc(row.topic_name or 'General')}",
+        f"Library language: {html_esc(row.topic_name or 'Unknown')}",
         _control_keyboard(row.id, confirm=True),
     )
 
@@ -435,7 +437,7 @@ async def _recall_review(ctx: Ctx, row: PendingReview, index: int) -> None:
         source=str(sidecar.get("source") or "drive-review"),
         confidence_reason=str(sidecar.get("confidence_reason") or "Recalled from Drive review"),
     )
-    topic = str(sidecar.get("topic") or "General")
+    topic = str(sidecar.get("topic") or "Unknown")
     ctx.catalog.update_pending_review(
         row.id,
         phase="edit:0",
@@ -472,8 +474,12 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
     @router.message(F.chat.type == "private", FlacMessageFilter())
     async def private_media(message: Message, ctx: Ctx) -> None:
         from app.bot import file_info
+        from app.botapi import discard_download
+        from app.intake import ingest_local_flac
 
         if not await _require_private(message, ctx):
+            return
+        if message_from_bot(message, ctx.bot):
             return
         if ctx.catalog.get_active_for_chat(message.chat.id):
             await message.reply("Finish or cancel current action first.")
@@ -482,45 +488,23 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
         pending_dir = ctx.settings.pending_root / str(uuid.uuid4())
         pending_dir.mkdir(parents=True, exist_ok=True)
         local = pending_dir / (sanitize_filename(Path(file_name).stem) + ".flac")
-        status = await message.reply(f"Downloading <code>{html_esc(file_name)}</code>…", parse_mode="HTML")
         try:
             telegram_file = await ctx.bot.get_file(file_id)
             await ctx.bot.download(telegram_file, destination=local)
             await asyncio.to_thread(discard_download, telegram_file.file_path)
-        except Exception:
-            shutil.rmtree(pending_dir, ignore_errors=True)
-            log.exception("private FLAC download failed")
-            await status.edit_text("Could not download FLAC. Try again.")
-            return
-        try:
-            pending_id = ctx.catalog.insert_pending_review(
-                phase="dm_topic",
-                local_path=str(local),
-                sidecar_path=None,
-                relative_path=None,
-                kind="library",
-                original_json="{}",
-                recommended_json="{}",
-                working_json="{}",
-                candidates_json="[]",
-                identity_json="{}",
-                source_report_json="{}",
-                chat_id=message.chat.id,
-                thread_id=None,
-                status_message_id=status.message_id,
-                topic_name="",
+            await ingest_local_flac(
+                ctx,
+                chat=message.chat,
+                user_id=message.from_user.id,
+                path=local,
                 file_name=file_name,
                 telegram_file_id=file_id,
                 source_message_id=message.message_id,
-                expires_at=_expires_at(),
             )
-        except RuntimeError:
+        except Exception:
             shutil.rmtree(pending_dir, ignore_errors=True)
-            await status.edit_text("Another private action is already active.")
-            return
-        row = ctx.catalog.get_pending_review(pending_id)
-        if row:
-            await _show_topics(ctx, row)
+            log.exception("private FLAC ingest failed")
+            await message.reply("Could not process FLAC. Try again.")
 
     @router.callback_query(F.data.regexp(r"^d\d+:"))
     async def private_callback(callback: CallbackQuery, ctx: Ctx) -> None:
@@ -537,7 +521,7 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
         if not callback.from_user:
             await callback.answer()
             return
-        if not await is_forum_member(ctx, callback.from_user.id):
+        if not await allow_user(ctx, callback.from_user.id, callback.message.chat):
             await callback.answer("Access denied.", show_alert=True)
             return
         mutates = (

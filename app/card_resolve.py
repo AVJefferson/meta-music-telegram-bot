@@ -28,13 +28,14 @@ _DRIVE_OPEN_RE = re.compile(
 )
 _DRIVE_ID_QUERY_RE = re.compile(r"[?&]id=([A-Za-z0-9_-]{10,})", re.I)
 _SAVED_KIND_RE = re.compile(r"Saved\s*\((library|review)\b", re.I)
-_KIND_LINE_RE = re.compile(r"^(library|review)\b", re.I | re.M)
+_EDITOR_RE = re.compile(r"editor:(\d+)")
 _DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}/")
 _CODE_HTML_RE = re.compile(r"<code>([^<]+)</code>", re.I)
 _HREF_RE = re.compile(r'href="([^"]+)"', re.I)
 _ARTIST_RE = re.compile(r"^Artist:\s*(.*)$", re.M)
 _ALBUM_RE = re.compile(r"^Album:\s*(.*)$", re.M)
 _FLAC_LINE_RE = re.compile(r"(?m)^(\S(?:.*\S)?\.flac)$", re.I)
+_KIND_LINE_RE = re.compile(r"(?im)^\s*(library|review)\s*$")
 _PROBE_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
 
 
@@ -87,9 +88,7 @@ def parse_drive_file_id(url: str) -> str | None:
 def looks_like_music_card(hint: CardHint) -> bool:
     if hint.drive_file_id or hint.relative_path or hint.telegram_file_id:
         return True
-    if hint.kind and hint.title and hint.artist:
-        return True
-    return False
+    return bool(hint.kind and hint.title and hint.artist)
 
 
 def _int_field(raw: object) -> int | None:
@@ -390,23 +389,27 @@ async def _drive_id_from_path(ctx: Ctx, hint: CardHint) -> str | None:
     relative = hint.relative_path
     if not relative:
         return None
+    from app.drive import resolve_drive, user_drive_root
+
     kinds = [hint.kind] if hint.kind in {"library", "review"} else ["library", "review"]
     posix = Path(_normalize_relative(relative))
+    uid = getattr(ctx, "index_user_id", 0) or 0
+    drive = resolve_drive(ctx, uid)
+    if drive is None:
+        return None
     for kind in kinds:
-        root = (
-            ctx.settings.gdrive_folder_id
-            if kind == "library"
-            else ctx.settings.gdrive_review_folder_id
-        )
+        root = user_drive_root(ctx, kind, uid)
+        if not root:
+            continue
         try:
-            parent = await asyncio.to_thread(ctx.drive.find_path, root, list(posix.parts[:-1]))
+            parent = await asyncio.to_thread(drive.find_path, root, list(posix.parts[:-1]))
         except Exception:
             log.debug("drive path lookup failed kind=%s path=%s", kind, relative, exc_info=True)
             continue
         if not parent:
             continue
         try:
-            hits = await asyncio.to_thread(ctx.drive.find_name_conflicts, parent, posix.name)
+            hits = await asyncio.to_thread(drive.find_name_conflicts, parent, posix.name)
         except Exception:
             log.debug("drive name lookup failed kind=%s path=%s", kind, relative, exc_info=True)
             continue
@@ -541,7 +544,9 @@ def _insert_track(ctx: Ctx, hint: CardHint) -> TrackRecord | None:
     return ctx.catalog.get_track(track_id)
 
 
-def _bind_messages(ctx: Ctx, track: TrackRecord, hint: CardHint, *, chat_id: int, message_id: int) -> tuple[int | None, int | None]:
+def _bind_messages(
+    ctx: Ctx, track: TrackRecord, hint: CardHint, *, chat_id: int, message_id: int
+) -> tuple[int | None, int | None]:
     ctx.catalog.bind_track_message(track.id, chat_id, message_id)
     source_id = hint.source_message_id or track.source_message_id
     card_id = message_id if not hint.is_source_audio else hint.card_message_id
@@ -552,7 +557,15 @@ def _bind_messages(ctx: Ctx, track: TrackRecord, hint: CardHint, *, chat_id: int
     return source_id, card_id
 
 
-def _remember_resolved(ctx: Ctx, track: TrackRecord, hint: CardHint, *, chat_id: int, source_id: int | None, card_id: int | None) -> None:
+def _remember_resolved(
+    ctx: Ctx,
+    track: TrackRecord,
+    hint: CardHint,
+    *,
+    chat_id: int,
+    source_id: int | None,
+    card_id: int | None,
+) -> None:
     tags = (
         tagset_from_dict(json.loads(track.tags_json))
         if track.tags_json

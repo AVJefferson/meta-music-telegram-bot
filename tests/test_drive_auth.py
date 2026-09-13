@@ -80,9 +80,9 @@ class PortBusyTests(unittest.TestCase):
             patch("app.drive_auth.sys.stdin.isatty", return_value=True),
             patch("app.drive_auth._prompt_busy_choice", return_value="q"),
             patch("app.drive_auth._listeners_on_port", return_value=[]),
+            self.assertRaises(SystemExit) as ctx,
         ):
-            with self.assertRaises(SystemExit) as ctx:
-                drive_auth._resolve_bind_port("localhost", 8090)
+            drive_auth._resolve_bind_port("localhost", 8090)
         self.assertEqual(ctx.exception.code, 1)
 
     def test_resolve_non_tty_auto_picks(self) -> None:

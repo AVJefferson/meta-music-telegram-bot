@@ -12,6 +12,7 @@ from pathlib import Path
 from PIL import Image
 
 from app.enrich import _fit_cover, fetch_cover, list_caa_fronts, list_itunes_album_cover
+from app.library import UNKNOWN_LANGUAGE_FOLDER
 from app.models import Ctx, Identity, TagSet
 from app.util import format_artist_list, normalize_match_text, sanitize_filename
 
@@ -54,7 +55,7 @@ def album_folder_parts(topic: str, albumartist: str, album: str) -> list[str] | 
     if not is_shareable_album(album):
         return None
     return [
-        sanitize_filename(topic or "General"),
+        sanitize_filename(topic or UNKNOWN_LANGUAGE_FOLDER),
         sanitize_filename(albumartist or "Unknown Artist"),
         sanitize_filename(album),
     ]
@@ -203,14 +204,21 @@ def _download_drive_cover(ctx: Ctx, topic: str, albumartist: str, album: str) ->
     parts = album_folder_parts(topic, albumartist, album)
     if not parts:
         return None
-    folder_id = ctx.drive.find_path(ctx.settings.gdrive_folder_id, parts)
+    from app.drive import resolve_drive, user_drive_root
+
+    uid = getattr(ctx, "index_user_id", 0) or 0
+    root = user_drive_root(ctx, "library", uid)
+    drive = resolve_drive(ctx, uid)
+    if not root or drive is None:
+        return None
+    folder_id = drive.find_path(root, parts)
     if not folder_id:
         return None
-    hits = ctx.drive.find_name_conflicts(folder_id, COVER_NAME)
+    hits = drive.find_name_conflicts(folder_id, COVER_NAME)
     if not hits:
         return None
     try:
-        data = ctx.drive.download_bytes(hits[0].id)
+        data = drive.download_bytes(hits[0].id)
     except Exception:
         log.debug("drive cover download failed", exc_info=True)
         return None

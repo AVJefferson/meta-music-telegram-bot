@@ -20,6 +20,7 @@ from app.authenticity import (
     unknown_result,
 )
 from app.config import Settings
+from app.genre import GenreMapper
 from app.models import Enrichment, Identity, Job, TagHints, TagSet
 from app.queue import _preview, process_job, quality, tag_preview
 from app.review_ui import format_conflict
@@ -205,7 +206,7 @@ class ProcessJobFlagOnlyTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 drive=SimpleNamespace(),
                 http=SimpleNamespace(),
-                genre=SimpleNamespace(compose=lambda genre: genre),
+                genre=GenreMapper(Path(__file__).resolve().parent.parent / "genre_map.yaml"),
                 bot=SimpleNamespace(),
                 mb=SimpleNamespace(),
             )
@@ -292,6 +293,10 @@ class FullFileSampleTests(unittest.TestCase):
             self.assertEqual(resolved_sample_seconds(path, -1), 1_000_000_000.0)
 
     def test_minus_one_passes_file_duration_into_analyzer(self) -> None:
+        try:
+            import flac_detective  # noqa: F401
+        except ImportError:
+            self.skipTest("flac_detective missing")
         seen: dict[str, float] = {}
 
         class FakeAnalyzer:
@@ -318,6 +323,11 @@ class FullFileSampleTests(unittest.TestCase):
         full_ctx.assert_called_once()
 
     def test_positive_seconds_skips_full_file_patch(self) -> None:
+        try:
+            import flac_detective  # noqa: F401
+        except ImportError:
+            self.skipTest("flac_detective missing")
+
         class FakeAnalyzer:
             def __init__(self, sample_duration: float = 30.0, deep: bool = False) -> None:
                 self.sample_duration = sample_duration

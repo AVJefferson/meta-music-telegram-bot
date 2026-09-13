@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 import uuid
 from dataclasses import asdict, replace
 from pathlib import Path
 
+from app.drive import resolve_drive, user_drive_root
 from app.genre import genre_tokens
 from app.library import library_relative, place_file, review_relative, rmdir_empty, unlink_quiet, write_sidecar
 from app.models import Ctx, Identity, TagSet, TrackRecord, identity_from_dict, tagset_from_dict
+from app.paths import user_kind_root
 from app.tags import AudioMetrics, normalize_tagset, overlay_tagset, read_audio_metrics, read_cover, read_tagset, write_tags
 from app.util import sanitize_filename
 
@@ -87,10 +90,22 @@ def sidecar_payload(topic: str, file_name: str, tags: TagSet, identity: Identity
     }
 
 
-def drive_root_id(ctx: Ctx, kind: str) -> str:
-    if kind == "library":
-        return ctx.settings.gdrive_folder_id
-    return ctx.settings.gdrive_review_folder_id
+def drive_root_id(ctx: Ctx, kind: str, user_id: int = 0) -> str:
+    return user_drive_root(ctx, kind, user_id)
+
+
+def ctx_for_user(ctx: Ctx, user_id: int) -> Ctx:
+    client = resolve_drive(ctx, user_id)
+    kwargs: dict = {"index_user_id": user_id}
+    if client is not None and client is not ctx.drive:
+        kwargs["drive"] = client
+    return replace(ctx, **kwargs)
+
+
+def local_kind_root(ctx: Ctx, kind: str, user_id: int = 0) -> Path:
+    if user_id:
+        return user_kind_root(ctx, user_id, kind)
+    return ctx.settings.library_root if kind == "library" else ctx.settings.review_root
 
 
 async def _resolve_drive_file_id(ctx: Ctx, track: TrackRecord) -> str | None:
@@ -99,11 +114,13 @@ async def _resolve_drive_file_id(ctx: Ctx, track: TrackRecord) -> str | None:
     if not track.relative_path:
         return None
     relative = Path(track.relative_path)
-    root = drive_root_id(ctx, track.kind)
-    parent = await asyncio.to_thread(ctx.drive.find_path, root, list(relative.parts[:-1]))
+    uid = getattr(track, "user_id", 0) or 0
+    root = drive_root_id(ctx, track.kind, uid)
+    drive = resolve_drive(ctx, uid) or ctx.drive
+    parent = await asyncio.to_thread(drive.find_path, root, list(relative.parts[:-1]))
     if not parent:
         return None
-    hits = await asyncio.to_thread(ctx.drive.find_name_conflicts, parent, relative.name)
+    hits = await asyncio.to_thread(drive.find_name_conflicts, parent, relative.name)
     return hits[0].id if hits else None
 
 
@@ -117,7 +134,7 @@ async def _ensure_local_flac_locked(ctx: Ctx, track: TrackRecord) -> Path:
     if track.local_path:
         candidates.append(Path(track.local_path))
     if track.relative_path:
-        root = ctx.settings.library_root if track.kind == "library" else ctx.settings.review_root
+        root = local_kind_root(ctx, track.kind, getattr(track, "user_id", 0) or 0)
         candidates.append(root / track.relative_path)
     for path in candidates:
         if path.is_file():
@@ -131,30 +148,36 @@ async def _ensure_local_flac_locked(ctx: Ctx, track: TrackRecord) -> Path:
     name = Path(track.relative_path or track.file_name or "track.flac").name
     dest = ctx.settings.pending_root / str(uuid.uuid4()) / sanitize_filename(name)
     log.info("downloading track=%s from Drive id=%s to %s", track.id, file_id, dest)
-    await asyncio.to_thread(ctx.drive.download_to, file_id, dest)
+    drive = resolve_drive(ctx, getattr(track, "user_id", 0) or 0) or ctx.drive
+    await asyncio.to_thread(drive.download_to, file_id, dest)
     ctx.catalog.update_track(track.id, local_path=str(dest), drive_file_id=file_id)
     return dest
 
 
-async def _delete_drive_named(ctx: Ctx, kind: str, relative: Path | None, extra_ids: list[str | None]) -> None:
+async def _delete_drive_named(
+    ctx: Ctx, kind: str, relative: Path | None, extra_ids: list[str | None], user_id: int = 0
+) -> None:
     seen: set[str] = set()
+    drive = resolve_drive(ctx, user_id) or ctx.drive
+    if not callable(getattr(drive, "delete_file", None)):
+        return
     for file_id in extra_ids:
         if not file_id or file_id in seen:
             continue
         seen.add(file_id)
         try:
-            await asyncio.to_thread(ctx.drive.delete_file, file_id)
+            await asyncio.to_thread(drive.delete_file, file_id)
         except Exception:
             log.warning("Drive delete failed id=%s", file_id, exc_info=True)
     if relative is None:
         return
-    root = drive_root_id(ctx, kind)
-    parent = await asyncio.to_thread(ctx.drive.find_path, root, list(relative.parts[:-1]))
+    root = drive_root_id(ctx, kind, user_id)
+    parent = await asyncio.to_thread(drive.find_path, root, list(relative.parts[:-1]))
     if not parent:
         return
     for name in (relative.name, relative.with_suffix(".json").name, relative.with_suffix(".log").name):
         try:
-            hits = await asyncio.to_thread(ctx.drive.find_name_conflicts, parent, name)
+            hits = await asyncio.to_thread(drive.find_name_conflicts, parent, name)
         except Exception:
             log.debug("Drive sibling lookup failed name=%s", name, exc_info=True)
             continue
@@ -163,7 +186,7 @@ async def _delete_drive_named(ctx: Ctx, kind: str, relative: Path | None, extra_
                 continue
             seen.add(hit.id)
             try:
-                await asyncio.to_thread(ctx.drive.delete_file, hit.id)
+                await asyncio.to_thread(drive.delete_file, hit.id)
             except Exception:
                 log.warning("Drive sibling delete failed id=%s", hit.id, exc_info=True)
 
@@ -221,7 +244,11 @@ async def relocate_track(
     topic_name: str,
     file_name: str,
     staged: Path | None = None,
+    correct_telegram: bool = False,
+    editor_user_id: int | None = None,
 ) -> TrackRecord:
+    uid = getattr(track, "user_id", 0) or 0
+    ctx = ctx_for_user(ctx, uid)
     local = staged if staged and staged.is_file() else await ensure_local_flac(ctx, track)
     tags = normalize_tagset(tags, ctx.genre)
     if tags.genre:
@@ -236,40 +263,56 @@ async def relocate_track(
 
     if kind == "library":
         relative = library_relative(topic_name, tags)
-        dest = ctx.settings.library_root / relative
-        root_id = ctx.settings.gdrive_folder_id
+        dest = local_kind_root(ctx, "library", uid) / relative
+        root_id = drive_root_id(ctx, "library", uid)
         sidecar_path: Path | None = None
     else:
         relative = review_relative(file_name)
-        dest = ctx.settings.review_root / relative
-        root_id = ctx.settings.gdrive_review_folder_id
+        dest = local_kind_root(ctx, "review", uid) / relative
+        root_id = drive_root_id(ctx, "review", uid)
         sidecar_path = dest.with_suffix(".json")
 
+    dest.parent.mkdir(parents=True, exist_ok=True)
     if local.resolve() != dest.resolve():
         dest = await asyncio.to_thread(place_file, local, dest)
 
-    parent_id = await asyncio.to_thread(ctx.drive.ensure_parent, root_id, relative)
-    filename = relative.name
-    conflicts = await asyncio.to_thread(ctx.drive.find_name_conflicts, parent_id, filename)
-    try:
-        if conflicts:
-            file_id, url = await asyncio.to_thread(
-                ctx.drive.replace_file, conflicts[0].id, dest, "audio/flac"
-            )
-        else:
-            file_id, url = await asyncio.to_thread(
-                ctx.drive.create_file, dest, parent_id, filename, "audio/flac"
-            )
-    except Exception:
-        log.exception("Drive relocate upload failed track=%s kind=%s", track.id, kind)
-        raise
-
+    drive = ctx.drive
+    can_drive = bool(root_id) and callable(getattr(drive, "ensure_parent", None))
+    file_id, url = "", None
     sidecar_id = None
-    if kind == "review":
-        sidecar_path, sidecar_id = await _upload_review_sidecar(
-            ctx, dest, parent_id, topic_name, file_name, tags, identity
+    log_id = None
+    filename = relative.name
+    if can_drive:
+        parent_id = await asyncio.to_thread(drive.ensure_parent, root_id, relative)
+        conflicts = await asyncio.to_thread(drive.find_name_conflicts, parent_id, filename)
+        try:
+            if conflicts:
+                file_id, url = await asyncio.to_thread(
+                    drive.replace_file, conflicts[0].id, dest, "audio/flac"
+                )
+            else:
+                file_id, url = await asyncio.to_thread(
+                    drive.create_file, dest, parent_id, filename, "audio/flac"
+                )
+        except Exception as exc:
+            log.exception("Drive relocate upload failed track=%s kind=%s", track.id, kind)
+            from app.errors import to_app_error
+
+            raise to_app_error(exc) from exc
+        if kind == "review":
+            sidecar_path, sidecar_id = await _upload_review_sidecar(
+                ctx, dest, parent_id, topic_name, file_name, tags, identity
+            )
+        log_id = await _upload_songlog(ctx, dest, parent_id, source_report, tags, identity)
+    elif kind == "review" and sidecar_path:
+        from app.library import write_sidecar
+
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(
+            write_sidecar,
+            sidecar_path,
+            {"topic": topic_name, "file_name": file_name, "proposed": asdict(tags)},
         )
-    log_id = await _upload_songlog(ctx, dest, parent_id, source_report, tags, identity)
 
     same_drive = bool(track.drive_file_id and track.drive_file_id == file_id)
     if not same_drive:
@@ -278,6 +321,7 @@ async def relocate_track(
             old_kind,
             old_relative,
             [track.drive_file_id, track.drive_sidecar_id, track.drive_log_id],
+            user_id=uid,
         )
     elif kind != "review" and track.drive_sidecar_id:
         try:
@@ -312,6 +356,7 @@ async def relocate_track(
         topic_name=topic_name,
         file_name=file_name,
         error=None,
+        last_editor_user_id=editor_user_id if editor_user_id else getattr(track, "last_editor_user_id", None),
     )
     if old_kind == "library" and old_relative and (
         kind != "library" or old_relative.as_posix() != relative.as_posix()
@@ -332,6 +377,31 @@ async def relocate_track(
     )
     refreshed = ctx.catalog.get_track(track.id)
     assert refreshed is not None
+    if correct_telegram and refreshed.source_chat_id and (refreshed.source_message_id or refreshed.telegram_file_id):
+        from app.captions import music_caption
+        from app.telegram_file import update_public_audio
+
+        caption = music_caption(
+            tags=tags,
+            track=refreshed,
+            relative_path=relative.as_posix(),
+            last_editor_user_id=editor_user_id,
+        )
+        msg_id = refreshed.source_message_id
+        if msg_id:
+            new_id = await update_public_audio(
+                ctx,
+                chat_id=refreshed.source_chat_id,
+                message_id=msg_id,
+                path=dest,
+                caption=caption,
+                correct_media=True,
+            )
+            if new_id:
+                ctx.catalog.update_track(refreshed.id, telegram_file_id=new_id)
+                refreshed = ctx.catalog.get_track(refreshed.id) or refreshed
+        if editor_user_id:
+            ctx.catalog.increment_songs_edited(editor_user_id)
     return refreshed
 
 
@@ -346,6 +416,7 @@ async def delete_track(ctx: Ctx, track: TrackRecord) -> None:
         track.kind,
         relative,
         [track.drive_file_id, track.drive_sidecar_id, track.drive_log_id],
+        user_id=getattr(track, "user_id", 0) or 0,
     )
     local = Path(track.local_path) if track.local_path else None
     if local:
@@ -437,3 +508,81 @@ async def hydrate_track_tags(ctx: Ctx, track: TrackRecord) -> TrackRecord:
         log.debug("hydrate audio metrics failed path=%s", local, exc_info=True)
     ctx.catalog.update_track(track.id, **fields)
     return ctx.catalog.get_track(track.id) or track
+
+
+async def copy_track_for_user(
+    ctx: Ctx,
+    track: TrackRecord,
+    user_id: int,
+    *,
+    kind: str,
+) -> TrackRecord:
+    tags = tags_from_track(track)
+    identity = identity_from_track(track)
+    report = _loads(track.source_report_json, {})
+    if not isinstance(report, dict):
+        report = {}
+    if getattr(track, "user_id", 0) == user_id:
+        return await relocate_track(
+            ctx,
+            track,
+            kind=kind,
+            tags=tags,
+            identity=identity,
+            source_report=report,
+            topic_name=track.topic_name or "Unknown",
+            file_name=track.file_name or "track.flac",
+        )
+    local = await ensure_local_flac(ctx, track)
+    staged = ctx.settings.pending_root / str(uuid.uuid4()) / Path(local.name)
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(shutil.copy2, local, staged)
+    new_id = ctx.catalog.insert_pending(
+        kind=kind,
+        mb_recording_id=track.mb_recording_id,
+        acoustid=track.acoustid,
+        local_path=str(staged),
+        sidecar_path=None,
+        relative_path=track.relative_path or staged.name,
+        bit_depth=track.bit_depth,
+        sample_rate=track.sample_rate,
+        title=track.title,
+        artist=track.artist,
+        album=track.album,
+        user_id=user_id,
+        audio_sha256=getattr(track, "audio_sha256", None),
+        telegram_file_id=track.telegram_file_id,
+        tags_json=track.tags_json,
+        identity_json=track.identity_json,
+        source_report_json=track.source_report_json,
+        topic_name=track.topic_name,
+        file_name=track.file_name,
+    )
+    dest = ctx.catalog.get_track(new_id)
+    assert dest is not None
+    return await relocate_track(
+        ctx,
+        dest,
+        kind=kind,
+        tags=tags,
+        identity=identity,
+        source_report=report,
+        topic_name=track.topic_name or "Unknown",
+        file_name=track.file_name or "track.flac",
+        staged=staged,
+    )
+
+
+def user_copy_of(ctx: Ctx, track: TrackRecord, user_id: int) -> TrackRecord | None:
+    sha = getattr(track, "audio_sha256", None)
+    if sha:
+        found = ctx.catalog.find_user_track_by_sha(user_id, sha)
+        if found:
+            return found
+    if track.mb_recording_id:
+        found = ctx.catalog.find_user_track_by_mbid(user_id, track.mb_recording_id)
+        if found:
+            return found
+    if getattr(track, "user_id", 0) == user_id:
+        return track
+    return None

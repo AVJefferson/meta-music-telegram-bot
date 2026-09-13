@@ -11,11 +11,13 @@ from app.models import TagSet
 from app.tags import build_filename
 from app.util import sanitize_filename
 
+UNKNOWN_LANGUAGE_FOLDER = "Unknown"
+
 
 def library_relative(topic: str, tags: TagSet) -> Path:
     album_artist = sanitize_filename(tags.albumartist or tags.artist or "Unknown Artist")
     album = sanitize_filename(tags.album or "Unknown Album")
-    return Path(sanitize_filename(topic or "General")) / album_artist / album / build_filename(tags)
+    return Path(sanitize_filename(topic or UNKNOWN_LANGUAGE_FOLDER)) / album_artist / album / build_filename(tags)
 
 
 def review_relative(original_name: str) -> Path:

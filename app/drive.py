@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from google.auth.exceptions import RefreshError
@@ -16,10 +18,15 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBa
 
 from app.config import Settings
 from app.drive_scopes import DRIVE_SCOPE
+from app.errors import AppError
 
 log = logging.getLogger(__name__)
 FOLDER_MIME = "application/vnd.google-apps.folder"
 _NO_RETRY_STATUS = {400, 401, 403, 404}
+ACCESS_MAX_SECONDS = 6 * 3600
+
+LIBRARY_FOLDER = "Telegram Music"
+REVIEW_FOLDER = "Telegram Music Review"
 
 
 @dataclass
@@ -62,13 +69,7 @@ class DriveAccessError(RuntimeError):
     """Folder missing, wrong auth, or Drive rejected the upload."""
 
 
-_INVALID_GRANT = (
-    "Google OAuth refresh token is invalid or expired (invalid_grant). "
-    "Consent apps left in Testing expire the token after ~7 days. "
-    "Re-run `python -m app.drive_auth` and update GOOGLE_REFRESH_TOKEN. "
-    "Keep the same OAuth client and GDRIVE_* folder IDs. "
-    "To stop the 7-day expiry, set the consent screen to In production."
-)
+_INVALID_GRANT = "Google login expired. Use /login again."
 
 
 def _oauth_email(creds: Credentials) -> str:
@@ -128,30 +129,69 @@ class DriveClient:
         self._folder_cache: dict[tuple[str, str], str] = {}
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> DriveClient:
-        client_id = (settings.google_client_id or "").strip()
-        client_secret = (settings.google_client_secret or "").strip()
-        refresh_token = (settings.google_refresh_token or "").strip()
-        if client_id and client_secret and refresh_token:
-            creds = Credentials(
-                token=None,
-                refresh_token=refresh_token,
-                token_uri="https://oauth2.googleapis.com/token",
-                client_id=client_id,
-                client_secret=client_secret,
-                scopes=DRIVE_SCOPE,
-            )
+    def from_refresh(
+        cls,
+        *,
+        client_id: str,
+        client_secret: str,
+        refresh_token: str,
+        access_token: str | None = None,
+    ) -> DriveClient:
+        creds = Credentials(
+            token=access_token,
+            refresh_token=refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=client_id,
+            client_secret=client_secret or None,
+            scopes=DRIVE_SCOPE,
+        )
+        if not creds.token or creds.expired:
             try:
                 creds.refresh(Request())
             except RefreshError as exc:
                 raise DriveAccessError(_INVALID_GRANT) from exc
-            email = _oauth_email(creds)
-            log.info("drive auth=oauth drive.file user=%s", email)
-            return cls(creds, email=email)
-        raise DriveAccessError(
-            "No Drive credentials. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, "
-            "GOOGLE_REFRESH_TOKEN (python -m app.drive_auth)."
-        )
+        if creds.expiry:
+            cap = datetime.now(timezone.utc) + timedelta(seconds=ACCESS_MAX_SECONDS)
+            expiry = creds.expiry
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if expiry > cap:
+                creds.expiry = cap.replace(tzinfo=None)
+        email = _oauth_email(creds)
+        log.info("drive auth=oauth drive.file user=%s", email)
+        return cls(creds, email=email)
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> DriveClient:
+        client_id = (settings.google_client_id or "").strip()
+        client_secret = (settings.google_client_secret or "").strip()
+        refresh_token = (getattr(settings, "google_refresh_token", None) or "").strip()
+        if client_id and refresh_token:
+            return cls.from_refresh(
+                client_id=client_id,
+                client_secret=client_secret,
+                refresh_token=refresh_token,
+            )
+        raise DriveAccessError("No Drive credentials for this user. Use /login.")
+
+    @classmethod
+    def for_user(cls, settings: Settings, catalog, user_id: int) -> DriveClient | None:
+        user = catalog.get_user(user_id)
+        token = (user.google_refresh_token or "").strip() if user else ""
+        if not token:
+            return None
+        client_id = (settings.google_client_id or "").strip()
+        if not client_id:
+            raise DriveAccessError("GOOGLE_CLIENT_ID missing")
+        try:
+            return cls.from_refresh(
+                client_id=client_id,
+                client_secret=(settings.google_client_secret or "").strip(),
+                refresh_token=token,
+            )
+        except DriveAccessError:
+            catalog.clear_user_google(user_id)
+            raise AppError("needs_login") from None
 
     def _wrap_http_error(self, exc: HttpError, folder_id: str | None = None) -> Exception:
         if _quota_error(exc):
@@ -164,9 +204,7 @@ class DriveClient:
         where = f" id={folder_id}" if folder_id else ""
         return DriveAccessError(
             f"Drive folder{where} not visible with drive.file scope. "
-            f"That scope only sees folders this app created. "
-            f"Run `python -m app.drive_auth` and paste the printed GDRIVE_* IDs. "
-            f"You can then move those folders into Music in the Drive UI."
+            "This app can only see folders it created after /login."
         )
 
     def assert_folders(self, folders: dict[str, str]) -> None:
@@ -646,3 +684,59 @@ class DriveClient:
         if conflicts:
             return self.replace_file(conflicts[0].id, local_file, mime_type)
         return self.create_file(local_file, parent_id, filename, mime_type)
+
+
+class DriveHub:
+    """Per-user Drive clients. Access tokens stay in process memory."""
+
+    def __init__(self, settings: Settings, catalog) -> None:
+        self.settings = settings
+        self.catalog = catalog
+        self._clients: dict[int, DriveClient] = {}
+        self._lock = threading.Lock()
+
+    def for_user(self, user_id: int) -> DriveClient | None:
+        with self._lock:
+            cached = self._clients.get(user_id)
+            if cached and cached._creds.valid:
+                expiry = cached._creds.expiry
+                if expiry is not None:
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=timezone.utc)
+                    if expiry > datetime.now(timezone.utc):
+                        return cached
+            client = DriveClient.for_user(self.settings, self.catalog, user_id)
+            if client:
+                self._clients[user_id] = client
+            else:
+                self._clients.pop(user_id, None)
+            return client
+
+    def drop(self, user_id: int) -> None:
+        with self._lock:
+            self._clients.pop(user_id, None)
+
+
+def resolve_drive(ctx, user_id: int = 0):
+    hub = getattr(ctx, "drive", None)
+    if hub is None:
+        return None
+    getter = getattr(hub, "for_user", None)
+    if callable(getter) and user_id:
+        return getter(user_id)
+    if callable(getattr(hub, "find_path", None)):
+        return hub
+    return None if callable(getter) else hub
+
+
+def user_drive_root(ctx, kind: str, user_id: int = 0) -> str:
+    if user_id:
+        user = ctx.catalog.get_user(user_id)
+        if not user:
+            return ""
+        if kind == "library":
+            return user.gdrive_folder_id or ""
+        return user.gdrive_review_folder_id or ""
+    if kind == "library":
+        return getattr(ctx.settings, "gdrive_folder_id", "") or ""
+    return getattr(ctx.settings, "gdrive_review_folder_id", "") or ""

@@ -9,6 +9,66 @@ from app.util import html_esc, unique_names
 
 BUCKETS = ("genres", "moods", "languages", "instruments")
 
+# MusicBrainz text-representation / work.language: ISO 639-1 or 639-2/3.
+ISO639_TO_LANGUAGE = {
+    "ar": "arabic",
+    "ara": "arabic",
+    "bn": "bengali",
+    "ben": "bengali",
+    "en": "english",
+    "eng": "english",
+    "fr": "french",
+    "fra": "french",
+    "fre": "french",
+    "de": "german",
+    "deu": "german",
+    "ger": "german",
+    "hi": "hindi",
+    "hin": "hindi",
+    "it": "italian",
+    "ita": "italian",
+    "ja": "japanese",
+    "jpn": "japanese",
+    "kn": "kannada",
+    "kan": "kannada",
+    "ko": "korean",
+    "kor": "korean",
+    "ml": "malayalam",
+    "mal": "malayalam",
+    "mr": "marathi",
+    "mar": "marathi",
+    "pt": "portuguese",
+    "por": "portuguese",
+    "pa": "punjabi",
+    "pan": "punjabi",
+    "pun": "punjabi",
+    "ru": "russian",
+    "rus": "russian",
+    "es": "spanish",
+    "spa": "spanish",
+    "ta": "tamil",
+    "tam": "tamil",
+    "te": "telugu",
+    "tel": "telugu",
+    "tr": "turkish",
+    "tur": "turkish",
+    "ur": "urdu",
+    "urd": "urdu",
+}
+_SKIP_ISO_LANGUAGES = {"zxx", "und", "mul"}
+_LANG_PHRASES = (
+    re.compile(r"^(?P<lang>.+?)\s+songs?$"),
+    re.compile(r"^(?P<lang>.+?)\s+music$"),
+    re.compile(r"^songs\s+in\s+(?P<lang>.+)$"),
+)
+
+
+def language_name_from_iso(code: str) -> str | None:
+    key = (code or "").strip().casefold()
+    if not key or key in _SKIP_ISO_LANGUAGES:
+        return None
+    return ISO639_TO_LANGUAGE.get(key)
+
 
 def genre_tokens(value: str) -> list[str]:
     out: list[str] = []
@@ -35,22 +95,27 @@ class GenreMapper:
         seen: set[str] = set()
         for raw in tags:
             token = self._normalize(raw)
+            bucket = self._bucket_for(token) if token else None
+            if bucket:
+                label = self._sets[bucket].get(token, token)
+                display = self._display(bucket, label)
+            else:
+                display = self.language_from_raw(raw)
+                if not display:
+                    continue
+                bucket = "languages"
+                token = display.casefold()
             if not token or token in seen:
                 continue
-            bucket = self._bucket_for(token)
-            if not bucket:
+            if display.casefold() in {x.casefold() for x in ordered[bucket]}:
+                seen.add(token)
                 continue
-            label = self._sets[bucket].get(token, token)
-            if label.casefold() in {x.casefold() for x in ordered[bucket]}:
-                continue
-            ordered[bucket].append(self._display(bucket, label))
+            ordered[bucket].append(display)
             seen.add(token)
 
         if extra_language:
-            lang = self._normalize(extra_language)
-            lang = self._alias.get(lang, lang)
-            if lang:
-                display = self._display("languages", self._sets["languages"].get(lang, extra_language))
+            display = self.language_from_raw(extra_language)
+            if display:
                 existing = {x.casefold() for x in ordered["languages"]}
                 if display.casefold() not in existing:
                     ordered["languages"].append(display)
@@ -145,12 +210,40 @@ class GenreMapper:
         label = self._sets[bucket].get(token, token)
         return self._display(bucket, label)
 
-    def language_from_topic(self, topic: str) -> str | None:
-        token = self._normalize(topic)
-        if not token or self._bucket_for(token) != "languages":
+    def language_from_raw(self, raw: str) -> str | None:
+        token = self._normalize(raw)
+        if token and self._bucket_for(token) == "languages":
+            label = self._sets["languages"].get(token, token)
+            return self._display("languages", label)
+        text = " ".join((raw or "").strip().casefold().split())
+        if not text:
             return None
-        label = self._sets["languages"].get(token, token)
-        return self._display("languages", label)
+        for pattern in _LANG_PHRASES:
+            match = pattern.match(text)
+            if not match:
+                continue
+            inner = self._normalize(match.group("lang"))
+            if inner and self._bucket_for(inner) == "languages":
+                label = self._sets["languages"].get(inner, inner)
+                return self._display("languages", label)
+        return None
+
+    def language_from_topic(self, topic: str) -> str | None:
+        return self.language_from_raw(topic)
+
+    def languages_from_tags(self, tags: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in tags:
+            label = self.language_from_raw(raw)
+            if not label:
+                continue
+            key = label.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(label)
+        return out
 
     def extract_query_tokens(self, text: str) -> tuple[list[str], str]:
         remaining = " ".join((text or "").split())

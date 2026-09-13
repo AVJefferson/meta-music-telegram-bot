@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from app.membership import is_forum_member
+from app.membership import allow_from_callback, allow_user, touch, user_is_bot
 from app.models import Ctx, TrackRecord
 from app.queue import tag_preview
 from app.relocate import hydrate_track_tags, identity_from_track, metrics_from_track, read_tags_for_card
@@ -76,15 +76,19 @@ def _loads_report(track: TrackRecord) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-async def _sync_drive_review(ctx: Ctx) -> None:
+async def _sync_drive_review(ctx: Ctx, user_id: int) -> None:
+    from app.drive import resolve_drive, user_drive_root
+
+    folder = user_drive_root(ctx, "review", user_id)
+    drive = resolve_drive(ctx, user_id)
+    if not folder or drive is None or not callable(getattr(drive, "list_review_items", None)):
+        return
     try:
-        items = await asyncio.to_thread(
-            ctx.drive.list_review_items, ctx.settings.gdrive_review_folder_id
-        )
+        items = await asyncio.to_thread(drive.list_review_items, folder)
     except Exception:
         log.exception("Drive review listing failed")
         return
-    known = {track.drive_file_id for track in ctx.catalog.list_review_tracks() if track.drive_file_id}
+    known = {track.drive_file_id for track in ctx.catalog.list_review_tracks(user_id) if track.drive_file_id}
     for item in items:
         if item.file_id in known:
             continue
@@ -104,15 +108,14 @@ async def _sync_drive_review(ctx: Ctx) -> None:
             file_name=item.name,
             drive_file_id=item.file_id,
             drive_sidecar_id=item.sidecar_id,
+            user_id=user_id,
         )
 
 
 async def _authorized(message: Message, ctx: Ctx) -> bool:
-    if not message.from_user:
+    if not message.from_user or user_is_bot(message.from_user, ctx.bot):
         return False
-    if message.chat.type != "private" and message.chat.id != ctx.settings.allowed_chat_id:
-        return False
-    return await is_forum_member(ctx, message.from_user.id)
+    return await allow_user(ctx, message.from_user.id, message.chat)
 
 
 def _not_modified(exc: BaseException) -> bool:
@@ -149,9 +152,9 @@ async def _deliver_list(message: Message, text: str, markup=None, *, edit: bool 
         log.warning("review list send failed: %s", exc)
 
 
-async def _show_list(message: Message, ctx: Ctx, page: int = 0, *, edit: bool = False) -> None:
-    await _sync_drive_review(ctx)
-    items = ctx.catalog.list_review_tracks()
+async def _show_list(message: Message, ctx: Ctx, page: int = 0, *, edit: bool = False, user_id: int = 0) -> None:
+    await _sync_drive_review(ctx, user_id)
+    items = ctx.catalog.list_review_tracks(user_id or None)
     if not items:
         await _deliver_list(message, "Review queue is empty.", edit=edit)
         return
@@ -179,13 +182,25 @@ def build_review_command_router() -> Router:
     async def review_cmd(message: Message, ctx: Ctx) -> None:
         if not await _authorized(message, ctx):
             if message.chat.type == "private":
-                await message.reply("Private access requires current membership in configured forum group.")
+                await message.reply("Private access requires membership in a known group.")
             return
-        await _show_list(message, ctx)
+        touch(ctx, message.from_user.id)
+        from app.ephemeral import send_private
+        from app.user_cmd import _web_or_url_keyboard
+
+        kb = _web_or_url_keyboard(ctx, "review", None, "Open review")
+        await send_private(
+            ctx,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+            text="Your review folder. Mini App if available, or pick below.",
+            reply_markup=kb,
+        )
+        await _show_list(message, ctx, user_id=message.from_user.id)
 
     @router.callback_query(F.data.regexp(r"^rvp:\d+$"))
     async def review_page(callback: CallbackQuery, ctx: Ctx) -> None:
-        if not callback.from_user or not await is_forum_member(ctx, callback.from_user.id):
+        if not await allow_from_callback(ctx, callback):
             await callback.answer("Access denied.", show_alert=True)
             return
         if not callback.message:
@@ -194,13 +209,13 @@ def build_review_command_router() -> Router:
         page = int((callback.data or "rvp:0").split(":", 1)[1])
         await callback.answer()
         try:
-            await _show_list(callback.message, ctx, page, edit=True)
+            await _show_list(callback.message, ctx, page, edit=True, user_id=callback.from_user.id)
         except Exception:
             log.exception("review page failed")
 
     @router.callback_query(F.data.regexp(r"^rvt:\d+$"))
     async def review_pick(callback: CallbackQuery, ctx: Ctx) -> None:
-        if not callback.from_user or not await is_forum_member(ctx, callback.from_user.id):
+        if not await allow_from_callback(ctx, callback):
             await callback.answer("Access denied.", show_alert=True)
             return
         if not callback.message:
@@ -208,7 +223,12 @@ def build_review_command_router() -> Router:
             return
         track_id = int((callback.data or "rvt:0").split(":", 1)[1])
         track = ctx.catalog.get_track(track_id)
-        if track is None or track.kind != "review" or track.status == "deleted":
+        if (
+            track is None
+            or track.kind != "review"
+            or track.status == "deleted"
+            or getattr(track, "user_id", 0) != callback.from_user.id
+        ):
             await callback.answer("Gone from review.", show_alert=True)
             return
         await callback.answer()

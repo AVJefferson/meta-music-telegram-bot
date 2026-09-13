@@ -25,6 +25,7 @@ def merge_enrichment(report: dict[str, Any], enrichment: Enrichment) -> dict[str
     out = dict(report)
     out["itunes"] = dict(enrichment.itunes_report or {})
     out["lastfm_tags"] = list(enrichment.lastfm_tags or [])
+    out["languages"] = list(enrichment.languages or [])
     out["cover_source"] = enrichment.cover_source or "none"
     out["coverartarchive"] = {
         "used": enrichment.cover_source == "caa",

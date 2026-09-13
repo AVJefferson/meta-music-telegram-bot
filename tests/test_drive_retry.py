@@ -86,8 +86,8 @@ class FromSettingsAuthTests(unittest.TestCase):
             creds.refresh.side_effect = RefreshError("invalid_grant: Bad Request")
             with self.assertRaises(DriveAccessError) as ctx:
                 DriveClient.from_settings(settings)
-        self.assertIn("drive_auth", str(ctx.exception))
-        self.assertIn("GOOGLE_REFRESH_TOKEN", str(ctx.exception))
+        self.assertIn("/login", str(ctx.exception))
+        self.assertNotIn("GOOGLE_REFRESH_TOKEN", str(ctx.exception))
 
     def test_missing_credentials(self) -> None:
         settings = SimpleNamespace(

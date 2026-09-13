@@ -567,7 +567,7 @@ async def show_cover_prompt(ctx: Ctx, row: PendingReview) -> None:
     identity = identity_from_dict(_loads(row.identity_json, {}))
     try:
         options = await list_edit_cover_candidates(
-            ctx, identity, tags, row.topic_name or "General", file_cover
+            ctx, identity, tags, row.topic_name or "Unknown", file_cover
         )
     except Exception:
         log.exception("edit cover fetch failed id=%s", row.id)
@@ -757,7 +757,7 @@ def row_is_editing(row: PendingReview) -> bool:
 
 
 async def handle_edit_callback(callback, ctx: Ctx) -> None:
-    from app.membership import is_forum_member
+    from app.membership import allow_from_callback
     from app.queue import cancel_pending
 
     action = parse_edit_callback(callback.data)
@@ -771,8 +771,11 @@ async def handle_edit_callback(callback, ctx: Ctx) -> None:
     if callback.message and callback.message.chat.id != row.chat_id:
         await callback.answer()
         return
-    if not callback.from_user or not await is_forum_member(ctx, callback.from_user.id):
+    if not await allow_from_callback(ctx, callback):
         await callback.answer("Access denied.", show_alert=True)
+        return
+    if row.user_id and callback.from_user.id != row.user_id:
+        await callback.answer("Not your prompt.", show_alert=True)
         return
     if action.op in {
         "done",
@@ -879,7 +882,7 @@ async def handle_edit_callback(callback, ctx: Ctx) -> None:
 
 
 async def handle_edit_text(message, ctx: Ctx) -> bool:
-    from app.membership import is_forum_member
+    from app.membership import allow_user
 
     if not message.text or message.text.startswith("/"):
         return False
@@ -893,7 +896,9 @@ async def handle_edit_text(message, ctx: Ctx) -> bool:
     field = current_edit_field(row)
     if field is None:
         return False
-    if not message.from_user or not await is_forum_member(ctx, message.from_user.id):
+    if not message.from_user or not await allow_user(ctx, message.from_user.id, message.chat):
+        return False
+    if row.user_id and message.from_user.id != row.user_id:
         return False
     if message.chat.type != "private" and not message.reply_to_message:
         return False
@@ -945,7 +950,7 @@ def build_edit_router() -> Router:
         from io import BytesIO
 
         from app.botapi import discard_download
-        from app.membership import is_forum_member
+        from app.membership import allow_user
         from app.private_ui import _store_manual_cover
 
         if message.chat.type == "private":
@@ -955,7 +960,9 @@ def build_edit_router() -> Router:
             row = ctx.catalog.get_pending_by_message(message.chat.id, message.reply_to_message.message_id)
         if row is None or not row_is_editing(row):
             raise SkipHandler()
-        if not message.from_user or not await is_forum_member(ctx, message.from_user.id):
+        if not message.from_user or not await allow_user(ctx, message.from_user.id, message.chat):
+            raise SkipHandler()
+        if row.user_id and message.from_user.id != row.user_id:
             raise SkipHandler()
         media = message.photo[-1] if message.photo else message.document
         if not media or (message.document and not (message.document.mime_type or "").startswith("image/")):

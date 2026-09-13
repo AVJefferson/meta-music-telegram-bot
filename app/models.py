@@ -67,6 +67,7 @@ class Enrichment:
     caa_release: str | None = None
     itunes_report: dict[str, Any] = field(default_factory=dict)
     lastfm_tags: list[str] = field(default_factory=list)
+    languages: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -96,6 +97,10 @@ class Job:
     source_pending_id: int | None = None
     fallback_send: bool = True
     source_message_id: int = 0
+    user_id: int = 0
+    public_message_id: int = 0
+    drive_dest: str = ""
+    correct_telegram: bool = False
 
 
 @dataclass
@@ -108,6 +113,7 @@ class Ctx:
     bot: Any
     mb: Any
     jobs: Any = None
+    index_user_id: int = 0
 
 
 @dataclass
@@ -141,6 +147,9 @@ class TrackRecord:
     thread_id: int | None = None
     source_chat_id: int | None = None
     source_message_id: int | None = None
+    user_id: int = 0
+    last_editor_user_id: int | None = None
+    audio_sha256: str | None = None
 
     @property
     def local(self) -> Path | None:
@@ -178,6 +187,35 @@ class PendingReview:
     created_at: str
     expires_at: str
     source_message_id: int | None = None
+    user_id: int = 0
+    public_message_id: int | None = None
+
+
+@dataclass
+class UserRecord:
+    telegram_user_id: int
+    first_seen_at: str
+    last_active_at: str
+    songs_edited: int = 0
+    google_refresh_token: str | None = None
+    google_email: str | None = None
+    gdrive_folder_id: str | None = None
+    gdrive_review_folder_id: str | None = None
+    settings_json: str = "{}"
+
+    @property
+    def logged_in(self) -> bool:
+        return bool((self.google_refresh_token or "").strip())
+
+
+@dataclass
+class ChatRecord:
+    chat_id: int
+    type: str
+    title: str
+    active: bool
+    added_at: str
+    last_active_at: str
 
 
 @dataclass

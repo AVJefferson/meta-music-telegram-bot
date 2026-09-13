@@ -24,7 +24,7 @@ from app.private_ui import (
     _topic_keyboard,
 )
 from app.queue import _delete_promoted_review_source, recover_interrupted
-from app.review_ui import conflict_keyboard, cover_keyboard, parse_callback, review_keyboard
+from app.review_ui import conflict_keyboard, cover_keyboard, dest_keyboard, parse_callback, review_keyboard
 
 
 class CatalogSessionTests(unittest.TestCase):
@@ -280,6 +280,30 @@ class UiTests(unittest.TestCase):
         self.assertIsNotNone(action)
         assert action is not None
         self.assertEqual(action.op, "cancel")
+
+    def test_dest_callbacks_are_opaque_pending_ids(self) -> None:
+        markup = dest_keyboard(4, "library", False)
+        data = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+        self.assertEqual(parse_callback("p4:dl").op, "dest_library")
+        self.assertEqual(parse_callback("p4:dv").op, "dest_review")
+        self.assertEqual(parse_callback("p4:dn").op, "dest_none")
+        self.assertEqual(parse_callback("p4:dt").op, "dest_telegram")
+        self.assertTrue(all(item.startswith("p4:") for item in data if item))
+        self.assertFalse(any("drive" in (item or "") for item in data))
+
+    def test_language_callback(self) -> None:
+        from app.review_ui import language_keyboard
+
+        markup = language_keyboard(4, ["Malayalam", "Tamil"])
+        data = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+        action = parse_callback("p4:lg:tamil")
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action.op, "lang")
+        self.assertEqual(action.field, "tamil")
+        self.assertIn("p4:lg:malayalam", data)
+        self.assertIn("p4:lg:tamil", data)
+        self.assertIn("p4:cancel", data)
 
     def test_cover_keyboard_back_only_from_review(self) -> None:
         plain = cover_keyboard(2, [{"label": "file"}])

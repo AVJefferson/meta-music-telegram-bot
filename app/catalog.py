@@ -5,7 +5,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from app.models import PendingReview, SuggestSession, TrackRecord
+from app.models import ChatRecord, PendingReview, SuggestSession, TrackRecord, UserRecord
 
 GENERAL_TOPIC_THREAD_ID = 1
 GENERAL_TOPIC_NAME = "General"
@@ -70,6 +70,9 @@ def _row_to_track(row: sqlite3.Row) -> TrackRecord:
         thread_id=_row_get(row, "thread_id"),
         source_chat_id=_row_get(row, "source_chat_id"),
         source_message_id=_row_get(row, "source_message_id"),
+        user_id=int(_row_get(row, "user_id") or 0),
+        last_editor_user_id=_row_get(row, "last_editor_user_id"),
+        audio_sha256=_row_get(row, "audio_sha256"),
     )
 
 
@@ -104,6 +107,8 @@ def _row_to_pending(row: sqlite3.Row) -> PendingReview:
         created_at=row["created_at"],
         expires_at=row["expires_at"],
         source_message_id=_row_get(row, "source_message_id"),
+        user_id=int(_row_get(row, "user_id") or 0),
+        public_message_id=_row_get(row, "public_message_id"),
     )
 
 
@@ -230,6 +235,69 @@ class Catalog:
                   drive_file_id TEXT,
                   payload_sha TEXT
                 );
+                CREATE TABLE IF NOT EXISTS user_library_index (
+                  user_id INTEGER PRIMARY KEY,
+                  payload_json TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  drive_file_id TEXT,
+                  payload_sha TEXT
+                );
+                CREATE TABLE IF NOT EXISTS users (
+                  telegram_user_id INTEGER PRIMARY KEY,
+                  first_seen_at TEXT NOT NULL,
+                  last_active_at TEXT NOT NULL,
+                  songs_edited INTEGER NOT NULL DEFAULT 0,
+                  google_refresh_token TEXT,
+                  google_email TEXT,
+                  gdrive_folder_id TEXT,
+                  gdrive_review_folder_id TEXT,
+                  settings_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE TABLE IF NOT EXISTS chats (
+                  chat_id INTEGER PRIMARY KEY,
+                  type TEXT NOT NULL DEFAULT '',
+                  title TEXT NOT NULL DEFAULT '',
+                  active INTEGER NOT NULL DEFAULT 1,
+                  added_at TEXT NOT NULL,
+                  last_active_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS blacklist_users (
+                  telegram_user_id INTEGER PRIMARY KEY,
+                  created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS blacklist_chats (
+                  chat_id INTEGER PRIMARY KEY,
+                  created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS oauth_tickets (
+                  token TEXT PRIMARY KEY,
+                  telegram_user_id INTEGER NOT NULL,
+                  expires_at TEXT NOT NULL,
+                  used INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS oauth_states (
+                  state TEXT PRIMARY KEY,
+                  telegram_user_id INTEGER NOT NULL,
+                  code_verifier TEXT NOT NULL,
+                  expires_at TEXT NOT NULL,
+                  used INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS cached_files (
+                  sha256 TEXT PRIMARY KEY,
+                  path TEXT NOT NULL,
+                  size INTEGER,
+                  created_at TEXT NOT NULL,
+                  last_used_at TEXT NOT NULL,
+                  refcount INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS hifi_picks (
+                  pick_id TEXT PRIMARY KEY,
+                  user_id INTEGER NOT NULL,
+                  session_id TEXT NOT NULL,
+                  hifi_callback TEXT NOT NULL,
+                  label TEXT NOT NULL DEFAULT '',
+                  expires_at TEXT NOT NULL
+                );
                 """
             )
             pending_columns = {
@@ -262,6 +330,18 @@ class Catalog:
                     self._conn.execute(f"ALTER TABLE tracks ADD COLUMN {name} INTEGER")
             if "source_message_id" not in pending_columns:
                 self._conn.execute("ALTER TABLE pending_reviews ADD COLUMN source_message_id INTEGER")
+            if "user_id" not in pending_columns:
+                self._conn.execute(
+                    "ALTER TABLE pending_reviews ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0"
+                )
+            if "public_message_id" not in pending_columns:
+                self._conn.execute("ALTER TABLE pending_reviews ADD COLUMN public_message_id INTEGER")
+            if "user_id" not in track_columns:
+                self._conn.execute("ALTER TABLE tracks ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
+            if "last_editor_user_id" not in track_columns:
+                self._conn.execute("ALTER TABLE tracks ADD COLUMN last_editor_user_id INTEGER")
+            if "audio_sha256" not in track_columns:
+                self._conn.execute("ALTER TABLE tracks ADD COLUMN audio_sha256 TEXT")
             index_columns = {
                 row["name"]
                 for row in self._conn.execute("PRAGMA table_info(library_tag_index)").fetchall()
@@ -269,6 +349,12 @@ class Catalog:
             for name in ("drive_file_id", "payload_sha"):
                 if name not in index_columns:
                     self._conn.execute(f"ALTER TABLE library_tag_index ADD COLUMN {name} TEXT")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tracks_user ON tracks(user_id, kind, status)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tracks_user_mb ON tracks(user_id, mb_recording_id)"
+            )
             self._conn.commit()
 
     def upsert_topic(self, thread_id: int, name: str) -> None:
@@ -304,14 +390,24 @@ class Catalog:
             if not is_general_topic(thread_id, name)
         ]
 
-    def find_library_by_mbid(self, mb_recording_id: str) -> TrackRecord | None:
+    def find_library_by_mbid(
+        self, mb_recording_id: str, user_id: int | None = None
+    ) -> TrackRecord | None:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM tracks WHERE mb_recording_id=? AND kind='library' "
-                "AND status IN ('uploaded', 'pending', 'failed', 'awaiting_drive') "
-                "ORDER BY (status='uploaded') DESC, id DESC LIMIT 1",
-                (mb_recording_id,),
-            ).fetchone()
+            if user_id is None:
+                row = self._conn.execute(
+                    "SELECT * FROM tracks WHERE mb_recording_id=? AND kind='library' "
+                    "AND status IN ('uploaded', 'pending', 'failed', 'awaiting_drive') "
+                    "ORDER BY (status='uploaded') DESC, id DESC LIMIT 1",
+                    (mb_recording_id,),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT * FROM tracks WHERE mb_recording_id=? AND kind='library' AND user_id=? "
+                    "AND status IN ('uploaded', 'pending', 'failed', 'awaiting_drive') "
+                    "ORDER BY (status='uploaded') DESC, id DESC LIMIT 1",
+                    (mb_recording_id, user_id),
+                ).fetchone()
         return _row_to_track(row) if row else None
 
     def insert_pending(
@@ -339,6 +435,9 @@ class Catalog:
         drive_url: str | None = None,
         drive_sidecar_id: str | None = None,
         drive_log_id: str | None = None,
+        user_id: int = 0,
+        last_editor_user_id: int | None = None,
+        audio_sha256: str | None = None,
     ) -> int:
         with self._lock:
             cur = self._conn.execute(
@@ -348,8 +447,8 @@ class Catalog:
                     relative_path, status, bit_depth, sample_rate, title, artist, album,
                     created_at, telegram_file_id, source_report_json, tags_json,
                     identity_json, topic_name, file_name, drive_file_id, drive_url,
-                    drive_sidecar_id, drive_log_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    drive_sidecar_id, drive_log_id, user_id, last_editor_user_id, audio_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     mb_recording_id,
@@ -375,6 +474,9 @@ class Catalog:
                     drive_url,
                     drive_sidecar_id,
                     drive_log_id,
+                    user_id,
+                    last_editor_user_id,
+                    audio_sha256,
                 ),
             )
             self._conn.commit()
@@ -428,13 +530,22 @@ class Catalog:
             )
             self._conn.commit()
 
-    def find_uploaded_by_relative(self, relative_path: str) -> TrackRecord | None:
+    def find_uploaded_by_relative(
+        self, relative_path: str, user_id: int | None = None
+    ) -> TrackRecord | None:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM tracks WHERE relative_path=? AND status='uploaded' "
-                "ORDER BY id DESC LIMIT 1",
-                (relative_path,),
-            ).fetchone()
+            if user_id is None:
+                row = self._conn.execute(
+                    "SELECT * FROM tracks WHERE relative_path=? AND status='uploaded' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (relative_path,),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT * FROM tracks WHERE relative_path=? AND status='uploaded' AND user_id=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (relative_path, user_id),
+                ).fetchone()
         return _row_to_track(row) if row else None
 
     def update_track_paths(
@@ -498,6 +609,8 @@ class Catalog:
         telegram_file_id: str | None = None,
         source_message_id: int | None = None,
         expires_at: str,
+        user_id: int = 0,
+        public_message_id: int | None = None,
     ) -> int:
         with self._lock:
             if chat_id > 0 and track_id is None:
@@ -517,9 +630,9 @@ class Catalog:
                     chat_id, thread_id, status_message_id, topic_name, file_name,
                     track_id, replace_id, old_drive_id, source_drive_file_id,
                     source_drive_sidecar_id, telegram_file_id, source_message_id,
-                    created_at, expires_at
+                    created_at, expires_at, user_id, public_message_id
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -551,6 +664,8 @@ class Catalog:
                     source_message_id,
                     _utc_now(),
                     expires_at,
+                    user_id,
+                    public_message_id,
                 ),
             )
             self._conn.commit()
@@ -597,6 +712,8 @@ class Catalog:
             "thread_id",
             "file_name",
             "expires_at",
+            "user_id",
+            "public_message_id",
         }
         cols = []
         values = []
@@ -742,13 +859,21 @@ class Catalog:
             ).fetchone()
         return _row_to_track(row) if row else None
 
-    def list_review_tracks(self) -> list[TrackRecord]:
+    def list_review_tracks(self, user_id: int | None = None) -> list[TrackRecord]:
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM tracks WHERE kind='review' "
-                "AND status IN ('uploaded', 'pending', 'failed') "
-                "ORDER BY id DESC"
-            ).fetchall()
+            if user_id is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM tracks WHERE kind='review' "
+                    "AND status IN ('uploaded', 'pending', 'failed') "
+                    "ORDER BY id DESC"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM tracks WHERE kind='review' AND user_id=? "
+                    "AND status IN ('uploaded', 'pending', 'failed') "
+                    "ORDER BY id DESC",
+                    (user_id,),
+                ).fetchall()
         return [_row_to_track(row) for row in rows]
 
     def update_track(self, track_id: int, **fields: object) -> None:
@@ -781,6 +906,9 @@ class Catalog:
             "acoustid",
             "source_chat_id",
             "source_message_id",
+            "user_id",
+            "last_editor_user_id",
+            "audio_sha256",
         }
         cols = []
         values = []
@@ -841,22 +969,39 @@ class Catalog:
             ).fetchone()
         return _row_to_pending(row) if row else None
 
-    def get_waiting_for_track(self, track_id: int) -> PendingReview | None:
+    def get_waiting_for_track(
+        self, track_id: int, user_id: int | None = None
+    ) -> PendingReview | None:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM pending_reviews WHERE track_id=? AND status='waiting' "
-                "ORDER BY id DESC LIMIT 1",
-                (track_id,),
-            ).fetchone()
+            if user_id is None:
+                row = self._conn.execute(
+                    "SELECT * FROM pending_reviews WHERE track_id=? AND status='waiting' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (track_id,),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT * FROM pending_reviews WHERE track_id=? AND user_id=? AND status='waiting' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (track_id, user_id),
+                ).fetchone()
         return _row_to_pending(row) if row else None
 
-    def list_library_tracks(self) -> list[TrackRecord]:
+    def list_library_tracks(self, user_id: int | None = None) -> list[TrackRecord]:
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM tracks WHERE kind='library' "
-                "AND status IN ('uploaded', 'pending', 'failed', 'awaiting_drive') "
-                "ORDER BY id DESC"
-            ).fetchall()
+            if user_id is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM tracks WHERE kind='library' "
+                    "AND status IN ('uploaded', 'pending', 'failed', 'awaiting_drive') "
+                    "ORDER BY id DESC"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM tracks WHERE kind='library' AND user_id=? "
+                    "AND status IN ('uploaded', 'pending', 'failed', 'awaiting_drive') "
+                    "ORDER BY id DESC",
+                    (user_id,),
+                ).fetchall()
         return [_row_to_track(row) for row in rows]
 
     def list_owned_tracks(self) -> list[TrackRecord]:
@@ -968,11 +1113,20 @@ class Catalog:
         payload, _drive_id, _sha = self.get_library_tag_index_meta()
         return payload
 
-    def get_library_tag_index_meta(self) -> tuple[str | None, str | None, str | None]:
+    def get_library_tag_index_meta(
+        self, user_id: int = 0
+    ) -> tuple[str | None, str | None, str | None]:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT payload_json, drive_file_id, payload_sha FROM library_tag_index WHERE id=1"
-            ).fetchone()
+            if user_id:
+                row = self._conn.execute(
+                    "SELECT payload_json, drive_file_id, payload_sha FROM user_library_index "
+                    "WHERE user_id=?",
+                    (user_id,),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT payload_json, drive_file_id, payload_sha FROM library_tag_index WHERE id=1"
+                ).fetchone()
         if not row:
             return None, None, None
         payload = str(row["payload_json"]) if row["payload_json"] else None
@@ -986,18 +1140,467 @@ class Catalog:
         *,
         drive_file_id: str | None = None,
         payload_sha: str | None = None,
+        user_id: int = 0,
+    ) -> None:
+        with self._lock:
+            if user_id:
+                self._conn.execute(
+                    "INSERT INTO user_library_index(user_id, payload_json, updated_at, drive_file_id, payload_sha) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET payload_json=excluded.payload_json, "
+                    "updated_at=excluded.updated_at, "
+                    "drive_file_id=COALESCE(excluded.drive_file_id, user_library_index.drive_file_id), "
+                    "payload_sha=COALESCE(excluded.payload_sha, user_library_index.payload_sha)",
+                    (user_id, payload_json, _utc_now(), drive_file_id, payload_sha),
+                )
+            else:
+                self._conn.execute(
+                    "INSERT INTO library_tag_index(id, payload_json, updated_at, drive_file_id, payload_sha) "
+                    "VALUES (1, ?, ?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json, "
+                    "updated_at=excluded.updated_at, "
+                    "drive_file_id=COALESCE(excluded.drive_file_id, library_tag_index.drive_file_id), "
+                    "payload_sha=COALESCE(excluded.payload_sha, library_tag_index.payload_sha)",
+                    (payload_json, _utc_now(), drive_file_id, payload_sha),
+                )
+            self._conn.commit()
+
+    def _row_to_user(self, row: sqlite3.Row) -> UserRecord:
+        return UserRecord(
+            telegram_user_id=int(row["telegram_user_id"]),
+            first_seen_at=str(row["first_seen_at"]),
+            last_active_at=str(row["last_active_at"]),
+            songs_edited=int(row["songs_edited"] or 0),
+            google_refresh_token=row["google_refresh_token"],
+            google_email=row["google_email"],
+            gdrive_folder_id=row["gdrive_folder_id"],
+            gdrive_review_folder_id=row["gdrive_review_folder_id"],
+            settings_json=str(row["settings_json"] or "{}"),
+        )
+
+    def ensure_user(self, telegram_user_id: int) -> UserRecord:
+        now = _utc_now()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO users(telegram_user_id, first_seen_at, last_active_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(telegram_user_id) DO NOTHING",
+                (telegram_user_id, now, now),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM users WHERE telegram_user_id=?", (telegram_user_id,)
+            ).fetchone()
+        return self._row_to_user(row)
+
+    def get_user(self, telegram_user_id: int) -> UserRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM users WHERE telegram_user_id=?", (telegram_user_id,)
+            ).fetchone()
+        return self._row_to_user(row) if row else None
+
+    def touch_user(self, telegram_user_id: int) -> UserRecord:
+        user = self.ensure_user(telegram_user_id)
+        now = _utc_now()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET last_active_at=? WHERE telegram_user_id=?",
+                (now, telegram_user_id),
+            )
+            self._conn.commit()
+        return UserRecord(
+            telegram_user_id=user.telegram_user_id,
+            first_seen_at=user.first_seen_at,
+            last_active_at=now,
+            songs_edited=user.songs_edited,
+            google_refresh_token=user.google_refresh_token,
+            google_email=user.google_email,
+            gdrive_folder_id=user.gdrive_folder_id,
+            gdrive_review_folder_id=user.gdrive_review_folder_id,
+            settings_json=user.settings_json,
+        )
+
+    def increment_songs_edited(self, telegram_user_id: int) -> None:
+        self.ensure_user(telegram_user_id)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET songs_edited=songs_edited+1, last_active_at=? "
+                "WHERE telegram_user_id=?",
+                (_utc_now(), telegram_user_id),
+            )
+            self._conn.commit()
+
+    def update_user(self, telegram_user_id: int, **fields: object) -> None:
+        allowed = {
+            "google_refresh_token",
+            "google_email",
+            "gdrive_folder_id",
+            "gdrive_review_folder_id",
+            "settings_json",
+            "songs_edited",
+            "last_active_at",
+        }
+        cols = []
+        values = []
+        for key, value in fields.items():
+            if key not in allowed:
+                raise ValueError(f"unknown user field {key}")
+            cols.append(f"{key}=?")
+            values.append(value)
+        if not cols:
+            return
+        values.append(telegram_user_id)
+        self.ensure_user(telegram_user_id)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE users SET {', '.join(cols)} WHERE telegram_user_id=?",
+                values,
+            )
+            self._conn.commit()
+
+    def clear_user_google(self, telegram_user_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET google_refresh_token=NULL, google_email=NULL, "
+                "gdrive_folder_id=NULL, gdrive_review_folder_id=NULL WHERE telegram_user_id=?",
+                (telegram_user_id,),
+            )
+            self._conn.commit()
+
+    def list_active_users(self, since_iso: str) -> list[UserRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM users WHERE last_active_at>=? ORDER BY last_active_at DESC",
+                (since_iso,),
+            ).fetchall()
+        return [self._row_to_user(row) for row in rows]
+
+    def list_inactive_users(self, before_iso: str) -> list[UserRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM users WHERE last_active_at<? ORDER BY last_active_at",
+                (before_iso,),
+            ).fetchall()
+        return [self._row_to_user(row) for row in rows]
+
+    def forget_user(self, telegram_user_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET google_refresh_token=NULL, google_email=NULL, "
+                "gdrive_folder_id=NULL, gdrive_review_folder_id=NULL, settings_json='{}' "
+                "WHERE telegram_user_id=?",
+                (telegram_user_id,),
+            )
+            self._conn.execute(
+                "DELETE FROM user_library_index WHERE user_id=?", (telegram_user_id,)
+            )
+            self._conn.execute(
+                "DELETE FROM oauth_tickets WHERE telegram_user_id=?", (telegram_user_id,)
+            )
+            self._conn.execute(
+                "DELETE FROM oauth_states WHERE telegram_user_id=?", (telegram_user_id,)
+            )
+            self._conn.execute("DELETE FROM hifi_picks WHERE user_id=?", (telegram_user_id,))
+            self._conn.commit()
+
+    def delete_user_tracks(self, telegram_user_id: int) -> list[TrackRecord]:
+        rows = self.list_user_tracks(telegram_user_id)
+        with self._lock:
+            self._conn.execute("DELETE FROM tracks WHERE user_id=?", (telegram_user_id,))
+            self._conn.commit()
+        return rows
+
+    def list_user_tracks(self, telegram_user_id: int) -> list[TrackRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tracks WHERE user_id=? ORDER BY id",
+                (telegram_user_id,),
+            ).fetchall()
+        return [_row_to_track(row) for row in rows]
+
+    def find_user_track_by_mbid(
+        self, user_id: int, mb_recording_id: str, kind: str | None = None
+    ) -> TrackRecord | None:
+        sql = (
+            "SELECT * FROM tracks WHERE user_id=? AND mb_recording_id=? "
+            "AND status NOT IN ('deleted', 'skipped') "
+        )
+        args: list[object] = [user_id, mb_recording_id]
+        if kind:
+            sql += "AND kind=? "
+            args.append(kind)
+        sql += "ORDER BY (kind='library') DESC, id DESC LIMIT 1"
+        with self._lock:
+            row = self._conn.execute(sql, args).fetchone()
+        return _row_to_track(row) if row else None
+
+    def find_user_track_by_sha(self, user_id: int, sha256: str) -> TrackRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM tracks WHERE user_id=? AND audio_sha256=? "
+                "AND status NOT IN ('deleted', 'skipped') ORDER BY id DESC LIMIT 1",
+                (user_id, sha256),
+            ).fetchone()
+        return _row_to_track(row) if row else None
+
+    def upsert_chat(
+        self,
+        chat_id: int,
+        *,
+        type: str = "",
+        title: str = "",
+        active: bool = True,
+    ) -> None:
+        now = _utc_now()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO chats(chat_id, type, title, active, added_at, last_active_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET "
+                "type=CASE WHEN excluded.type='' THEN chats.type ELSE excluded.type END, "
+                "title=CASE WHEN excluded.title='' THEN chats.title ELSE excluded.title END, "
+                "active=excluded.active, last_active_at=excluded.last_active_at",
+                (chat_id, type, title, 1 if active else 0, now, now),
+            )
+            self._conn.commit()
+
+    def get_chat(self, chat_id: int) -> ChatRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM chats WHERE chat_id=?", (chat_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return ChatRecord(
+            chat_id=int(row["chat_id"]),
+            type=str(row["type"] or ""),
+            title=str(row["title"] or ""),
+            active=bool(row["active"]),
+            added_at=str(row["added_at"]),
+            last_active_at=str(row["last_active_at"]),
+        )
+
+    def list_chats(self, types: tuple[str, ...] | None = None) -> list[ChatRecord]:
+        with self._lock:
+            if types:
+                placeholders = ",".join("?" for _ in types)
+                rows = self._conn.execute(
+                    f"SELECT * FROM chats WHERE type IN ({placeholders}) ORDER BY title",
+                    types,
+                ).fetchall()
+            else:
+                rows = self._conn.execute("SELECT * FROM chats ORDER BY title").fetchall()
+        return [
+            ChatRecord(
+                chat_id=int(row["chat_id"]),
+                type=str(row["type"] or ""),
+                title=str(row["title"] or ""),
+                active=bool(row["active"]),
+                added_at=str(row["added_at"]),
+                last_active_at=str(row["last_active_at"]),
+            )
+            for row in rows
+        ]
+
+    def list_known_chat_ids(self) -> list[int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT chat_id FROM chats WHERE active=1"
+            ).fetchall()
+        return [int(row["chat_id"]) for row in rows]
+
+    def is_user_blacklisted(self, telegram_user_id: int) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM blacklist_users WHERE telegram_user_id=?",
+                (telegram_user_id,),
+            ).fetchone()
+        return row is not None
+
+    def is_chat_blacklisted(self, chat_id: int) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM blacklist_chats WHERE chat_id=?", (chat_id,)
+            ).fetchone()
+        return row is not None
+
+    def blacklist_user(self, telegram_user_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO blacklist_users(telegram_user_id, created_at) VALUES (?, ?) "
+                "ON CONFLICT(telegram_user_id) DO NOTHING",
+                (telegram_user_id, _utc_now()),
+            )
+            self._conn.commit()
+
+    def unblacklist_user(self, telegram_user_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM blacklist_users WHERE telegram_user_id=?",
+                (telegram_user_id,),
+            )
+            self._conn.commit()
+
+    def blacklist_chat(self, chat_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO blacklist_chats(chat_id, created_at) VALUES (?, ?) "
+                "ON CONFLICT(chat_id) DO NOTHING",
+                (chat_id, _utc_now()),
+            )
+            self._conn.commit()
+
+    def unblacklist_chat(self, chat_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM blacklist_chats WHERE chat_id=?", (chat_id,)
+            )
+            self._conn.commit()
+
+    def create_oauth_ticket(self, token: str, telegram_user_id: int, expires_at: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO oauth_tickets(token, telegram_user_id, expires_at, used) "
+                "VALUES (?, ?, ?, 0)",
+                (token, telegram_user_id, expires_at),
+            )
+            self._conn.commit()
+
+    def consume_oauth_ticket(self, token: str) -> int | None:
+        now = _utc_now()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT telegram_user_id FROM oauth_tickets "
+                "WHERE token=? AND used=0 AND expires_at>?",
+                (token, now),
+            ).fetchone()
+            if not row:
+                return None
+            cur = self._conn.execute(
+                "UPDATE oauth_tickets SET used=1 WHERE token=? AND used=0",
+                (token,),
+            )
+            self._conn.commit()
+            if not cur.rowcount:
+                return None
+            return int(row["telegram_user_id"])
+
+    def create_oauth_state(
+        self, state: str, telegram_user_id: int, code_verifier: str, expires_at: str
     ) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO library_tag_index(id, payload_json, updated_at, drive_file_id, payload_sha) "
-                "VALUES (1, ?, ?, ?, ?) "
-                "ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json, "
-                "updated_at=excluded.updated_at, "
-                "drive_file_id=COALESCE(excluded.drive_file_id, library_tag_index.drive_file_id), "
-                "payload_sha=COALESCE(excluded.payload_sha, library_tag_index.payload_sha)",
-                (payload_json, _utc_now(), drive_file_id, payload_sha),
+                "INSERT INTO oauth_states(state, telegram_user_id, code_verifier, expires_at, used) "
+                "VALUES (?, ?, ?, ?, 0)",
+                (state, telegram_user_id, code_verifier, expires_at),
             )
             self._conn.commit()
+
+    def consume_oauth_state(self, state: str) -> tuple[int, str] | None:
+        now = _utc_now()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT telegram_user_id, code_verifier FROM oauth_states "
+                "WHERE state=? AND used=0 AND expires_at>?",
+                (state, now),
+            ).fetchone()
+            if not row:
+                return None
+            cur = self._conn.execute(
+                "UPDATE oauth_states SET used=1 WHERE state=? AND used=0",
+                (state,),
+            )
+            self._conn.commit()
+            if not cur.rowcount:
+                return None
+            return int(row["telegram_user_id"]), str(row["code_verifier"])
+
+    def put_cached_file(self, sha256: str, path: str, size: int | None) -> None:
+        now = _utc_now()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO cached_files(sha256, path, size, created_at, last_used_at, refcount) "
+                "VALUES (?, ?, ?, ?, ?, 1) "
+                "ON CONFLICT(sha256) DO UPDATE SET last_used_at=excluded.last_used_at, "
+                "refcount=cached_files.refcount+1, path=excluded.path",
+                (sha256, path, size, now, now),
+            )
+            self._conn.commit()
+
+    def get_cached_file(self, sha256: str) -> str | None:
+        now = _utc_now()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT path FROM cached_files WHERE sha256=?", (sha256,)
+            ).fetchone()
+            if not row:
+                return None
+            self._conn.execute(
+                "UPDATE cached_files SET last_used_at=? WHERE sha256=?",
+                (now, sha256),
+            )
+            self._conn.commit()
+            return str(row["path"])
+
+    def list_stale_cache(self, before_iso: str) -> list[tuple[str, str]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT sha256, path FROM cached_files WHERE last_used_at<? AND refcount<=0",
+                (before_iso,),
+            ).fetchall()
+        return [(str(row["sha256"]), str(row["path"])) for row in rows]
+
+    def list_cache_older_than(self, before_iso: str) -> list[tuple[str, str]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT sha256, path FROM cached_files WHERE last_used_at<?",
+                (before_iso,),
+            ).fetchall()
+        return [(str(row["sha256"]), str(row["path"])) for row in rows]
+
+    def delete_cached_file(self, sha256: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM cached_files WHERE sha256=?", (sha256,))
+            self._conn.commit()
+
+    def put_hifi_pick(
+        self,
+        pick_id: str,
+        user_id: int,
+        session_id: str,
+        hifi_callback: str,
+        label: str,
+        expires_at: str,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO hifi_picks(pick_id, user_id, session_id, hifi_callback, label, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (pick_id, user_id, session_id, hifi_callback, label, expires_at),
+            )
+            self._conn.commit()
+
+    def get_hifi_pick(self, pick_id: str, user_id: int) -> tuple[str, str, str] | None:
+        now = _utc_now()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT session_id, hifi_callback, label FROM hifi_picks "
+                "WHERE pick_id=? AND user_id=? AND expires_at>?",
+                (pick_id, user_id, now),
+            ).fetchone()
+        if not row:
+            return None
+        return str(row["session_id"]), str(row["hifi_callback"]), str(row["label"])
+
+    def list_hifi_picks(self, session_id: str, user_id: int) -> list[tuple[str, str]]:
+        now = _utc_now()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT pick_id, label FROM hifi_picks "
+                "WHERE session_id=? AND user_id=? AND expires_at>?",
+                (session_id, user_id, now),
+            ).fetchall()
+        return [(str(row["pick_id"]), str(row["label"])) for row in rows]
 
     def close(self) -> None:
         with self._lock:

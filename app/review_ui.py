@@ -37,7 +37,9 @@ FIELDS: list[tuple[str, str]] = [
 FIELD_KEYS = {key for key, _ in FIELDS}
 MULTI_VALUE_FIELDS = {"artist", "albumartist", "composer"}
 SPARSE_FILL_FIELDS = {"composer", "genre", "year"}
-_CALLBACK = re.compile(r"^p(\d+):(ok|rev|cancel|back|dr|dk|ds|cv(\d+)|c(\d+)|t:([a-z]+)|uf|ur)$")
+_CALLBACK = re.compile(
+    r"^p(\d+):(ok|rev|cancel|back|dr|dk|ds|cv(\d+)|c(\d+)|t:([a-z]+)|uf|ur|dl|dv|dn|dt|lg:([a-z]+))$"
+)
 
 
 @dataclass
@@ -74,6 +76,16 @@ def parse_callback(data: str | None) -> PendingAction | None:
         return PendingAction(pending_id, "use_file")
     if rest == "ur":
         return PendingAction(pending_id, "use_rec")
+    if rest == "dl":
+        return PendingAction(pending_id, "dest_library")
+    if rest == "dv":
+        return PendingAction(pending_id, "dest_review")
+    if rest == "dn":
+        return PendingAction(pending_id, "dest_none")
+    if rest == "dt":
+        return PendingAction(pending_id, "dest_telegram")
+    if rest.startswith("lg:") and match.group(6):
+        return PendingAction(pending_id, "lang", field=match.group(6))
     if rest.startswith("cv") and match.group(3) is not None:
         return PendingAction(pending_id, "cover", index=int(match.group(3)))
     if rest.startswith("c") and match.group(4) is not None:
@@ -432,6 +444,58 @@ def conflict_keyboard(pending_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Skip", callback_data=f"p{pending_id}:ds")],
             [InlineKeyboardButton(text="Cancel", callback_data=f"p{pending_id}:cancel")],
         ]
+    )
+
+
+def dest_keyboard(pending_id: int, dest: str, correct_telegram: bool) -> InlineKeyboardMarkup:
+    def mark(active: bool, label: str) -> str:
+        return f"● {label}" if active else label
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=mark(dest == "library", "Drive library"), callback_data=f"p{pending_id}:dl")],
+            [InlineKeyboardButton(text=mark(dest == "review", "Drive review"), callback_data=f"p{pending_id}:dv")],
+            [InlineKeyboardButton(text=mark(dest == "none", "No Drive upload"), callback_data=f"p{pending_id}:dn")],
+            [
+                InlineKeyboardButton(
+                    text=mark(correct_telegram, "Correct Telegram file"),
+                    callback_data=f"p{pending_id}:dt",
+                )
+            ],
+            [
+                InlineKeyboardButton(text="OK", callback_data=f"p{pending_id}:ok"),
+                InlineKeyboardButton(text="Cancel", callback_data=f"p{pending_id}:cancel"),
+            ],
+        ]
+    )
+
+
+def dest_prompt_text(dest: str, correct_telegram: bool) -> str:
+    return (
+        "<b>Save options</b>\n"
+        f"Drive: <code>{html_esc(dest)}</code>\n"
+        f"Correct Telegram file: {'on' if correct_telegram else 'off (first save)'}\n"
+        "OK writes local + Drive per the toggles."
+    )
+
+
+def language_keyboard(pending_id: int, languages: list[str]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for lang in languages[:8]:
+        slug = lang.casefold()
+        if not slug.isalpha():
+            continue
+        rows.append([InlineKeyboardButton(text=lang, callback_data=f"p{pending_id}:lg:{slug}")])
+    rows.append([InlineKeyboardButton(text="Cancel", callback_data=f"p{pending_id}:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def language_prompt_text(languages: list[str]) -> str:
+    listed = " | ".join(html_esc(item) for item in languages) or "—"
+    return (
+        "<b>Primary language?</b>\n"
+        f"Genre keeps all: {listed}\n"
+        "Tap one for the Drive/library folder."
     )
 
 

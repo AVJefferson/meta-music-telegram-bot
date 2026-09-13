@@ -214,7 +214,7 @@ def _loads(text: str | None, default):
 
 
 def _read_cached(ctx: Ctx) -> list[dict[str, str]] | None:
-    raw, _drive_id, _sha = ctx.catalog.get_library_tag_index_meta()
+    raw, _drive_id, _sha = ctx.catalog.get_library_tag_index_meta(getattr(ctx, "index_user_id", 0) or 0)
     if not raw:
         return None
     return parse_index_payload(raw)
@@ -232,13 +232,18 @@ def _write_cached(
         payload,
         drive_file_id=drive_file_id,
         payload_sha=payload_sha_value or payload_sha(payload),
+        user_id=getattr(ctx, "index_user_id", 0) or 0,
     )
     return payload
 
 
 def load_index_from_drive(ctx: Ctx) -> tuple[list[dict[str, str]], str] | None:
+    from app.drive import user_drive_root
+
     log.info("library tag index: probing Drive %s/%s", INDEX_FOLDER, INDEX_FILE)
-    root = ctx.settings.gdrive_folder_id
+    root = user_drive_root(ctx, "library", getattr(ctx, "index_user_id", 0) or 0)
+    if not root:
+        return None
     parent = ctx.drive.find_path(root, [INDEX_FOLDER])
     if not parent:
         log.info("library tag index: Drive folder %s missing", INDEX_FOLDER)
@@ -263,7 +268,15 @@ def save_index_to_drive(ctx: Ctx, payload: bytes, *, replace_id: str | None) -> 
             return file_id or replace_id
         except Exception:
             log.info("library tag index in-place update missed file, creating tracks.json")
-    parent = ctx.drive.ensure_parent(ctx.settings.gdrive_folder_id, INDEX_RELATIVE)
+    from app.drive import user_drive_root
+
+    root = user_drive_root(ctx, "library", getattr(ctx, "index_user_id", 0) or 0)
+    if not root:
+        return None
+    parent = ctx.drive.ensure_parent(
+        root,
+        INDEX_RELATIVE,
+    )
     hits = ctx.drive.find_by_name(parent, INDEX_FILE)
     found_id = hits[0].id if hits else None
     file_id, _url = ctx.drive.upload_bytes(
@@ -275,8 +288,8 @@ def save_index_to_drive(ctx: Ctx, payload: bytes, *, replace_id: str | None) -> 
 def persist_index(ctx: Ctx, entries: list[dict[str, str]]) -> None:
     payload = dump_index_payload(entries)
     sha = payload_sha(payload)
-    _cached, drive_id, old_sha = ctx.catalog.get_library_tag_index_meta()
-    ctx.catalog.set_library_tag_index(payload, payload_sha=sha)
+    _cached, drive_id, old_sha = ctx.catalog.get_library_tag_index_meta(getattr(ctx, "index_user_id", 0) or 0)
+    ctx.catalog.set_library_tag_index(payload, payload_sha=sha, user_id=getattr(ctx, "index_user_id", 0) or 0)
     if old_sha == sha and drive_id:
         return
     try:
@@ -285,7 +298,9 @@ def persist_index(ctx: Ctx, entries: list[dict[str, str]]) -> None:
         log.warning("library tag index Drive write failed", exc_info=True)
         return
     if new_id:
-        ctx.catalog.set_library_tag_index(payload, drive_file_id=new_id, payload_sha=sha)
+        ctx.catalog.set_library_tag_index(
+            payload, drive_file_id=new_id, payload_sha=sha, user_id=getattr(ctx, "index_user_id", 0) or 0
+        )
 
 
 def load_index_entries(ctx: Ctx) -> list[dict[str, str]] | None:
@@ -399,8 +414,13 @@ def extract_item_tags(ctx: Ctx, item: DriveReviewItem, tmp_root: Path) -> TagSet
 
 
 def rebuild_index(ctx: Ctx, *, on_progress: Callable[[int, int], None] | None = None) -> list[dict[str, str]]:
+    from app.drive import user_drive_root
+
     log.info("library tag index: walking Drive FLACs (once)")
-    items = ctx.drive.list_library_items(ctx.settings.gdrive_folder_id)
+    root = user_drive_root(ctx, "library", getattr(ctx, "index_user_id", 0) or 0)
+    if not root:
+        return []
+    items = ctx.drive.list_library_items(root)
     previous = load_index_entries(ctx) or []
     by_path = {(item.get("relative_path") or "").casefold(): item for item in previous}
     entries: list[dict[str, str]] = []
@@ -452,6 +472,11 @@ def library_tracks_from_index(ctx: Ctx, *, topic: str | None = None, rebuild: bo
 
 def ensure_library_index(ctx: Ctx) -> str:
     """Load sqlite cache, else Drive tracks.json, else walk FLACs once (after volume wipe)."""
+    from app.drive import user_drive_root
+
+    root = user_drive_root(ctx, "library", getattr(ctx, "index_user_id", 0) or 0)
+    if not root:
+        return "skip"
     with _INDEX_LOCK:
         cached = load_index_entries(ctx)
         if cached is not None:
@@ -475,9 +500,16 @@ def remember_library_tags(
     message_id: int | None = None,
     card_message_id: int | None = None,
     thread_id: int | None = None,
+    user_id: int = 0,
 ) -> None:
     if kind != "library" or not relative_path:
         return
+    if user_id:
+        from dataclasses import replace as _replace
+
+        from app.drive import resolve_drive
+
+        ctx = _replace(ctx, index_user_id=user_id, drive=resolve_drive(ctx, user_id) or ctx.drive)
     try:
         upsert_library_index(
             ctx,

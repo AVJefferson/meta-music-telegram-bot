@@ -19,7 +19,6 @@ from app.card_resolve import (
     resolve_track_for_reaction,
 )
 from app.catalog import Catalog
-from app.library_index import dump_index_payload, find_entry_for_message, index_entry, upsert_entries
 from app.edit_ui import (
     apply_suggestion,
     exit_edit_keyboard,
@@ -30,6 +29,7 @@ from app.edit_ui import (
 )
 from app.genre import GenreMapper
 from app.library import library_relative, review_relative
+from app.library_index import dump_index_payload, find_entry_for_message, index_entry, upsert_entries
 from app.models import PendingReview, TagSet
 from app.reactions import (
     DELETE_EMOJIS,
@@ -52,7 +52,10 @@ from app.review_cmd import review_label
 class PollingAllowedUpdatesTests(unittest.TestCase):
     def test_always_requests_message_and_reaction(self) -> None:
         dp = Dispatcher()
-        self.assertEqual(polling_allowed_updates(dp), ["message", "message_reaction"])
+        self.assertEqual(
+            polling_allowed_updates(dp),
+            ["channel_post", "message", "message_reaction", "my_chat_member"],
+        )
 
     def test_keeps_callback_query_from_handlers(self) -> None:
         dp = Dispatcher()
@@ -65,7 +68,10 @@ class PollingAllowedUpdatesTests(unittest.TestCase):
 
         dp.include_router(messages)
         allowed = polling_allowed_updates(dp)
-        self.assertEqual(allowed, ["callback_query", "message", "message_reaction"])
+        self.assertEqual(
+            allowed,
+            ["callback_query", "channel_post", "message", "message_reaction", "my_chat_member"],
+        )
 
 
 class EmojiReactionTests(unittest.TestCase):
@@ -376,6 +382,8 @@ class PathHelperTests(unittest.TestCase):
         lib = library_relative("English", tags)
         self.assertEqual(lib.parts[0], "English")
         self.assertTrue(str(lib).endswith(".flac"))
+        unknown = library_relative("", tags)
+        self.assertEqual(unknown.parts[0], "Unknown")
         rev = review_relative("song.flac")
         self.assertEqual(rev.name, "song.flac")
         self.assertEqual(len(rev.parts), 2)
@@ -839,6 +847,11 @@ class RestartTrackListenTests(unittest.IsolatedAsyncioTestCase):
                 topic_name="English",
                 file_name="song.flac",
                 status_message_id=99,
+                telegram_file_id=None,
+                local_path=None,
+                source_message_id=0,
+                user_id=0,
+                public_message_id=None,
             )
             jobs: asyncio.Queue = asyncio.Queue()
             ctx = SimpleNamespace(

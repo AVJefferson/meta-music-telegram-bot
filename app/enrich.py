@@ -343,35 +343,65 @@ async def fetch_cover(
     return None, "none", None
 
 
-async def _lastfm_tags(http: httpx.AsyncClient, api_key: str, identity: Identity) -> list[str]:
-    if not api_key or not identity.title or not identity.artists:
+def _lastfm_toptags(payload: dict, *, min_count: int = 2, limit: int = 15) -> list[str]:
+    tags = ((payload.get("toptags") or {}).get("tag")) or []
+    out: list[str] = []
+    for tag in tags[:limit]:
+        name = tag.get("name") if isinstance(tag, dict) else None
+        try:
+            count = int(tag.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if name and count >= min_count:
+            out.append(str(name))
+    return out
+
+
+async def _lastfm_method_tags(
+    http: httpx.AsyncClient,
+    api_key: str,
+    params: dict[str, str],
+) -> list[str]:
+    if not api_key:
         return []
     try:
         response = await http.get(
             "https://ws.audioscrobbler.com/2.0/",
-            params={
-                "method": "track.gettoptags",
-                "artist": identity.artists[0],
-                "track": identity.title,
-                "api_key": api_key,
-                "format": "json",
-            },
+            params={"api_key": api_key, "format": "json", **params},
             timeout=20.0,
         )
         response.raise_for_status()
         payload = response.json()
     except httpx.HTTPError:
         return []
-    tags = ((payload.get("toptags") or {}).get("tag")) or []
-    out: list[str] = []
-    for tag in tags[:15]:
-        name = tag.get("name") if isinstance(tag, dict) else None
-        try:
-            count = int(tag.get("count") or 0)
-        except (TypeError, ValueError):
-            count = 0
-        if name and count >= 2:
-            out.append(str(name))
+    return _lastfm_toptags(payload)
+
+
+async def _lastfm_tags(http: httpx.AsyncClient, api_key: str, identity: Identity) -> list[str]:
+    if not identity.title or not identity.artists:
+        return []
+    track = await _lastfm_method_tags(
+        http,
+        api_key,
+        {
+            "method": "track.gettoptags",
+            "artist": identity.artists[0],
+            "track": identity.title,
+        },
+    )
+    artist = await _lastfm_method_tags(
+        http,
+        api_key,
+        {"method": "artist.gettoptags", "artist": identity.artists[0]},
+    )
+    seen = {item.casefold() for item in track}
+    out = list(track)
+    for name in artist:
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
     return out
 
 
@@ -435,7 +465,6 @@ async def enrich(
     identity: Identity,
     genre: GenreMapper,
     lastfm_api_key: str,
-    topic_language: str | None,
     *,
     cover: bytes | None = None,
     cover_mime: str | None = None,
@@ -456,7 +485,8 @@ async def enrich(
     if instrumental:
         extra_tags.append("Instrumental")
 
-    genre_str = genre.classify(extra_tags, extra_language=topic_language)
+    languages = genre.languages_from_tags(extra_tags)
+    genre_str = genre.classify(extra_tags)
     return Enrichment(
         cover=cover,
         cover_mime=cover_mime,
@@ -467,4 +497,5 @@ async def enrich(
         caa_release=caa_release,
         itunes_report=itunes_meta,
         lastfm_tags=lastfm_tags,
+        languages=languages,
     )

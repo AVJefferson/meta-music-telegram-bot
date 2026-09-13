@@ -933,3 +933,44 @@ async def suggest_tracks(
         exclude=exclude,
     )
     return attach_library_meta(items, library or [])
+
+
+async def suggest_for_user(ctx, user_id: int, query: str, *, language: str | None = None) -> list[dict[str, str]]:
+    api_key = (getattr(ctx.settings, "lastfm_api_key", None) or "").strip()
+    if not api_key:
+        return []
+    library = ctx.catalog.list_library_tracks(user_id)
+    if not library:
+        from dataclasses import replace
+
+        from app.drive import resolve_drive
+        from app.library_index import entries_to_tracks, load_index_entries
+
+        bound = replace(ctx, index_user_id=user_id, drive=resolve_drive(ctx, user_id) or ctx.drive)
+        entries = load_index_entries(bound) or []
+        library = entries_to_tracks(entries)
+    seeds = select_library_seeds(library, ctx.genre, language=language)
+    owned = owned_keys_from_tracks(library)
+    shown = ctx.catalog.list_suggest_shown(user_id)
+    client = LastfmClient(ctx.http, api_key, ctx.catalog)
+    tokens = [part for part in (query or "").replace(",", " ").split() if part]
+    items = await suggest_tracks(
+        client,
+        seeds,
+        owned=owned,
+        shown=shown,
+        mapper=ctx.genre,
+        language=language,
+        query_tokens=tokens,
+        library=library,
+    )
+    return [
+        {
+            "artist": item.artist,
+            "title": item.title,
+            "in_library": "1" if item.in_library else "0",
+            "why": item.why,
+            "url": item.url,
+        }
+        for item in items
+    ]

@@ -11,6 +11,7 @@ import acoustid
 import musicbrainzngs
 
 from app.config import Settings
+from app.genre import language_name_from_iso
 from app.models import Candidate, Identity, TagHints
 from app.songlog import mb_snapshot
 from app.tags import read_audio_metrics
@@ -141,11 +142,40 @@ def _track_position(release: dict, recording_id: str) -> tuple[str, str]:
     return "", ""
 
 
-def _composers_from_recording(mb: MBClient, recording: dict) -> list[str]:
+def mb_language_names(
+    recording: dict,
+    release: dict | None = None,
+    extra_iso: list[str] | None = None,
+) -> list[str]:
+    codes: list[str] = list(extra_iso or [])
+    if release:
+        tr = release.get("text-representation") or {}
+        if isinstance(tr, dict) and tr.get("language"):
+            codes.append(str(tr["language"]))
+    for rel in _as_list(recording.get("work-relation-list")):
+        work = (rel or {}).get("work") or {}
+        if work.get("language"):
+            codes.append(str(work["language"]))
     names: list[str] = []
+    seen: set[str] = set()
+    for code in codes:
+        name = language_name_from_iso(code)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def _composers_from_recording(mb: MBClient, recording: dict) -> tuple[list[str], list[str]]:
+    names: list[str] = []
+    lang_codes: list[str] = []
     for rel in _as_list(recording.get("work-relation-list")):
         work = rel.get("work") or {}
         work_id = work.get("id")
+        stub_lang = work.get("language")
+        if stub_lang:
+            lang_codes.append(str(stub_lang))
         if not work_id:
             continue
         try:
@@ -153,6 +183,9 @@ def _composers_from_recording(mb: MBClient, recording: dict) -> list[str]:
         except musicbrainzngs.WebServiceError:
             log.debug("work lookup failed for %s", work_id)
             continue
+        full_lang = full.get("language")
+        if full_lang:
+            lang_codes.append(str(full_lang))
         for artist_rel in _as_list(full.get("artist-relation-list")):
             rel_type = str(artist_rel.get("type") or "").lower()
             if rel_type not in COMPOSER_TYPES:
@@ -161,7 +194,7 @@ def _composers_from_recording(mb: MBClient, recording: dict) -> list[str]:
             name = artist.get("name")
             if name:
                 names.append(str(name))
-    return names
+    return names, lang_codes
 
 
 def _tags_from(obj: dict) -> list[str]:
@@ -198,6 +231,7 @@ def _identity_from_recording(
     discnumber = ""
     release_id = None
     rg_id = None
+    full_release: dict | None = None
 
     for thin in releases_sorted[:8]:
         rid = thin.get("id")
@@ -207,6 +241,7 @@ def _identity_from_recording(
             release = mb.release(rid)
         except musicbrainzngs.WebServiceError:
             continue
+        full_release = release
         release_id = rid
         rg = release.get("release-group") or {}
         rg_id = rg.get("id")
@@ -223,7 +258,8 @@ def _identity_from_recording(
         year = year_from_date(releases[0].get("date"))
         release_id = releases[0].get("id")
 
-    composers = _composers_from_recording(mb, recording)
+    composers, work_iso = _composers_from_recording(mb, recording)
+    raw_tags.extend(mb_language_names(recording, full_release, work_iso))
 
     mb_duration = duration
     raw_length = recording.get("length")

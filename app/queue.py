@@ -23,7 +23,6 @@ from app.authenticity import (
 )
 from app.authenticity import format_line as format_authenticity_line
 from app.botapi import discard_download
-from app.cleanup import alert_general
 from app.covers import (
     CoverHit,
     CoverOption,
@@ -38,10 +37,11 @@ from app.covers import (
     upload_album_cover_if_missing,
 )
 from app.enrich import enrich, lyrics_card_text
+from app.genre import genre_tokens
 from app.identify import identify_file, identity_from_mbid
-from app.library import library_relative, place_file, review_relative, unlink_quiet, write_sidecar
+from app.library import UNKNOWN_LANGUAGE_FOLDER, library_relative, place_file, review_relative, unlink_quiet, write_sidecar
 from app.library_index import remember_library_tags
-from app.membership import is_forum_member
+from app.membership import allow_from_callback
 from app.models import (
     Ctx,
     Identity,
@@ -57,10 +57,14 @@ from app.review_ui import (
     conflict_keyboard,
     cover_keyboard,
     cover_option_text,
+    dest_keyboard,
+    dest_prompt_text,
     empty_markup,
     format_conflict,
     format_cover_prompt,
     format_summary,
+    language_keyboard,
+    language_prompt_text,
     parse_callback,
     review_keyboard,
     toggle_working_field,
@@ -160,11 +164,15 @@ def _job_from_pending(row: PendingReview) -> Job:
         chat_id=row.chat_id,
         thread_id=row.thread_id,
         topic_name=row.topic_name,
-        file_id="",
+        file_id=getattr(row, "telegram_file_id", None) or "",
         file_name=row.file_name,
         status_message_id=row.status_message_id or 0,
+        local_path=row.local_path or None,
         private=row.chat_id > 0,
+        source_pending_id=row.id,
         source_message_id=getattr(row, "source_message_id", None) or 0,
+        user_id=getattr(row, "user_id", 0) or 0,
+        public_message_id=getattr(row, "public_message_id", None) or 0,
     )
 
 
@@ -186,7 +194,17 @@ async def edit_status(ctx: Ctx, job: Job, text: str, markup=None, *, fallback_se
         except TelegramBadRequest as exc:
             if "message is not modified" in str(exc).lower():
                 return job.status_message_id
-            log.warning("status edit failed: %s", exc)
+            try:
+                await ctx.bot.edit_message_caption(
+                    chat_id=job.chat_id,
+                    message_id=job.status_message_id,
+                    caption=text,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+                return job.status_message_id
+            except Exception:
+                log.warning("status edit failed: %s", exc)
         except Exception:
             log.warning("status edit failed", exc_info=True)
     if not fallback_send:
@@ -224,7 +242,8 @@ async def worker(name: str, queue: asyncio.Queue[Job], ctx: Ctx) -> None:
                 ctx.catalog.transition_pending(
                     job.source_pending_id, "processing", "done"
                 )
-                if job.local_path:
+                row = ctx.catalog.get_pending_review(job.source_pending_id)
+                if row and row.status == "done" and job.local_path:
                     source = Path(job.local_path)
                     unlink_quiet(source)
                     with contextlib.suppress(OSError):
@@ -235,12 +254,19 @@ async def worker(name: str, queue: asyncio.Queue[Job], ctx: Ctx) -> None:
         except TelegramNetworkError:
             log.warning("telegram dropped during job file=%s; queued for retry", job.file_name)
             _park_interrupted_job(ctx, job)
-        except Exception:
-            log.exception("job failed for %s", job.file_name)
+        except Exception as exc:
+            from app.errors import log_error, to_app_error
+            from app.notify import notify_user
+
+            err = to_app_error(exc)
+            log_error(err.code, user_id=job.user_id or None, chat_id=job.chat_id, pending_id=job.source_pending_id, exc=exc)
             if job.source_pending_id:
                 ctx.catalog.update_pending_review(job.source_pending_id, status="failed")
+            if job.user_id:
+                with contextlib.suppress(Exception):
+                    await notify_user(ctx, job.user_id, err.user_message, chat_id=job.chat_id)
             with contextlib.suppress(Exception):
-                await edit_status(ctx, job, f"Failed processing <code>{html_esc(job.file_name)}</code>. Check logs.")
+                await edit_status(ctx, job, err.user_message)
         finally:
             queue.task_done()
 
@@ -267,20 +293,10 @@ async def recover_interrupted(ctx: Ctx, jobs: asyncio.Queue[Job]) -> None:
                 continue
             if row.phase == "dm_topic" and row.status in {"queued", "processing"}:
                 ctx.catalog.update_pending_review(row.id, status="queued")
-                await jobs.put(
-                    Job(
-                        chat_id=row.chat_id,
-                        thread_id=None,
-                        topic_name=row.topic_name,
-                        file_id="",
-                        file_name=row.file_name,
-                        status_message_id=row.status_message_id,
-                        local_path=row.local_path,
-                        private=True,
-                        source_pending_id=row.id,
-                        source_message_id=getattr(row, "source_message_id", None) or 0,
-                    )
-                )
+                job = _job_from_pending(row)
+                job.local_path = row.local_path
+                job.private = True
+                await jobs.put(job)
                 continue
             if row.phase == "intake" and row.status in {"queued", "processing"}:
                 if not row.telegram_file_id and not row.local_path:
@@ -288,20 +304,7 @@ async def recover_interrupted(ctx: Ctx, jobs: asyncio.Queue[Job]) -> None:
                     ctx.catalog.update_pending_review(row.id, status="failed")
                     continue
                 ctx.catalog.update_pending_review(row.id, status="queued")
-                await jobs.put(
-                    Job(
-                        chat_id=row.chat_id,
-                        thread_id=row.thread_id,
-                        topic_name=row.topic_name,
-                        file_id=row.telegram_file_id or "",
-                        file_name=row.file_name,
-                        status_message_id=row.status_message_id,
-                        local_path=row.local_path,
-                        private=row.chat_id > 0,
-                        source_pending_id=row.id,
-                        source_message_id=getattr(row, "source_message_id", None) or 0,
-                    )
-                )
+                await jobs.put(_job_from_pending(row))
                 log.info("re-queued interrupted group job id=%s file=%s", row.id, row.file_name)
                 continue
             if row.status == "uploading":
@@ -309,6 +312,16 @@ async def recover_interrupted(ctx: Ctx, jobs: asyncio.Queue[Job]) -> None:
                 refreshed = ctx.catalog.get_pending_review(row.id)
                 if refreshed:
                     await _apply_drive_choice(ctx, refreshed, "replace")
+                continue
+            if row.phase == "dest" and row.status in {"queued", "processing", "waiting"}:
+                ctx.catalog.update_pending_review(row.id, status="waiting")
+                try:
+                    await _restore_dest_prompt(ctx, ctx.catalog.get_pending_review(row.id) or row)
+                except Exception:
+                    log.exception("dest prompt restore failed id=%s", row.id)
+                continue
+            if row.phase == "lang" and row.status in {"queued", "processing"}:
+                ctx.catalog.update_pending_review(row.id, status="waiting")
                 continue
             if row.phase == "cover" and row.status in {"queued", "processing"}:
                 ctx.catalog.update_pending_review(row.id, status="waiting")
@@ -323,6 +336,13 @@ async def recover_interrupted(ctx: Ctx, jobs: asyncio.Queue[Job]) -> None:
             await _restore_cover_prompt(ctx, row)
         except Exception:
             log.exception("cover prompt restore failed id=%s", row.id)
+    waiting_langs = ctx.catalog.list_waiting_by_phase("lang")
+    log.info("restoring language prompts count=%s", len(waiting_langs))
+    for row in waiting_langs:
+        try:
+            await _restore_language_prompt(ctx, row)
+        except Exception:
+            log.exception("language prompt restore failed id=%s", row.id)
     log.info("recovery done")
 
 
@@ -333,6 +353,10 @@ def _build_report(hints: TagHints, identity: Identity, enrichment, tags: TagSet)
 
 
 async def process_job(job: Job, ctx: Ctx) -> None:
+    if job.user_id:
+        from app.relocate import ctx_for_user
+
+        ctx = ctx_for_user(ctx, job.user_id)
     settings = ctx.settings
     work = settings.tmp_root / str(uuid.uuid4())
     work.mkdir(parents=True, exist_ok=True)
@@ -357,7 +381,6 @@ async def process_job(job: Job, ctx: Ctx) -> None:
             identity,
             ctx.genre,
             settings.lastfm_api_key,
-            job.topic_name,
         )
         tags = identity_to_tags(identity, enrichment)
         tags = fill_sparse_tags(hints_to_tagset(hints), tags)
@@ -369,6 +392,7 @@ async def process_job(job: Job, ctx: Ctx) -> None:
         # itself (cover resolution, review confirm, expiry) or discards the file.
         # Writing now would only add a full mutagen rewrite of a large FLAC.
         report = _build_report(hints, identity, enrichment, tags)
+        _stamp_languages(ctx, report, tags)
         if settings.authenticity_check:
             await edit_status(ctx, job, "Checking authenticity…")
             try:
@@ -393,7 +417,9 @@ async def process_job(job: Job, ctx: Ctx) -> None:
                 restart_old_drive = pending_row.old_drive_id
 
         if identity.confidence == "high" and identity.mb_recording_id:
-            existing = ctx.catalog.find_library_by_mbid(identity.mb_recording_id)
+            existing = ctx.catalog.find_library_by_mbid(
+                identity.mb_recording_id, job.user_id or None
+            )
             if existing and existing.id != restart_replace:
                 new_q = quality(identity.bit_depth, identity.sample_rate)
                 old_q = quality(existing.bit_depth, existing.sample_rate)
@@ -895,6 +921,7 @@ def _upsert_cover_pending(
         working_json=_dumps(asdict(tags)),
         identity_json=_dumps(asdict(identity)),
         source_report_json=_dumps(report),
+        topic_name=job.topic_name,
         replace_id=replace_id,
         old_drive_id=old_drive_id,
         track_id=track_id,
@@ -1095,6 +1122,25 @@ async def _library_commit_with_cover(
     new_q: tuple[int, int] | None = None,
     file_cover: tuple[bytes | None, str | None] | None = None,
 ) -> None:
+    _stamp_languages(ctx, report, tags)
+    if await _maybe_prompt_language(
+        ctx,
+        job=job,
+        local=local,
+        tags=tags,
+        identity=identity,
+        report=report,
+        pending_id=pending_id,
+        replace_id=replace_id,
+        old_drive_id=old_drive_id,
+        track_id=track_id,
+        replaced=replaced,
+        old_q=old_q,
+        new_q=new_q,
+        kind_default="library",
+    ):
+        return
+    _bind_primary_language(job, report, ctx.genre)
     paused = await maybe_cover_picker(
         ctx,
         job=job,
@@ -1113,13 +1159,31 @@ async def _library_commit_with_cover(
     )
     if paused:
         return
+    if await _maybe_prompt_dest(
+        ctx,
+        job=job,
+        local=local,
+        tags=tags,
+        identity=identity,
+        report=report,
+        pending_id=pending_id,
+        replace_id=replace_id,
+        old_drive_id=old_drive_id,
+        track_id=track_id,
+        replaced=replaced,
+        old_q=old_q,
+        new_q=new_q,
+        kind_default="library",
+    ):
+        return
+    kind, _drive = _dest_commit_plan(ctx, job.user_id, report, "library")
     await _commit_upload(
         ctx,
         job=job,
         local=local,
         tags=tags,
         identity=identity,
-        kind="library",
+        kind=kind,
         source_report=report,
         replace_id=replace_id,
         old_drive_id=old_drive_id,
@@ -1139,16 +1203,35 @@ async def _resume_library_after_cover(
     report: dict,
 ) -> None:
     job = _job_from_pending(row)
+    _bind_primary_language(job, report, ctx.genre)
     qr = report.get("quality_replace") or {}
     old_q = tuple(qr["old_q"]) if qr.get("old_q") else None
     new_q = tuple(qr["new_q"]) if qr.get("new_q") else None
+    if await _maybe_prompt_dest(
+        ctx,
+        job=job,
+        local=Path(row.local_path),
+        tags=tags,
+        identity=identity,
+        report=report,
+        pending_id=row.id,
+        replace_id=row.replace_id,
+        old_drive_id=row.old_drive_id,
+        track_id=row.track_id,
+        replaced=bool(qr.get("replaced")),
+        old_q=old_q,
+        new_q=new_q,
+        kind_default="library",
+    ):
+        return
+    kind, _drive = _dest_commit_plan(ctx, job.user_id, report, "library")
     await _commit_upload(
         ctx,
         job=job,
         local=Path(row.local_path),
         tags=tags,
         identity=identity,
-        kind="library",
+        kind=kind,
         source_report=apply_chosen(report, tags, identity),
         replace_id=row.replace_id,
         old_drive_id=row.old_drive_id,
@@ -1512,6 +1595,399 @@ async def _cover_choice_from_pending(
     return _read_cover_option(Path(leader.local_path), options[0])
 
 
+def _user_default_dest(ctx: Ctx, user_id: int) -> str:
+    if not user_id:
+        return "none"
+    user = ctx.catalog.get_user(user_id)
+    if not user or not user.logged_in:
+        return "none"
+    try:
+        settings = json.loads(user.settings_json or "{}")
+    except (TypeError, ValueError):
+        settings = {}
+    dest = str(settings.get("default_dest") or "none")
+    if dest not in {"library", "review", "none"}:
+        return "none"
+    return dest
+
+
+def _dest_commit_plan(ctx: Ctx, user_id: int, report: dict, fallback_kind: str) -> tuple[str, bool]:
+    dest = str(report.get("drive_dest") or "")
+    user = ctx.catalog.get_user(user_id) if user_id else None
+    logged_in = bool(user and user.logged_in)
+    if not dest:
+        dest = _user_default_dest(ctx, user_id) if logged_in else "none"
+    if dest == "review":
+        return "review", logged_in
+    if dest == "library":
+        return "library", logged_in
+    return (fallback_kind or "library"), False
+
+
+def _dest_state(report: dict) -> tuple[str, bool]:
+    dest = str(report.get("drive_dest") or "none")
+    if dest not in {"library", "review", "none"}:
+        dest = "none"
+    return dest, bool(report.get("correct_telegram"))
+
+
+def _stamp_languages(ctx: Ctx, report: dict, tags: TagSet) -> list[str]:
+    extra = list(report.get("languages") or []) + list(report.get("lastfm_tags") or [])
+    langs = ctx.genre.languages_from_tags(extra + genre_tokens(tags.genre))
+    report["languages"] = langs
+    return langs
+
+
+def _bind_primary_language(job: Job, report: dict, mapper) -> None:
+    langs = list(report.get("languages") or [])
+    if report.get("language_confirmed") and report.get("primary_language"):
+        raw = str(report["primary_language"])
+        primary = mapper.language_from_raw(raw) or raw
+    elif len(langs) == 1:
+        primary = langs[0]
+        report["primary_language"] = primary
+        report["language_confirmed"] = True
+    else:
+        primary = UNKNOWN_LANGUAGE_FOLDER
+        report["primary_language"] = primary
+        report["language_confirmed"] = True
+    job.topic_name = primary
+
+
+async def _restore_language_prompt(ctx: Ctx, row: PendingReview) -> None:
+    from app.ephemeral import send_private
+
+    report = _loads(row.source_report_json, {})
+    if not isinstance(report, dict):
+        report = {}
+    langs = [str(item) for item in (report.get("languages") or []) if str(item).strip()]
+    uid = getattr(row, "user_id", 0) or 0
+    await send_private(
+        ctx,
+        chat_id=row.chat_id,
+        user_id=uid or row.chat_id,
+        text=language_prompt_text(langs),
+        parse_mode="HTML",
+        reply_markup=language_keyboard(row.id, langs),
+    )
+
+
+async def _maybe_prompt_language(
+    ctx: Ctx,
+    *,
+    job: Job,
+    local: Path,
+    tags: TagSet,
+    identity: Identity,
+    report: dict,
+    pending_id: int | None,
+    replace_id: int | None,
+    old_drive_id: str | None,
+    track_id: int | None,
+    replaced: bool,
+    old_q: tuple[int, int] | None,
+    new_q: tuple[int, int] | None,
+    kind_default: str,
+) -> bool:
+    if not isinstance(report, dict):
+        report = {}
+    langs = _stamp_languages(ctx, report, tags)
+    if report.get("language_confirmed"):
+        _bind_primary_language(job, report, ctx.genre)
+        return False
+    if len(langs) <= 1:
+        if langs:
+            report["primary_language"] = langs[0]
+        else:
+            report["primary_language"] = UNKNOWN_LANGUAGE_FOLDER
+        report["language_confirmed"] = True
+        job.topic_name = str(report["primary_language"])
+        if pending_id is not None:
+            ctx.catalog.update_pending_review(
+                pending_id,
+                source_report_json=_dumps(report),
+                topic_name=job.topic_name,
+            )
+        return False
+    report["quality_replace"] = {
+        "replaced": replaced,
+        "old_q": list(old_q) if old_q else None,
+        "new_q": list(new_q) if new_q else None,
+    }
+    parked = await _park_pending_flac(ctx, job, local)
+    pending = pending_id
+    if pending is None:
+        pending = ctx.catalog.insert_pending_review(
+            phase="lang",
+            status="waiting",
+            local_path=str(parked),
+            sidecar_path=None,
+            relative_path=None,
+            kind=kind_default,
+            original_json=_dumps(asdict(tags)),
+            recommended_json=_dumps(asdict(tags)),
+            working_json=_dumps(asdict(tags)),
+            candidates_json="[]",
+            identity_json=_dumps(asdict(identity)),
+            source_report_json=_dumps(report),
+            chat_id=job.chat_id,
+            thread_id=job.thread_id,
+            status_message_id=job.status_message_id or 0,
+            topic_name=job.topic_name,
+            file_name=job.file_name,
+            track_id=track_id,
+            replace_id=replace_id,
+            old_drive_id=old_drive_id,
+            telegram_file_id=job.file_id or None,
+            source_message_id=job.source_message_id or None,
+            expires_at=_expires_at(),
+            user_id=job.user_id or 0,
+            public_message_id=job.public_message_id or job.status_message_id or None,
+        )
+    else:
+        ctx.catalog.update_pending_review(
+            pending,
+            phase="lang",
+            status="waiting",
+            local_path=str(parked),
+            working_json=_dumps(asdict(tags)),
+            identity_json=_dumps(asdict(identity)),
+            source_report_json=_dumps(report),
+            kind=kind_default,
+            topic_name=job.topic_name,
+            replace_id=replace_id,
+            old_drive_id=old_drive_id,
+            track_id=track_id,
+        )
+    row = ctx.catalog.get_pending_review(pending)
+    if row:
+        await edit_status(ctx, job, "Pick a primary language for the library folder.")
+        await _restore_language_prompt(ctx, row)
+    return True
+
+
+async def _apply_language_choice(ctx: Ctx, row: PendingReview, slug: str) -> None:
+    _original, _recommended, working, identity, report, _cands = _load_pending_state(row)
+    if not isinstance(report, dict):
+        report = {}
+    langs = [str(item) for item in (report.get("languages") or []) if str(item).strip()]
+    chosen = next((item for item in langs if item.casefold() == slug.casefold()), None)
+    if chosen is None:
+        chosen = ctx.genre.language_from_raw(slug)
+    if chosen is None or chosen.casefold() not in {item.casefold() for item in langs}:
+        ctx.catalog.update_pending_review(row.id, status="waiting")
+        await _restore_language_prompt(ctx, row)
+        return
+    report["primary_language"] = chosen
+    report["language_confirmed"] = True
+    tags = normalize_tagset(tagset_from_dict(working), ctx.genre)
+    local = Path(row.local_path)
+    job = _job_from_pending(row)
+    _bind_primary_language(job, report, ctx.genre)
+    ctx.catalog.update_pending_review(
+        row.id,
+        source_report_json=_dumps(report),
+        topic_name=job.topic_name,
+        status="processing",
+    )
+    qr = report.get("quality_replace") or {}
+    old_q = tuple(qr["old_q"]) if qr.get("old_q") else None
+    new_q = tuple(qr["new_q"]) if qr.get("new_q") else None
+    kind_default = row.kind or "library"
+    if kind_default != "library":
+        if await _maybe_prompt_dest(
+            ctx,
+            job=job,
+            local=local,
+            tags=tags,
+            identity=identity,
+            report=report,
+            pending_id=row.id,
+            replace_id=row.replace_id,
+            old_drive_id=row.old_drive_id,
+            track_id=row.track_id,
+            replaced=bool(qr.get("replaced")),
+            old_q=old_q,
+            new_q=new_q,
+            kind_default="review",
+        ):
+            return
+        kind, _drive = _dest_commit_plan(ctx, job.user_id, report, "review")
+        await _commit_upload(
+            ctx,
+            job=job,
+            local=local,
+            tags=tags,
+            identity=identity,
+            kind=kind,
+            source_report=report,
+            replace_id=row.replace_id,
+            old_drive_id=row.old_drive_id,
+            replaced=bool(qr.get("replaced")),
+            old_q=old_q,
+            new_q=new_q,
+            pending_id=row.id,
+            track_id=row.track_id,
+        )
+        return
+    await _library_commit_with_cover(
+        ctx,
+        job=job,
+        local=local,
+        tags=tags,
+        identity=identity,
+        report=report,
+        pending_id=row.id,
+        replace_id=row.replace_id,
+        old_drive_id=row.old_drive_id,
+        track_id=row.track_id,
+        replaced=bool(qr.get("replaced")),
+        old_q=old_q,
+        new_q=new_q,
+    )
+
+
+async def _restore_dest_prompt(ctx: Ctx, row: PendingReview) -> None:
+    from app.ephemeral import send_private
+
+    report = _loads(row.source_report_json, {})
+    if not isinstance(report, dict):
+        report = {}
+    dest, correct = _dest_state(report)
+    uid = getattr(row, "user_id", 0) or 0
+    await send_private(
+        ctx,
+        chat_id=row.chat_id,
+        user_id=uid or row.chat_id,
+        text=dest_prompt_text(dest, correct),
+        parse_mode="HTML",
+        reply_markup=dest_keyboard(row.id, dest, correct),
+    )
+
+
+async def _maybe_prompt_dest(
+    ctx: Ctx,
+    *,
+    job: Job,
+    local: Path,
+    tags: TagSet,
+    identity: Identity,
+    report: dict,
+    pending_id: int | None,
+    replace_id: int | None,
+    old_drive_id: str | None,
+    track_id: int | None,
+    replaced: bool,
+    old_q: tuple[int, int] | None,
+    new_q: tuple[int, int] | None,
+    kind_default: str,
+) -> bool:
+    if not isinstance(report, dict):
+        report = {}
+    if report.get("dest_confirmed"):
+        return False
+    uid = job.user_id or 0
+    user = ctx.catalog.get_user(uid) if uid else None
+    if not user or not user.logged_in:
+        report["drive_dest"] = "none"
+        report["dest_confirmed"] = True
+        report["correct_telegram"] = False
+        return False
+    drive_dest = str(report.get("drive_dest") or _user_default_dest(ctx, uid))
+    if drive_dest not in {"library", "review", "none"}:
+        drive_dest = "none"
+    report["drive_dest"] = drive_dest
+    report["correct_telegram"] = bool(report.get("correct_telegram"))
+    report["quality_replace"] = {
+        "replaced": replaced,
+        "old_q": list(old_q) if old_q else None,
+        "new_q": list(new_q) if new_q else None,
+    }
+    parked = await _park_pending_flac(ctx, job, local)
+    pending = pending_id
+    if pending is None:
+        pending = ctx.catalog.insert_pending_review(
+            phase="dest",
+            status="waiting",
+            local_path=str(parked),
+            sidecar_path=None,
+            relative_path=None,
+            kind=kind_default,
+            original_json=_dumps(asdict(tags)),
+            recommended_json=_dumps(asdict(tags)),
+            working_json=_dumps(asdict(tags)),
+            candidates_json="[]",
+            identity_json=_dumps(asdict(identity)),
+            source_report_json=_dumps(report),
+            chat_id=job.chat_id,
+            thread_id=job.thread_id,
+            status_message_id=job.status_message_id or 0,
+            topic_name=job.topic_name,
+            file_name=job.file_name,
+            track_id=track_id,
+            replace_id=replace_id,
+            old_drive_id=old_drive_id,
+            telegram_file_id=job.file_id or None,
+            source_message_id=job.source_message_id or None,
+            expires_at=_expires_at(),
+            user_id=uid,
+            public_message_id=job.public_message_id or job.status_message_id or None,
+        )
+    else:
+        ctx.catalog.update_pending_review(
+            pending,
+            phase="dest",
+            status="waiting",
+            local_path=str(parked),
+            working_json=_dumps(asdict(tags)),
+            identity_json=_dumps(asdict(identity)),
+            source_report_json=_dumps(report),
+            kind=kind_default,
+            topic_name=job.topic_name,
+            replace_id=replace_id,
+            old_drive_id=old_drive_id,
+            track_id=track_id,
+        )
+    row = ctx.catalog.get_pending_review(pending)
+    if row:
+        await _restore_dest_prompt(ctx, row)
+    return True
+
+
+async def _apply_dest_confirm(ctx: Ctx, row: PendingReview) -> None:
+    _original, _recommended, working, identity, report, _cands = _load_pending_state(row)
+    if not isinstance(report, dict):
+        report = {}
+    report["dest_confirmed"] = True
+    tags = normalize_tagset(tagset_from_dict(working), ctx.genre)
+    local = Path(row.local_path)
+    job = _job_from_pending(row)
+    job.correct_telegram = bool(report.get("correct_telegram"))
+    job.drive_dest = str(report.get("drive_dest") or "none")
+    _bind_primary_language(job, report, ctx.genre)
+    kind, _drive = _dest_commit_plan(ctx, job.user_id, report, row.kind or "library")
+    qr = report.get("quality_replace") or {}
+    old_q = tuple(qr["old_q"]) if qr.get("old_q") else None
+    new_q = tuple(qr["new_q"]) if qr.get("new_q") else None
+    ctx.catalog.update_pending_review(row.id, source_report_json=_dumps(report), kind=kind)
+    await _commit_upload(
+        ctx,
+        job=job,
+        local=local,
+        tags=tags,
+        identity=identity,
+        kind=kind,
+        source_report=report,
+        replace_id=row.replace_id,
+        old_drive_id=row.old_drive_id,
+        replaced=bool(qr.get("replaced")),
+        old_q=old_q,
+        new_q=new_q,
+        pending_id=row.id,
+        track_id=row.track_id,
+    )
+
+
 def _sidecar_payload(job: Job, tags: TagSet, identity: Identity) -> dict:
     return {
         "confidence": identity.confidence,
@@ -1547,14 +2023,28 @@ async def _commit_upload(
 ) -> Path | None:
     settings = ctx.settings
     sidecar_path: Path | None = None
+    uid = job.user_id or 0
+    from app.drive import user_drive_root
+    from app.paths import user_kind_root
+    from app.relocate import ctx_for_user
+
+    if uid:
+        ctx = ctx_for_user(ctx, uid)
+    want_drive = str((source_report or {}).get("drive_dest") or "library") != "none"
     if kind == "library":
         relative = library_relative(job.topic_name, tags)
-        dest = settings.library_root / relative
-        root_id = settings.gdrive_folder_id
+        dest = (user_kind_root(ctx, uid, "library") if uid else settings.library_root) / relative
+        if uid:
+            root_id = user_drive_root(ctx, "library", uid) if want_drive else ""
+        else:
+            root_id = settings.gdrive_folder_id
     else:
         relative = review_relative(job.file_name)
-        dest = settings.review_root / relative
-        root_id = settings.gdrive_review_folder_id
+        dest = (user_kind_root(ctx, uid, "review") if uid else settings.review_root) / relative
+        if uid:
+            root_id = user_drive_root(ctx, "review", uid) if want_drive else ""
+        else:
+            root_id = settings.gdrive_review_folder_id
 
     if local.resolve() != dest.resolve():
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1564,14 +2054,19 @@ async def _commit_upload(
         sidecar_path = dest.with_suffix(".json")
         await asyncio.to_thread(write_sidecar, sidecar_path, _sidecar_payload(job, tags, identity))
 
-    parent_id = await asyncio.to_thread(ctx.drive.ensure_parent, root_id, relative)
-    filename = relative.name
-    found = await asyncio.to_thread(ctx.drive.find_name_conflicts, parent_id, filename)
+    if root_id:
+        parent_id = await asyncio.to_thread(ctx.drive.ensure_parent, root_id, relative)
+        filename = relative.name
+        found = await asyncio.to_thread(ctx.drive.find_name_conflicts, parent_id, filename)
+    else:
+        parent_id = ""
+        filename = relative.name
+        found = []
     conflict_dicts = [
         {"id": c.id, "name": c.name, "size": c.size, "modified": c.modified}
         for c in found
     ]
-    catalog_row = ctx.catalog.find_uploaded_by_relative(relative.as_posix())
+    catalog_row = ctx.catalog.find_uploaded_by_relative(relative.as_posix(), uid or None)
     catalog_note = False
     if not conflict_dicts and catalog_row:
         catalog_note = True
@@ -1606,6 +2101,7 @@ async def _commit_upload(
             artist=tags.artist,
             album=tags.album,
             status="skipped",
+            user_id=uid,
         )
         if pending_id is not None:
             ctx.catalog.update_pending_review(pending_id, status="skipped", track_id=skipped_id)
@@ -1715,6 +2211,7 @@ async def _commit_upload(
             title=tags.title,
             artist=tags.artist,
             album=tags.album,
+            user_id=uid,
         )
 
     if pending_id is not None:
@@ -1738,20 +2235,32 @@ async def _commit_upload(
     await edit_status(ctx, job, f"Uploading to Drive…\n\n{_preview(tags, identity, dest, source_report)}")
     log.debug("drive upload path=%s parent=%s replace=%s", relative, parent_id, replace_file_id)
     try:
-        if replace_file_id:
+        if not root_id:
+            file_id, url, sidecar_id, log_id = "", None, None, None
+        elif replace_file_id:
             file_id, url = await asyncio.to_thread(ctx.drive.replace_file, replace_file_id, dest, "audio/flac")
+            sidecar_id, log_id = await _upload_sidecars(
+                ctx,
+                parent_id=parent_id,
+                dest=dest,
+                sidecar_path=sidecar_path,
+                source_report=source_report,
+                tags=tags,
+                identity=identity,
+                kind=kind,
+            )
         else:
             file_id, url = await asyncio.to_thread(ctx.drive.create_file, dest, parent_id, filename, "audio/flac")
-        sidecar_id, log_id = await _upload_sidecars(
-            ctx,
-            parent_id=parent_id,
-            dest=dest,
-            sidecar_path=sidecar_path,
-            source_report=source_report,
-            tags=tags,
-            identity=identity,
-            kind=kind,
-        )
+            sidecar_id, log_id = await _upload_sidecars(
+                ctx,
+                parent_id=parent_id,
+                dest=dest,
+                sidecar_path=sidecar_path,
+                source_report=source_report,
+                tags=tags,
+                identity=identity,
+                kind=kind,
+            )
         ctx.catalog.mark_uploaded(track_id, file_id, url)
         telegram_file_id = job.file_id or None
         if pending_id is not None:
@@ -1772,6 +2281,7 @@ async def _commit_upload(
             kind=kind,
             source_chat_id=job.chat_id,
             source_message_id=job.source_message_id or None,
+            user_id=uid,
         )
         if old_drive_id and old_drive_id != file_id and conflict_action != "keep_both":
             await asyncio.to_thread(ctx.drive.delete_file, old_drive_id)
@@ -1788,15 +2298,10 @@ async def _commit_upload(
         ctx.catalog.mark_failed(track_id, str(exc))
         if pending_id is not None:
             ctx.catalog.update_pending_review(pending_id, status="failed")
-        await alert_general(
-            ctx,
-            "<b>Drive upload failed</b>\n"
-            f"File: {html_esc(job.file_name)}\n"
-            f"Title: {html_esc(tags.title)}\n"
-            f"Local: <code>{html_esc(dest)}</code>\n"
-            f"Error: {html_esc(exc)}",
-            fallback_thread_id=job.thread_id,
-        )
+        from app.notify import notify_user
+
+        if job.user_id:
+            await notify_user(ctx, job.user_id, "Drive upload failed. File kept locally.", chat_id=job.chat_id)
         await edit_status(
             ctx,
             job,
@@ -1811,6 +2316,36 @@ async def _commit_upload(
         extra = f"\nReplaced lower-quality copy ({old_q[0]}/{old_q[1]} → {new_q[0]}/{new_q[1]})."
     href = safe_link(url)
     link = f'\nDrive: <a href="{href}">open</a>' if href else ""
+    from app.captions import music_caption
+    from app.telegram_file import update_public_audio
+
+    public_id = job.public_message_id or 0
+    if pending_id is not None:
+        completed = ctx.catalog.get_pending_review(pending_id)
+        if completed and getattr(completed, "public_message_id", None):
+            public_id = completed.public_message_id
+    if not public_id:
+        public_id = job.status_message_id
+    caption = music_caption(
+        tags=tags,
+        relative_path=relative.as_posix(),
+        extra=f"Saved ({dest_label}){extra}",
+        last_editor_user_id=uid or None,
+    )
+    correct = bool(job.correct_telegram or (source_report or {}).get("correct_telegram"))
+    if public_id:
+        new_file = await update_public_audio(
+            ctx,
+            chat_id=job.chat_id,
+            message_id=public_id,
+            path=dest,
+            caption=caption,
+            correct_media=correct,
+        )
+        if new_file:
+            telegram_file_id = new_file
+            ctx.catalog.update_track(track_id, telegram_file_id=new_file)
+        ctx.catalog.bind_track_message(track_id, job.chat_id, public_id)
     await edit_status(
         ctx,
         job,
@@ -1834,7 +2369,7 @@ async def _commit_upload(
     )
     if job.source_message_id:
         ctx.catalog.bind_track_message(track_id, job.chat_id, job.source_message_id)
-    if job.status_message_id:
+    if job.status_message_id and job.status_message_id != public_id:
         ctx.catalog.bind_track_message(track_id, job.chat_id, job.status_message_id)
     log.info("saved %s kind=%s confidence=%s path=%s", job.file_name, dest_label, identity.confidence, relative)
     return dest
@@ -2023,6 +2558,10 @@ async def _run_claimed_action(ctx: Ctx, row: PendingReview, action) -> None:
                 _cover_status_text(picker, refreshed.file_name),
                 _cover_status_markup(refreshed.id, picker),
             )
+        elif refreshed and refreshed.phase == "dest":
+            await _restore_dest_prompt(ctx, refreshed)
+        elif refreshed and refreshed.phase == "lang":
+            await _restore_language_prompt(ctx, refreshed)
         elif refreshed and refreshed.phase == "drive":
             await edit_status(
                 ctx,
@@ -2044,12 +2583,11 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
     if callback.message and callback.message.chat.id != row.chat_id:
         await callback.answer()
         return
-    if (
-        row.chat_id > 0
-        and callback.from_user
-        and not await is_forum_member(ctx, callback.from_user.id)
-    ):
+    if callback.from_user and not await allow_from_callback(ctx, callback):
         await callback.answer("Access denied.", show_alert=True)
+        return
+    if row.user_id and callback.from_user and callback.from_user.id != row.user_id:
+        await callback.answer("Not your prompt.", show_alert=True)
         return
     if row.status != "waiting":
         await callback.answer("Expired.")
@@ -2073,6 +2611,9 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
         return
     if action.op == "ok":
         await state.clear()
+        if row.phase == "dest":
+            await _run_claimed_action(ctx, row, _apply_dest_confirm(ctx, row))
+            return
         await _run_claimed_action(
             ctx, row, _apply_confirm(ctx, row, kind="library")
         )
@@ -2122,6 +2663,31 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
         row = ctx.catalog.get_pending_review(row.id)
         if row:
             await _refresh_tag_ui(ctx, row)
+        return
+    if action.op in {"dest_library", "dest_review", "dest_none", "dest_telegram"}:
+        report = _loads(row.source_report_json, {})
+        if not isinstance(report, dict):
+            report = {}
+        if action.op == "dest_library":
+            report["drive_dest"] = "library"
+        elif action.op == "dest_review":
+            report["drive_dest"] = "review"
+        elif action.op == "dest_none":
+            report["drive_dest"] = "none"
+        else:
+            report["correct_telegram"] = not bool(report.get("correct_telegram"))
+        ctx.catalog.update_pending_review(
+            row.id, source_report_json=_dumps(report), status="waiting", phase="dest"
+        )
+        refreshed = ctx.catalog.get_pending_review(row.id)
+        if refreshed:
+            await _restore_dest_prompt(ctx, refreshed)
+        return
+    if action.op == "lang" and action.field:
+        if row.phase != "lang":
+            ctx.catalog.update_pending_review(row.id, status="waiting")
+            return
+        await _run_claimed_action(ctx, row, _apply_language_choice(ctx, row, action.field))
         return
     if action.op in {"drive_replace", "drive_keep", "drive_skip"}:
         mapping = {"drive_replace": "replace", "drive_keep": "keep_both", "drive_skip": "skip"}
@@ -2185,7 +2751,9 @@ async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
 
     job = _job_from_pending(row)
     if kind == "library" and identity.mb_recording_id:
-        existing = ctx.catalog.find_library_by_mbid(identity.mb_recording_id)
+        existing = ctx.catalog.find_library_by_mbid(
+            identity.mb_recording_id, getattr(row, "user_id", 0) or None
+        )
         if existing and existing.id != row.replace_id:
             new_q = quality(identity.bit_depth, identity.sample_rate)
             old_q = quality(existing.bit_depth, existing.sample_rate)
@@ -2216,6 +2784,43 @@ async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
             return
 
     if kind != "library":
+        _stamp_languages(ctx, report, tags)
+        if await _maybe_prompt_language(
+            ctx,
+            job=job,
+            local=local,
+            tags=tags,
+            identity=identity,
+            report=report,
+            pending_id=row.id,
+            replace_id=row.replace_id,
+            old_drive_id=row.old_drive_id,
+            track_id=row.track_id,
+            replaced=False,
+            old_q=None,
+            new_q=None,
+            kind_default="review",
+        ):
+            return
+        _bind_primary_language(job, report, ctx.genre)
+        if await _maybe_prompt_dest(
+            ctx,
+            job=job,
+            local=local,
+            tags=tags,
+            identity=identity,
+            report=report,
+            pending_id=row.id,
+            replace_id=row.replace_id,
+            old_drive_id=row.old_drive_id,
+            track_id=row.track_id,
+            replaced=False,
+            old_q=None,
+            new_q=None,
+            kind_default="review",
+        ):
+            return
+        kind, _drive = _dest_commit_plan(ctx, job.user_id, report, "review")
         await _commit_upload(
             ctx,
             job=job,
@@ -2289,7 +2894,6 @@ async def _apply_candidate(ctx: Ctx, row: PendingReview, index: int) -> None:
         new_identity,
         ctx.genre,
         ctx.settings.lastfm_api_key,
-        row.topic_name,
         cover=cover,
         cover_mime=mime,
         cover_source="file" if cover else "none",
@@ -2300,6 +2904,7 @@ async def _apply_candidate(ctx: Ctx, row: PendingReview, index: int) -> None:
     # expiry will write the final tags.
     report = merge_enrichment(report, enrichment)
     report = apply_chosen(report, tags, new_identity)
+    _stamp_languages(ctx, report, tags)
     ctx.catalog.update_pending_review(
         row.id,
         recommended_json=_dumps(asdict(tags)),

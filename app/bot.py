@@ -11,33 +11,36 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, TelegramObject
+from aiogram.types import ChatMemberUpdated, ErrorEvent, Message, TelegramObject
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from app.catalog import Catalog, is_general_topic
+from app.admin_cmd import build_admin_router
+from app.catalog import Catalog
 from app.cleanup import run_cleanup, run_expire_pending
 from app.config import Settings
-from app.drive import DriveClient
+from app.drive import DriveHub
 from app.edit_ui import build_edit_router
+from app.errors import AppError, log_error, to_app_error
 from app.genre import GenreMapper
+from app.hifi import build_hifi_router
+from app.http_app import start_http
 from app.identify import MBClient
 from app.library_index import ensure_library_index
+from app.membership import allow_user, ignore_bot_update, message_from_bot, touch
 from app.models import Ctx, Job
+from app.notify import notify_user
 from app.private_ui import build_private_router
 from app.queue import recover_interrupted, worker
 from app.reactions import build_reactions_router
 from app.review_cmd import build_review_command_router
 from app.review_ui import build_review_router
 from app.suggest_cmd import build_suggest_command_router
-from app.util import html_esc
+from app.user_cmd import build_search_text_router, build_user_command_router
 
 log = logging.getLogger(__name__)
 
-# Telegram's default getUpdates list omits message_reaction (and chat_member,
-# message_reaction_count) to save bandwidth. An empty allowed_updates is that
-# default — reaction events never arrive unless we name them.
-REQUIRED_ALLOWED_UPDATES = ("message", "message_reaction")
+REQUIRED_ALLOWED_UPDATES = ("message", "message_reaction", "my_chat_member", "channel_post")
 
 NOISY_LOGGERS = (
     "musicbrainzngs",
@@ -49,6 +52,7 @@ NOISY_LOGGERS = (
     "apscheduler",
     "aiogram.event",
     "urllib3",
+    "telethon",
 )
 
 
@@ -72,16 +76,13 @@ class CtxMiddleware(BaseMiddleware):
 
     async def __call__(self, handler, event: TelegramObject, data: dict):
         data["ctx"] = self.ctx
+        if ignore_bot_update(event, getattr(self.ctx, "bot", None)):
+            log.debug("ignored bot-originated update")
+            return None
         return await handler(event, data)
 
 
 def polling_allowed_updates(dp: Dispatcher) -> list[str]:
-    """Update types sent to getUpdates.
-
-    Starts from handlers actually registered (message, callback_query, …) and
-    always includes message + message_reaction. Passing only those two would
-    drop callback_query and break review/edit buttons.
-    """
     return sorted(set(dp.resolve_used_update_types()) | set(REQUIRED_ALLOWED_UPDATES))
 
 
@@ -131,13 +132,6 @@ def resolve_topic(message: Message, ctx: Ctx) -> tuple[int | None, str]:
 def build_router(jobs: asyncio.Queue[Job]) -> Router:
     router = Router()
 
-    @router.message(Command("start"))
-    async def start(message: Message) -> None:
-        await message.reply(
-            "Send FLAC files in the configured forum group. I tag, upload to Drive, and file them. "
-            "/suggest finds similar songs from Last.fm. ✓ rows are already in the library."
-        )
-
     @router.message(Command("chatid"))
     async def chatid(message: Message) -> None:
         await message.reply(
@@ -146,9 +140,21 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
             parse_mode="HTML",
         )
 
+    @router.my_chat_member()
+    async def on_my_chat_member(event: ChatMemberUpdated, ctx: Ctx) -> None:
+        chat = event.chat
+        status = str(getattr(event.new_chat_member.status, "value", event.new_chat_member.status))
+        active = status in {"member", "administrator", "creator"}
+        ctx.catalog.upsert_chat(
+            chat.id,
+            type=chat.type or "",
+            title=chat.title or getattr(chat, "full_name", None) or "",
+            active=active,
+        )
+
     @router.message(F.forum_topic_created)
     async def topic_created(message: Message, ctx: Ctx) -> None:
-        if message.chat.id != ctx.settings.allowed_chat_id:
+        if not await allow_user(ctx, message.from_user.id if message.from_user else None, message.chat):
             return
         created = message.forum_topic_created
         if created and message.message_thread_id:
@@ -156,66 +162,63 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
 
     @router.message(F.forum_topic_edited)
     async def topic_edited(message: Message, ctx: Ctx) -> None:
-        if message.chat.id != ctx.settings.allowed_chat_id:
+        if not await allow_user(ctx, message.from_user.id if message.from_user else None, message.chat):
             return
         edited = message.forum_topic_edited
         if edited and edited.name and message.message_thread_id:
             ctx.catalog.upsert_topic(message.message_thread_id, edited.name)
 
-    @router.message(F.document | F.audio)
-    async def on_media(message: Message, ctx: Ctx) -> None:
+    async def _intake_flac(message: Message, ctx: Ctx) -> None:
         if not is_flac_message(message):
             return
-        if message.chat.id != ctx.settings.allowed_chat_id:
-            log.info("ignored FLAC from chat_id=%s", message.chat.id)
+        if message_from_bot(message, ctx.bot) or not message.from_user:
+            log.debug("ignored bot or anonymous FLAC chat=%s", message.chat.id)
             return
+        if not await allow_user(ctx, message.from_user.id, message.chat):
+            return
+        touch(ctx, message.from_user.id)
         file_id, file_name = file_info(message)
-        thread_id, topic_name = resolve_topic(message, ctx)
-        if is_general_topic(thread_id, topic_name, is_topic_message=message.is_topic_message):
-            log.info("ignored FLAC in General topic thread_id=%s file=%s", thread_id, file_name)
-            return
-        status_id = 0
+        thread_id, _topic_name = resolve_topic(message, ctx)
+        from app.botapi import discard_download
+        from app.intake import ingest_local_flac
+
+        pending_dir = ctx.settings.pending_root / f"{message.chat.id}-{message.message_id}"
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        from pathlib import Path
+
+        from app.util import sanitize_filename
+
+        local = pending_dir / (sanitize_filename(Path(file_name).stem) + ".flac")
         try:
-            status = await message.reply(f"Queued <code>{html_esc(file_name)}</code>…", parse_mode="HTML")
-            status_id = status.message_id
-        except Exception as exc:
-            log.warning("queue reply failed: %s", exc)
-        # Recorded before enqueueing so a restart re-drives the job instead of
-        # leaving a permanently stale "Queued…" message.
-        pending_id = ctx.catalog.insert_pending_review(
-            phase="intake",
-            status="queued",
-            local_path="",
-            sidecar_path=None,
-            relative_path=None,
-            kind="library",
-            original_json="{}",
-            recommended_json="{}",
-            working_json="{}",
-            candidates_json="[]",
-            identity_json="{}",
-            source_report_json="{}",
-            chat_id=message.chat.id,
-            thread_id=thread_id,
-            status_message_id=status_id,
-            topic_name=topic_name,
-            file_name=file_name,
-            telegram_file_id=file_id,
-            source_message_id=message.message_id,
-            expires_at=intake_expires_at(),
-        )
-        await jobs.put(
-            Job(
-                chat_id=message.chat.id,
-                thread_id=thread_id,
-                topic_name=topic_name,
-                file_id=file_id,
+            telegram_file = await ctx.bot.get_file(file_id)
+            await ctx.bot.download(telegram_file, destination=local)
+            await asyncio.to_thread(discard_download, telegram_file.file_path)
+            await ingest_local_flac(
+                ctx,
+                chat=message.chat,
+                user_id=message.from_user.id,
+                path=local,
                 file_name=file_name,
-                status_message_id=status_id,
-                source_pending_id=pending_id,
+                thread_id=thread_id,
+                topic_name="",
+                telegram_file_id=file_id,
                 source_message_id=message.message_id,
             )
-        )
+        except AppError as exc:
+            await notify_user(ctx, message.from_user.id, exc.user_message, chat_id=message.chat.id)
+        except Exception as exc:
+            log.exception("group FLAC ingest failed")
+            await notify_user(ctx, message.from_user.id, to_app_error(exc).user_message, chat_id=message.chat.id)
+
+    @router.message(F.document | F.audio)
+    async def on_media(message: Message, ctx: Ctx) -> None:
+        if message.chat.type == "private":
+            return
+        await _intake_flac(message, ctx)
+
+    @router.channel_post(F.document | F.audio)
+    async def on_channel_media(message: Message, ctx: Ctx) -> None:
+        await _intake_flac(message, ctx)
 
     return router
 
@@ -254,18 +257,13 @@ async def main() -> None:
         settings.pending_root,
         settings.tmp_root,
         settings.covers_root,
+        settings.cache_root,
         settings.state_db.parent,
     ):
         path.mkdir(parents=True, exist_ok=True)
 
     catalog = Catalog(settings.state_db)
-    drive = DriveClient.from_settings(settings)
-    drive.assert_folders(
-        {
-            "GDRIVE_FOLDER_ID": settings.gdrive_folder_id,
-            "GDRIVE_REVIEW_FOLDER_ID": settings.gdrive_review_folder_id,
-        }
-    )
+    drive = DriveHub(settings, catalog)
     genre = GenreMapper(settings.genre_map_path)
     mb = MBClient(settings.musicbrainz_user_agent)
     http = httpx.AsyncClient(
@@ -291,11 +289,36 @@ async def main() -> None:
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.middleware(CtxMiddleware(ctx))
+
+    @dp.errors()
+    async def on_error(event: ErrorEvent, ctx: Ctx) -> None:
+        exc = event.exception
+        if isinstance(exc, asyncio.CancelledError):
+            raise exc
+        err = to_app_error(exc)
+        user_id = None
+        chat_id = None
+        update = event.update
+        if update.message and update.message.from_user:
+            user_id = update.message.from_user.id
+            chat_id = update.message.chat.id
+        elif update.callback_query and update.callback_query.from_user:
+            user_id = update.callback_query.from_user.id
+            if update.callback_query.message:
+                chat_id = update.callback_query.message.chat.id
+        log_error(err.code, user_id=user_id, chat_id=chat_id, exc=exc)
+        if user_id:
+            await notify_user(ctx, user_id, err.user_message, chat_id=chat_id)
+
+    dp.include_router(build_admin_router())
+    dp.include_router(build_user_command_router())
+    dp.include_router(build_hifi_router())
     dp.include_router(build_private_router(jobs))
     dp.include_router(build_review_command_router())
     dp.include_router(build_suggest_command_router())
     dp.include_router(build_edit_router())
     dp.include_router(build_reactions_router())
+    dp.include_router(build_search_text_router())
     dp.include_router(build_router(jobs))
     dp.include_router(build_review_router())
 
@@ -306,14 +329,18 @@ async def main() -> None:
 
     worker_task = asyncio.create_task(worker("main", jobs, ctx), name="tagger-worker")
     index_task: asyncio.Task | None = None
+    http_runner = None
     try:
         await wait_for_telegram(bot)
+        http_runner = await start_http(ctx)
         await recover_interrupted(ctx, jobs)
         allowed = polling_allowed_updates(dp)
-        log.info("polling allowed_updates=%s allowed_chat_id=%s", allowed, settings.allowed_chat_id)
+        log.info("polling allowed_updates=%s", allowed)
         index_task = asyncio.create_task(_warm_library_index(ctx), name="library-index")
         await dp.start_polling(bot, allowed_updates=allowed)
     finally:
+        if http_runner:
+            await http_runner.cleanup()
         if index_task:
             index_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

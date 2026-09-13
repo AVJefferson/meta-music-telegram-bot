@@ -7,6 +7,7 @@ x-logging: &logging
 services:
   telegram-bot-api:
     image: aiogram/telegram-bot-api:latest
+    # Needs Bot API 10.2+ for ephemeral receiver_user_id. Keep this image current.
     restart: unless-stopped
     environment:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID}
@@ -37,6 +38,10 @@ services:
     env_file: .env
     environment:
       TELEGRAM_API_BASE: http://telegram-bot-api:8081
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+    ports:
+      - "127.0.0.1:8080:8080"
     volumes:
       - bot-api-data:/var/lib/telegram-bot-api
       - bot-data:/data
@@ -57,17 +62,17 @@ services:
     mem_limit: 2g
     logging: *logging
     healthcheck:
-      test: ["CMD-SHELL", "test -d /data/library && test -d /data/review && test -d /data/covers"]
+      test: ["CMD-SHELL", "test -d /data/library && test -d /data/review && test -d /data/covers && test -d /data/cache"]
       interval: 10s
       timeout: 3s
       retries: 12
       start_period: 5s
 
   ftp:
+    profiles: ["ftp"]
     build: ./ftp
     restart: unless-stopped
-    # Only FTP settings — never the whole .env. This container is the one exposed
-    # to the network; it must not see BOT_TOKEN or the Google credentials.
+    # Shared cache only. Never sqlite, OAuth tokens, or hifi.session.
     environment:
       FTP_ROOT: /data
       FTP_USER: ${FTP_USER}
@@ -75,28 +80,13 @@ services:
       FTP_PASV_ADDRESS: ${FTP_PASV_ADDRESS}
       FTP_PASV_MIN_PORT: ${FTP_PASV_MIN_PORT:-21100}
       FTP_PASV_MAX_PORT: ${FTP_PASV_MAX_PORT:-21110}
-    # Subpath mounts, so state.sqlite, pending/ and tmp/ are not present in this
-    # container at all. Requires the directories to exist: bot creates them at
-    # startup, hence the service_healthy dependency below.
     volumes:
       - type: volume
         source: bot-data
-        target: /data/library
+        target: /data/cache
         read_only: true
         volume:
-          subpath: library
-      - type: volume
-        source: bot-data
-        target: /data/review
-        read_only: true
-        volume:
-          subpath: review
-      - type: volume
-        source: bot-data
-        target: /data/covers
-        read_only: true
-        volume:
-          subpath: covers
+          subpath: cache
       - ftp-certs:/etc/vsftpd/ssl
     ports:
       - "21:21"

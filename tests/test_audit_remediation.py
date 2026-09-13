@@ -304,8 +304,15 @@ class MembershipCacheTests(unittest.IsolatedAsyncioTestCase):
             calls.append(user_id)
             return SimpleNamespace(status="member")
 
+        catalog = SimpleNamespace(
+            is_user_blacklisted=lambda uid: False,
+            list_known_chat_ids=lambda: [-100123],
+            is_chat_blacklisted=lambda cid: False,
+            get_chat=lambda cid: SimpleNamespace(active=True),
+        )
         ctx = SimpleNamespace(
-            settings=SimpleNamespace(allowed_chat_id=-100123),
+            settings=SimpleNamespace(admin_telegram_user_id=1, dm_requires_known_chat=True),
+            catalog=catalog,
             bot=SimpleNamespace(get_chat_member=get_chat_member),
         )
         self.assertTrue(await is_forum_member(ctx, 42))
@@ -316,8 +323,15 @@ class MembershipCacheTests(unittest.IsolatedAsyncioTestCase):
         async def get_chat_member(chat_id: int, user_id: int):
             return SimpleNamespace(status="left")
 
+        catalog = SimpleNamespace(
+            is_user_blacklisted=lambda uid: False,
+            list_known_chat_ids=lambda: [-100123],
+            is_chat_blacklisted=lambda cid: False,
+            get_chat=lambda cid: SimpleNamespace(active=True),
+        )
         ctx = SimpleNamespace(
-            settings=SimpleNamespace(allowed_chat_id=-100123),
+            settings=SimpleNamespace(admin_telegram_user_id=1, dm_requires_known_chat=True),
+            catalog=catalog,
             bot=SimpleNamespace(get_chat_member=get_chat_member),
         )
         self.assertFalse(await is_forum_member(ctx, 42))
@@ -327,8 +341,15 @@ class MembershipCacheTests(unittest.IsolatedAsyncioTestCase):
         async def get_chat_member(chat_id: int, user_id: int):
             raise RuntimeError("telegram down")
 
+        catalog = SimpleNamespace(
+            is_user_blacklisted=lambda uid: False,
+            list_known_chat_ids=lambda: [-100123],
+            is_chat_blacklisted=lambda cid: False,
+            get_chat=lambda cid: SimpleNamespace(active=True),
+        )
         ctx = SimpleNamespace(
-            settings=SimpleNamespace(allowed_chat_id=-100123),
+            settings=SimpleNamespace(admin_telegram_user_id=1, dm_requires_known_chat=True),
+            catalog=catalog,
             bot=SimpleNamespace(get_chat_member=get_chat_member),
         )
         self.assertFalse(await is_forum_member(ctx, 42))

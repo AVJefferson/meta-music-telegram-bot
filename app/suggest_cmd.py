@@ -12,7 +12,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton
 
 from app.enrich import fetch_lrclib
 from app.library_index import entries_to_tracks, library_tracks_from_index, load_index_entries
-from app.membership import is_forum_member
+from app.membership import allow_from_callback, allow_user, user_is_bot
 from app.models import Ctx, Identity, TrackRecord
 from app.relocate import identity_from_track, tags_from_track
 from app.suggest import (
@@ -81,20 +81,6 @@ def parse_command_args(message: Message, command: CommandObject | None) -> str:
     return parts[1].strip() if len(parts) > 1 else ""
 
 
-def topic_name_for(message: Message, ctx: Ctx) -> str:
-    if message.chat.type == "private":
-        return ""
-    thread_id = message.message_thread_id
-    if not message.is_topic_message:
-        return ctx.catalog.get_topic(thread_id or 1) or "General"
-    if thread_id:
-        cached = ctx.catalog.get_topic(thread_id)
-        if cached:
-            return cached
-        return f"Topic {thread_id}"
-    return "General"
-
-
 def load_session_payload(raw: str) -> tuple[str | None, list[Suggestion]]:
     payload = json.loads(raw or "[]")
     language = None
@@ -113,11 +99,9 @@ def load_session_payload(raw: str) -> tuple[str | None, list[Suggestion]]:
 
 
 async def _authorized(message: Message, ctx: Ctx) -> bool:
-    if not message.from_user:
+    if not message.from_user or user_is_bot(message.from_user, ctx.bot):
         return False
-    if message.chat.type != "private" and message.chat.id != ctx.settings.allowed_chat_id:
-        return False
-    return await is_forum_member(ctx, message.from_user.id)
+    return await allow_user(ctx, message.from_user.id, message.chat)
 
 
 def _not_modified(exc: BaseException) -> bool:
@@ -227,18 +211,30 @@ async def _run_suggest(message: Message, ctx: Ctx, query: str) -> None:
         await _deliver(message, "Suggestions need LASTFM_API_KEY (Last.fm API account).")
         return
     mapper = ctx.genre
-    topic = topic_name_for(message, ctx)
-    language = mapper.language_from_topic(topic)
     query_tokens, leftover = mapper.extract_query_tokens(query)
+    language = next(
+        (
+            mapper.canonical_label(token) or token
+            for token in query_tokens
+            if mapper.token_bucket(token) == "languages"
+        ),
+        None,
+    )
     reply_track: TrackRecord | None = None
     reply = message.reply_to_message
     if reply:
         reply_track = ctx.catalog.get_track_by_message(message.chat.id, reply.message_id)
-    library = ctx.catalog.list_library_tracks()
+    library = ctx.catalog.list_library_tracks(message.from_user.id if message.from_user else None)
     if not library:
+        from dataclasses import replace
+
+        from app.drive import resolve_drive
+
+        uid = message.from_user.id if message.from_user else 0
+        bound = replace(ctx, index_user_id=uid, drive=resolve_drive(ctx, uid) or ctx.drive)
         library = await load_drive_library(
-            ctx,
-            topic=topic if language else None,
+            bound,
+            topic=None,
             notify=lambda text: _deliver(message, text),
         )
     if not library and reply_track is None:
@@ -259,7 +255,7 @@ async def _run_suggest(message: Message, ctx: Ctx, query: str) -> None:
     if language and not seeds:
         await _deliver(
             message,
-            f"No library tracks for {html_esc(language)}. Upload some, or run /suggest in General / DM.",
+            f"No library tracks tagged {html_esc(language)}.",
         )
         return
     if not seeds:
@@ -455,13 +451,26 @@ def build_suggest_command_router() -> Router:
     async def suggest_cmd(message: Message, ctx: Ctx, command: CommandObject | None = None) -> None:
         if not await _authorized(message, ctx):
             if message.chat.type == "private":
-                await message.reply("Private access requires current membership in configured forum group.")
+                await message.reply("Private access requires membership in a known group.")
             return
+        from app.ephemeral import send_private
+        from app.membership import touch
+        from app.user_cmd import _web_or_url_keyboard
+
+        touch(ctx, message.from_user.id)
+        kb = _web_or_url_keyboard(ctx, "suggest", None, "Open suggestions")
+        await send_private(
+            ctx,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+            text="Suggestions. Mini App if available, or pick below.",
+            reply_markup=kb,
+        )
         await _run_suggest(message, ctx, parse_command_args(message, command))
 
     @router.callback_query(F.data.regexp(r"^sg:\d+:\d+$"))
     async def suggest_page(callback: CallbackQuery, ctx: Ctx) -> None:
-        if not callback.from_user or not await is_forum_member(ctx, callback.from_user.id):
+        if not await allow_from_callback(ctx, callback):
             await callback.answer("Access denied.", show_alert=True)
             return
         if not callback.message:
@@ -469,7 +478,7 @@ def build_suggest_command_router() -> Router:
             return
         _, session_s, page_s = (callback.data or "sg:0:0").split(":")
         session = ctx.catalog.get_suggest_session(int(session_s))
-        if session is None:
+        if session is None or session.user_id != callback.from_user.id:
             await callback.answer("Suggestions expired. Run /suggest again.", show_alert=True)
             return
         await callback.answer()
@@ -491,7 +500,7 @@ def build_suggest_command_router() -> Router:
 
     @router.callback_query(F.data.regexp(r"^sgt:\d+:\d+$"))
     async def suggest_pick(callback: CallbackQuery, ctx: Ctx) -> None:
-        if not callback.from_user or not await is_forum_member(ctx, callback.from_user.id):
+        if not await allow_from_callback(ctx, callback):
             await callback.answer("Access denied.", show_alert=True)
             return
         if not callback.message:
@@ -499,7 +508,7 @@ def build_suggest_command_router() -> Router:
             return
         _, session_s, index_s = (callback.data or "sgt:0:0").split(":")
         session = ctx.catalog.get_suggest_session(int(session_s))
-        if session is None:
+        if session is None or session.user_id != callback.from_user.id:
             await callback.answer("Suggestions expired. Run /suggest again.", show_alert=True)
             return
         _language, items = load_session_payload(session.results_json)

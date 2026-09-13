@@ -19,14 +19,16 @@ from app.edit_ui import (
     show_field_menu,
 )
 from app.genre import genre_tokens
-from app.membership import is_forum_member
+from app.membership import allow_from_callback, allow_user, touch, user_is_bot
 from app.models import Ctx, Job, PendingReview, TrackRecord, identity_from_dict, tagset_from_dict
 from app.relocate import (
+    copy_track_for_user,
     delete_track,
     ensure_local_flac,
     identity_from_track,
     read_tags_for_card,
     relocate_track,
+    user_copy_of,
 )
 from app.tags import normalize_tagset, read_cover, read_tagset, write_tags
 from app.util import sanitize_filename
@@ -44,9 +46,9 @@ ADD_ONLY = {THUMBS_UP, THUMBS_DOWN, POO, MONKEY, FOLDED}
 DELETE_EMOJIS = {POO, MONKEY}
 
 _OP_LABELS = {
-    "library": "Move this track to the library on Google Drive?",
-    "review": "Move this track to the review folder on Google Drive?",
-    "delete": "Delete this track from local disk and Google Drive?",
+    "library": "Copy this track into your library?",
+    "review": "Copy this track into your review folder?",
+    "delete": "Delete this track from your library/review only?",
     "restart": "Re-identify from Telegram, local, or Drive? A successful run replaces the Drive copy.",
 }
 
@@ -108,10 +110,11 @@ def build_reactions_router() -> Router:
     @router.message_reaction()
     async def on_reaction(event: MessageReactionUpdated, ctx: Ctx) -> None:
         user = event.user
-        if user is None or user.is_bot:
+        if user is None or user_is_bot(user, ctx.bot):
             return
-        if not await is_forum_member(ctx, user.id):
+        if not await allow_user(ctx, user.id, event.chat):
             return
+        touch(ctx, user.id)
         added = added_emojis(event.old_reaction, event.new_reaction)
         removed = removed_emojis(event.old_reaction, event.new_reaction)
         if not added and not removed:
@@ -157,8 +160,11 @@ def build_reactions_router() -> Router:
         if callback.message and callback.message.chat.id != row.chat_id:
             await callback.answer()
             return
-        if not callback.from_user or not await is_forum_member(ctx, callback.from_user.id):
+        if not await allow_from_callback(ctx, callback):
             await callback.answer("Access denied.", show_alert=True)
+            return
+        if row.user_id and callback.from_user.id != row.user_id:
+            await callback.answer("Not your prompt.", show_alert=True)
             return
         if not ctx.catalog.claim_pending(row.id, "processing"):
             await callback.answer("Already handled.")
@@ -189,32 +195,23 @@ def _report_op(report: dict, op: str) -> dict:
 async def _reply_card(
     ctx: Ctx, event: MessageReactionUpdated, text: str, markup, *, thread_id: int | None = None
 ) -> int | None:
-    kwargs: dict = {
-        "chat_id": event.chat.id,
-        "text": text,
-        "parse_mode": "HTML",
-        "reply_markup": markup,
-    }
-    if thread_id:
-        kwargs["message_thread_id"] = thread_id
-    attempts = [
-        {**kwargs, "reply_to_message_id": event.message_id},
-        kwargs,
-    ]
-    if thread_id:
-        bare = dict(kwargs)
-        bare.pop("message_thread_id", None)
-        attempts.append(bare)
-    last_exc: Exception | None = None
-    for send_kwargs in attempts:
-        try:
-            sent = await ctx.bot.send_message(**send_kwargs)
-            return sent.message_id
-        except Exception as exc:
-            last_exc = exc
-            continue
-    log.warning("reaction reply failed: %s", last_exc)
-    return None
+    from app.ephemeral import send_private
+
+    user_id = event.user.id if event.user else 0
+    try:
+        sent = await send_private(
+            ctx,
+            chat_id=event.chat.id,
+            user_id=user_id,
+            text=text,
+            thread_id=thread_id,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return sent.message_id if sent else None
+    except Exception as exc:
+        log.warning("reaction reply failed: %s", exc)
+        return None
 
 
 async def _upsert_react_pending(
@@ -232,7 +229,7 @@ async def _upsert_react_pending(
     identity_json: str,
     source_report_json: str,
 ) -> PendingReview | None:
-    existing = ctx.catalog.get_waiting_for_track(track.id)
+    existing = ctx.catalog.get_waiting_for_track(track.id, event.user.id if event.user else None)
     thread_id = track.thread_id
     fields = dict(
         phase=phase,
@@ -255,6 +252,7 @@ async def _upsert_react_pending(
         old_drive_id=track.drive_file_id,
         telegram_file_id=track.telegram_file_id,
         expires_at=expires_at,
+        user_id=event.user.id if event.user else 0,
     )
     if existing and existing.phase.startswith("react"):
         update_fields = {k: v for k, v in fields.items() if k != "chat_id"}
@@ -269,7 +267,8 @@ async def _upsert_react_pending(
 
 
 async def _confirm_reaction(ctx: Ctx, event: MessageReactionUpdated, track: TrackRecord, emoji: str) -> None:
-    existing = ctx.catalog.get_waiting_for_track(track.id)
+    user_id = event.user.id if event.user else 0
+    existing = ctx.catalog.get_waiting_for_track(track.id, user_id)
     if existing and existing.phase in {"react_edit", "react_exit"}:
         await _reply_card(
             ctx,
@@ -281,16 +280,18 @@ async def _confirm_reaction(ctx: Ctx, event: MessageReactionUpdated, track: Trac
         return
     if emoji == THUMBS_UP:
         op = "library"
-        if track.kind == "library" and track.status == "uploaded":
+        mine = user_copy_of(ctx, track, user_id)
+        if mine and mine.kind == "library" and mine.status == "uploaded":
             await _reply_card(
-                ctx, event, "Already in library. No Drive change.", None, thread_id=track.thread_id
+                ctx, event, "Already in your library.", None, thread_id=track.thread_id
             )
             return
     elif emoji == THUMBS_DOWN:
         op = "review"
-        if track.kind == "review" and track.status == "uploaded":
+        mine = user_copy_of(ctx, track, user_id)
+        if mine and mine.kind == "review" and mine.status == "uploaded":
             await _reply_card(
-                ctx, event, "Already in review. No Drive change.", None, thread_id=track.thread_id
+                ctx, event, "Already in your review folder.", None, thread_id=track.thread_id
             )
             return
     elif emoji in DELETE_EMOJIS:
@@ -347,7 +348,7 @@ async def _stage_copy(ctx: Ctx, track: TrackRecord) -> Path:
 
 
 async def _enter_edit(ctx: Ctx, event: MessageReactionUpdated, track: TrackRecord) -> None:
-    existing = ctx.catalog.get_waiting_for_track(track.id)
+    existing = ctx.catalog.get_waiting_for_track(track.id, event.user.id if event.user else None)
     if existing and existing.phase in {"react_edit", "react_exit"}:
         if existing.phase == "react_edit":
             refreshed = ctx.catalog.get_pending_review(existing.id)
@@ -391,7 +392,7 @@ async def _enter_edit(ctx: Ctx, event: MessageReactionUpdated, track: TrackRecor
 
 
 async def _exit_edit_prompt(ctx: Ctx, event: MessageReactionUpdated, track: TrackRecord) -> None:
-    existing = ctx.catalog.get_waiting_for_track(track.id)
+    existing = ctx.catalog.get_waiting_for_track(track.id, event.user.id if event.user else None)
     if existing is None or existing.phase != "react_edit":
         return
     from app.edit_ui import _clear_edit_cover
@@ -451,45 +452,21 @@ async def _handle_confirm(ctx: Ctx, row: PendingReview, action: str) -> None:
         ctx.catalog.update_pending_review(row.id, status="failed")
         await edit_status(ctx, job, "Track is gone.")
         return
-    tags = tagset_from_dict(_loads(row.working_json, {}))
-    identity = identity_from_dict(_loads(row.identity_json, {}))
-    report = _loads(row.source_report_json, {})
     try:
         if op == "library":
-            if track.kind == "library" and track.status == "uploaded":
-                ctx.catalog.update_pending_review(row.id, status="done")
-                await edit_status(ctx, job, "Already in library.")
-                return
-            await relocate_track(
-                ctx,
-                track,
-                kind="library",
-                tags=tags,
-                identity=identity,
-                source_report=report,
-                topic_name=row.topic_name or track.topic_name or "General",
-                file_name=row.file_name or track.file_name or "track.flac",
-            )
-            await edit_status(ctx, job, "Moved to library on Google Drive.")
+            await copy_track_for_user(ctx, track, row.user_id or 0, kind="library")
+            await edit_status(ctx, job, "Copied to your library.")
         elif op == "review":
-            if track.kind == "review" and track.status == "uploaded":
-                ctx.catalog.update_pending_review(row.id, status="done")
-                await edit_status(ctx, job, "Already in review.")
-                return
-            await relocate_track(
-                ctx,
-                track,
-                kind="review",
-                tags=tags,
-                identity=identity,
-                source_report=report,
-                topic_name=row.topic_name or track.topic_name or "General",
-                file_name=row.file_name or track.file_name or "track.flac",
-            )
-            await edit_status(ctx, job, "Moved to review on Google Drive.")
+            await copy_track_for_user(ctx, track, row.user_id or 0, kind="review")
+            await edit_status(ctx, job, "Copied to your review folder.")
         elif op == "delete":
-            await delete_track(ctx, track)
-            await edit_status(ctx, job, "Deleted from disk and Google Drive.")
+            mine = user_copy_of(ctx, track, row.user_id or 0)
+            if mine is None:
+                ctx.catalog.update_pending_review(row.id, status="done")
+                await edit_status(ctx, job, "Nothing to delete in your library.")
+                return
+            await delete_track(ctx, mine)
+            await edit_status(ctx, job, "Removed from your library/review.")
         elif op == "restart":
             await _restart_track(ctx, row, track)
             return
@@ -497,10 +474,12 @@ async def _handle_confirm(ctx: Ctx, row: PendingReview, action: str) -> None:
             ctx.catalog.update_pending_review(row.id, status="waiting")
             await edit_status(ctx, job, "Unknown action.")
             return
-    except Exception:
+    except Exception as exc:
         log.exception("react confirm op=%s failed track=%s", op, track.id)
         ctx.catalog.update_pending_review(row.id, status="waiting")
-        await edit_status(ctx, job, "Drive action failed. Check logs.")
+        from app.errors import to_app_error
+
+        await edit_status(ctx, job, to_app_error(exc).user_message)
         return
     ctx.catalog.update_pending_review(row.id, status="done")
 
@@ -575,7 +554,7 @@ async def _restart_track(ctx: Ctx, row: PendingReview, track: TrackRecord) -> No
         Job(
             chat_id=row.chat_id,
             thread_id=row.thread_id,
-            topic_name=row.topic_name or track.topic_name or "General",
+            topic_name=row.topic_name or track.topic_name or "Unknown",
             file_id="",
             file_name=row.file_name or track.file_name or source.name,
             status_message_id=row.status_message_id,
@@ -642,15 +621,19 @@ async def _handle_exit(ctx: Ctx, row: PendingReview, action: str) -> None:
             tags=tags,
             identity=identity,
             source_report=report,
-            topic_name=row.topic_name or track.topic_name or "General",
+            topic_name=row.topic_name or track.topic_name or "Unknown",
             file_name=row.file_name or track.file_name or "track.flac",
             staged=staged,
+            correct_telegram=True,
+            editor_user_id=row.user_id or 0,
         )
         shutil.rmtree(staged.parent, ignore_errors=True)
-    except Exception:
+    except Exception as exc:
         log.exception("edit exit %s failed track=%s", action, track.id)
         ctx.catalog.update_pending_review(row.id, status="waiting")
-        await edit_status(ctx, job, "Could not write to Drive. Check logs.")
+        from app.errors import to_app_error
+
+        await edit_status(ctx, job, to_app_error(exc).user_message)
         return
     ctx.catalog.update_pending_review(row.id, status="done")
     dest = "review" if action == "draft" else "library"
