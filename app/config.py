@@ -30,7 +30,7 @@ class Settings(BaseSettings):
 
     public_base_url: str = ""
     oauth_http_port: int = 8080
-    user_inactive_months: int = 6
+    user_inactive_months: int = 3
     dm_requires_known_chat: bool = True
     hifi_bot_username: str = "HiFiAudioBot"
     hifi_session_path: Path = Path("/data/hifi.session")

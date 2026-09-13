@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Manual — MetaMusic</title>
+  <meta name="description" content="How to use MetaMusic in Telegram: send a FLAC, connect Drive, react to save, edit tags, review, and suggest.">
+  <meta name="theme-color" content="#f4efe6">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <header class="top">
+    <div class="wrap wrap-wide top-inner">
+      <a class="brand" href="/">
+        <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+          <rect width="32" height="32" rx="8" fill="currentColor"/>
+          <rect x="7" y="14" width="3" height="10" rx="1.2" fill="var(--paper)"/>
+          <rect x="12.5" y="8" width="3" height="16" rx="1.2" fill="var(--accent)"/>
+          <rect x="18" y="11" width="3" height="13" rx="1.2" fill="var(--paper)"/>
+          <rect x="23.5" y="16" width="3" height="8" rx="1.2" fill="var(--accent)"/>
+        </svg>
+        MetaMusic
+      </a>
+      <nav>
+        <a href="/">Home</a>
+        <a href="/manual">Manual</a>
+        <a href="/privacy">Privacy</a>
+        <a href="/terms">Terms</a>
+      </nav>
+    </div>
+  </header>
+  <main id="content">
+    <div class="wrap prose">
+      <p class="kicker">User manual</p>
+      <h1>How to use MetaMusic</h1>
+      <p class="lead">This is a Telegram bot, not a website you upload to. You send it a FLAC in a chat. It listens to a fingerprint of that file, looks up the recording, writes a short set of tags, and can drop a copy into your own Google Drive. The audio bits stay as they were — nothing is converted to MP3.</p>
+      <p>Search-by-name is off right now. Send a file. Song-name lookup will come back when the operator turns it on.</p>
+
+      <nav class="toc" aria-label="On this page">
+        <a href="#start">Start</a>
+        <a href="#drive">Drive</a>
+        <a href="#send">Send a FLAC</a>
+        <a href="#react">Reactions</a>
+        <a href="#edit">Edit tags</a>
+        <a href="#commands">Commands</a>
+        <a href="#stuck">If you get stuck</a>
+      </nav>
+
+      <h2 id="start">Start</h2>
+      <ol class="steps">
+        <li>
+          <h3>Be in a chat the bot already knows</h3>
+          <p>The bot lives in a group or channel. Join that chat. Direct messages only work after you are a member there (unless the operator made an exception for you). If a private chat says membership is required, join the group first, then message the bot.</p>
+        </li>
+        <li>
+          <h3>Say hello with <code>/start</code></h3>
+          <p>Send <code>/start</code> in a private chat with the bot. You should see when you first showed up, how many songs you have edited, whether Drive is connected, and that idle sessions are forgotten after three months. Do this once so later private confirmations have somewhere to land.</p>
+        </li>
+        <li>
+          <h3>Send a FLAC — that is the whole job</h3>
+          <p>Drop a <strong>.flac</strong> file in the group or in a private chat with the bot. MP3 and other formats are ignored. Photos and Files should be allowed in the group, and the bot should stay an admin, or reactions and cover pictures will not work well.</p>
+        </li>
+      </ol>
+
+      <h2 id="drive">Optional: connect Google Drive</h2>
+      <p>You do not need Drive to tag a file in Telegram. You need it if you want a copy in folders the bot creates in <em>your</em> account (a library folder and a review folder).</p>
+      <ol class="steps">
+        <li>
+          <h3>Run <code>/login</code></h3>
+          <p>The bot sends a private button. Open it. Google asks you to allow a narrow Drive permission: files this app creates, plus the music you sent it — not your whole Drive. Confirm. The window should say Drive is connected. You can close it.</p>
+        </li>
+        <li>
+          <h3>Never paste that link in the group</h3>
+          <p>The login link is one-time and only for you. If it expires, run <code>/login</code> again. If Google says the login died (common while the app is in testing), run <code>/login</code> again too.</p>
+        </li>
+        <li>
+          <h3>Pick a default save with <code>/settings</code></h3>
+          <p>Choose whether new saves go to <strong>library</strong>, <strong>review</strong>, or <strong>none</strong> (Telegram only). You can unlink Drive there as well. The screen often opens as a Mini App inside Telegram; if that fails, the bot falls back to a normal message.</p>
+        </li>
+      </ol>
+
+      <h2 id="send">What happens when you send a FLAC</h2>
+      <p>Think of it as a careful librarian, not a converter.</p>
+      <p>The bot takes a short acoustic fingerprint — a compact sketch of the sound, not a second copy of the album — and asks public catalogs (AcoustID, then MusicBrainz, and Last.fm when that is configured). It writes only a tight list of Vorbis comments: title, album, artists, composer, genre, date, track and disc numbers, synced lyrics when it finds them, and one front cover. Everything else on the file is stripped. Artists are written as <code>A, B, C &amp; D</code>. Genre is a pipe of <code>genre | mood | language | instrument</code>.</p>
+      <p>If more than one language shows up, they stay on the genre tag and you pick which library folder to use. If the group allows photos, you may see a few cover choices — tap the one that is right. If no pictures appear, the bot probably lacks photo permission in that chat.</p>
+      <p>When it is done, the chat gets the tagged audio and a caption. That message is the one you react to.</p>
+
+      <h2 id="react">Reactions on the tagged audio</h2>
+      <p>These are for the public audio+caption the bot posted. Your confirmations stay private (a quiet message only you see, or a DM).</p>
+      <dl class="cmds">
+        <dt><span class="react">👍</span> Save to your library</dt>
+        <dd><p>Copies the <em>current</em> Telegram file into your library. If Drive is connected, that is your Drive library folder. You get your own copy. The group message stays.</p></dd>
+        <dt><span class="react">👎</span> Save to review</dt>
+        <dd><p>Same idea, but into your review pile — songs you want to sit with before they join the library.</p></dd>
+        <dt><span class="react">💩</span> or <span class="react">🙉</span> Remove from yours</dt>
+        <dd><p>Deletes the copy from <em>your</em> library or review only. The group message is not removed. Other people keep whatever they already saved. Either emoji does the same job.</p></dd>
+        <dt><span class="react">🙏</span> Identify again</dt>
+        <dd><p>Runs fingerprinting and lookup once more if the first guess felt wrong.</p></dd>
+        <dt><span class="react">✍️</span> Edit tags</dt>
+        <dd><p>Opens the tag editor. When you commit, the <strong>group audio is replaced for everyone</strong>. Later thumbs-up copies that new file. The caption remembers who edited. Treat that as a group decision, not a private tweak.</p></dd>
+      </dl>
+      <p>The group needs those reactions enabled: 👍 👎 💩 🙉 🙏 ✍️.</p>
+
+      <h2 id="edit">Editing, review, and suggestions</h2>
+      <p>The editor lets you fix title, artists, album, and the rest of the allowlist, and pick a cover. Commit only when the group should all see the new file.</p>
+      <p><code>/review</code> opens your review folder. From the Mini App (or the private fallback) you can promote a track to the library, keep it as a draft, or cancel. This is your pile, not the group’s.</p>
+      <p><code>/suggest</code> looks at what you already have and, with Last.fm, proposes nearby artists and tracks. It is a “what next” list, not a download button. Search-by-name for files you do <em>not</em> have is off at the moment — send a FLAC instead of hoping <code>/get</code> will fetch one.</p>
+
+      <h2 id="commands">Commands at a glance</h2>
+      <dl class="cmds">
+        <dt><code>/start</code></dt>
+        <dd><p>Status: Drive, idle timer, what you can do.</p></dd>
+        <dt><code>/login</code></dt>
+        <dd><p>Connect Google Drive. Private, one-time link.</p></dd>
+        <dt><code>/settings</code></dt>
+        <dd><p>Default save location (library / review / none) and unlink Drive.</p></dd>
+        <dt><code>/review</code></dt>
+        <dd><p>Your review pile.</p></dd>
+        <dt><code>/suggest</code></dt>
+        <dd><p>Recommendations from your library.</p></dd>
+        <dt><code>/get</code> and typing a song name</dt>
+        <dd><p>Temporarily off. The bot will tell you to send a FLAC.</p></dd>
+      </dl>
+      <p>Login, settings, review, and suggest prefer the Mini App inside Telegram (music.avje.in). If the Mini App cannot open, you get the same actions as ordinary private messages.</p>
+
+      <h2 id="stuck">If you get stuck</h2>
+      <p>Login link expired or Google denied access: <code>/login</code> again. Do not reuse an old URL.</p>
+      <p>Private chat blocked: join the known group, then <code>/start</code> the bot in DM.</p>
+      <p>No cover pictures: give the bot permission to send photos in that group.</p>
+      <p>Someone else’s edit showed up in your Drive after a thumbs-up: that is expected. ✍️ replaces the group file; 👍 copies whatever is current. Only thumbs-up files you still want.</p>
+      <p>Want Drive gone: unlink in <code>/settings</code>. Music we still have on our servers is deleted after one week. Idle bot sessions are forgotten after three months. Copies already in your Drive stay until you delete them in Drive. Details are on the <a href="/privacy">privacy page</a>.</p>
+    </div>
+  </main>
+  <footer class="foot">
+    <div class="wrap wrap-wide foot-inner">
+      <p>© <span id="y"></span> MetaMusic</p>
+      <p><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a></p>
+    </div>
+  </footer>
+  <script src="/js/site.js" nonce="NONCE_PLACEHOLDER"></script>
+</body>
+</html>

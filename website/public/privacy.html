@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy Policy — MetaMusic</title>
+  <meta name="description" content="MetaMusic cannot read your Google Drive. Music files on our servers are kept for one week. Idle sessions are forgotten after three months.">
+  <meta name="theme-color" content="#f4efe6">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <header class="top">
+    <div class="wrap wrap-wide top-inner">
+      <a class="brand" href="/">
+        <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+          <rect width="32" height="32" rx="8" fill="currentColor"/>
+          <rect x="7" y="14" width="3" height="10" rx="1.2" fill="var(--paper)"/>
+          <rect x="12.5" y="8" width="3" height="16" rx="1.2" fill="var(--accent)"/>
+          <rect x="18" y="11" width="3" height="13" rx="1.2" fill="var(--paper)"/>
+          <rect x="23.5" y="16" width="3" height="8" rx="1.2" fill="var(--accent)"/>
+        </svg>
+        MetaMusic
+      </a>
+      <nav>
+        <a href="/">Home</a>
+        <a href="/manual">Manual</a>
+        <a href="/privacy">Privacy</a>
+        <a href="/terms">Terms</a>
+      </nav>
+    </div>
+  </header>
+  <main id="content">
+    <div class="wrap prose">
+      <p class="kicker">Privacy policy</p>
+      <h1>What this bot can see, and how long we keep it</h1>
+      <p class="updated">Last updated 14 September 2026. This page is for people using MetaMusic, and for Google and Telegram review.</p>
+      <p class="lead">MetaMusic is a Telegram bot that tags FLAC files you send it. Drive is optional. We wrote this in ordinary language so you do not have to decode permission names to know where you stand. Step-by-step use is in the <a href="/manual">manual</a>.</p>
+
+      <section class="cards" aria-label="The two promises">
+        <article class="card">
+          <p class="kicker">Google Drive</p>
+          <h2>We cannot read your entire Drive</h2>
+          <p>When you tap Connect Google Drive, Google shows a permission screen. That screen does <strong>not</strong> mean “let this bot open everything in Drive.”</p>
+          <p>MetaMusic uses Google’s limited <em>drive.file</em> access. In practice that means the bot can create its own folders (a library and a review folder) and can upload or update the music <strong>you sent it in Telegram</strong>. It cannot list, search, open, or download the rest of your Drive. Your photos, PDFs, other people’s shares, and folders you already had are out of reach.</p>
+          <p>We also see the email address of the Google account you linked, so the settings screen can show you which account is connected. We do not use that email for marketing.</p>
+        </article>
+        <article class="card">
+          <p class="kicker">Retention</p>
+          <h2>One week for music. Three months if you go quiet.</h2>
+          <div class="metrics">
+            <div class="metric">
+              <strong>1 week</strong>
+              <span>Music files on our servers</span>
+            </div>
+            <div class="metric">
+              <strong>3 months</strong>
+              <span>Your bot session if unused</span>
+            </div>
+          </div>
+          <p>These two clocks are the whole retention story on our side. They are not “up to,” and they are not hidden in a footnote.</p>
+        </article>
+      </section>
+
+      <h2>Music files: one week on our servers</h2>
+      <p>While the bot tags a track, it may keep a copy on our server: the file you sent, a cache copy, or a temporary file waiting to upload. Each of those copies has its own timestamp. After <strong>one week</strong> (seven days) from that timestamp, a daily cleanup job deletes it. We do not keep a permanent music library on our machines.</p>
+      <p>If you already saved a tagged copy into <em>your</em> Google Drive, that copy is yours. Deleting our server copy does not delete the Drive copy. Remove it in Drive if you want it gone there. Files still being processed or uploaded are not wiped mid-job.</p>
+
+      <h2>Your session: three months of silence</h2>
+      <p>A “session” here is not your Telegram login. It is the record we keep so the bot knows you: your Telegram user id, settings, and — if you connected Drive — the stored Google login (a refresh token) that lets us upload into those MetaMusic folders.</p>
+      <p>If you do not use the bot for <strong>three months</strong>, we treat you as idle. We drop the stored Google login first, then forget the rest of that bot session on our servers. You can talk to the bot again later and connect Drive again if you still want it.</p>
+      <p>You can also unlink Drive yourself in the Mini App settings at any time. That throws away the stored Google login immediately, without waiting three months.</p>
+
+      <h2>What we receive from Telegram</h2>
+      <p>Telegram sends us what you would expect a bot to see: your user id, the chats where the bot is used, files and captions you send it, button taps, and reactions on its messages. The Mini App sends a short signed packet (<code>initData</code>) so we know the request is really you. We use all of that only to run tagging, library, review, and settings — not to profile you for ads.</p>
+      <p>If you send a FLAC in a group, people in that group can see it. That is Telegram, not a MetaMusic share setting.</p>
+
+      <h2>Lookups that are not Google</h2>
+      <p>To guess tags, we send an audio fingerprint to AcoustID. We may ask MusicBrainz or Last.fm for titles, artists, and related metadata. Those services never receive your Google password or Drive token. The audio itself is not re-encoded.</p>
+
+      <h2>What we do not do</h2>
+      <p>We do not sell your data. We do not use Google user data for advertising. We do not share your Drive token with other apps. The Google client secret stays on the bot server. Login happens on https://music.avje.in (the same site as the Mini App), not on this www site.</p>
+
+      <h2>Who to ask</h2>
+      <p>MetaMusic is run by the person behind the Telegram bot you are talking to. Message that bot in a private chat if you want your server-side session wiped sooner than the three-month idle timer. Do not paste secrets or OAuth links in a public group.</p>
+    </div>
+  </main>
+  <footer class="foot">
+    <div class="wrap wrap-wide foot-inner">
+      <p>© <span id="y"></span> MetaMusic</p>
+      <p><a href="/manual">Manual</a> · <a href="/terms">Terms of use</a></p>
+    </div>
+  </footer>
+  <script src="/js/site.js" nonce="NONCE_PLACEHOLDER"></script>
+</body>
+</html>

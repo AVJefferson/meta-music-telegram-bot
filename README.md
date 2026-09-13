@@ -12,7 +12,7 @@ Friends-only by obscurity + admin blacklist. The bot username is **not** a secur
    - `/setprivacy` → **Disable**
    - Add to groups/channels. Grant Photos and Files. Keep it **admin** so reaction updates arrive.
    - Enable group reactions: 👍 👎 💩 🙉 🙏 ✍️
-   - Mini App: BotFather domain = `PUBLIC_BASE_URL` host
+   - Mini App: BotFather domain = `PUBLIC_BASE_URL` host (`music.avje.in`). Keep `/app` and `/api` on that origin (Telegram same-origin). Public policies: `www.music.avje.in`.
 2. `api_id` / `api_hash` from [my.telegram.org](https://my.telegram.org) (local Bot API + Telethon HiFi session)
 3. Free [AcoustID](https://acoustid.org/new-application) key
 4. MusicBrainz user-agent with a real contact email
@@ -23,7 +23,7 @@ Friends-only by obscurity + admin blacklist. The bot username is **not** a secur
    - Redirect URI: `${PUBLIC_BASE_URL}/oauth/callback`
    - Consent **Testing** + friends as test users (or publish later)
    - `GOOGLE_CLIENT_SECRET` stays on the bot server only
-7. Reverse proxy TLS in front of `127.0.0.1:8080`. Do not put raw HTTP on the WAN.
+7. Reverse proxy TLS in front of `127.0.0.1:8080` (Mini App + `/api` + OAuth) and `127.0.0.1:8082` (www). Samples: `samples/music.nginx.conf`, `samples/www.music.nginx.conf`. Do not put raw HTTP on the WAN. Do not put APIs on a second host.
 
 Set `ADMIN_TELEGRAM_USER_ID` to your Telegram user id.
 
@@ -79,7 +79,7 @@ Confirm UI is private (ephemeral or DM).
 
 ## Retention
 
-Daily 03:00 UTC (`CLEANUP_CRON`): Drive retry for logged-in users. Drop a local Drive-confirmed file, logged-out local, unused `/data/cache` entry, or tmp dir only after **7 days for that item**. Forget users idle longer than `USER_INACTIVE_MONTHS` (tokens first). Skip `processing`/`uploading`.
+Daily 03:00 UTC (`CLEANUP_CRON`): Drive retry for logged-in users. Drop a local Drive-confirmed file, logged-out local, unused `/data/cache` entry, or tmp dir only after **1 week for that item**. Forget users idle longer than `USER_INACTIVE_MONTHS` (default **3 months**; tokens first). Skip `processing`/`uploading`. Drive copies you already saved stay in your Drive.
 
 ## Threats
 

@@ -68,6 +68,30 @@ services:
       retries: 12
       start_period: 5s
 
+  website:
+    build: ./website
+    restart: unless-stopped
+    # Public policies at www.music.avje.in. Host nginx → 127.0.0.1:8082.
+    ports:
+      - "127.0.0.1:8082:8080"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    mem_limit: 64m
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    logging: *logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
   ftp:
     profiles: ["ftp"]
     build: ./ftp

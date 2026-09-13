@@ -96,7 +96,7 @@ def build_user_command_router() -> Router:
                 await message.reply("Private access requires membership in a known group.")
             return
         user = ctx.catalog.touch_user(message.from_user.id)
-        months = int(getattr(ctx.settings, "user_inactive_months", 6) or 6)
+        months = int(getattr(ctx.settings, "user_inactive_months", 3) or 3)
         cmds = ["/start", "/login", "/settings", "/review", "/suggest"]
         if SEARCH_ENABLED:
             if message.chat.type == "private":
@@ -154,7 +154,7 @@ def build_user_command_router() -> Router:
         if not await allow_user(ctx, message.from_user.id, message.chat):
             return
         user = ctx.catalog.touch_user(message.from_user.id)
-        months = int(getattr(ctx.settings, "user_inactive_months", 6) or 6)
+        months = int(getattr(ctx.settings, "user_inactive_months", 3) or 3)
         kb = _web_or_url_keyboard(ctx, "settings", None, "Open settings")
         text = (
             f"Drive: {html_esc(user.google_email or 'not connected')}\n"

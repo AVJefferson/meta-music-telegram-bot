@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MetaMusic</title>
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <style>
+  <script src="https://telegram.org/js/telegram-web-app.js" nonce="NONCE_PLACEHOLDER"></script>
+  <style nonce="NONCE_PLACEHOLDER">
     body { font-family: sans-serif; margin: 1rem; }
     button { margin: 0.25rem 0; }
     .row { padding: 0.4rem 0; border-bottom: 1px solid #ddd; }
@@ -19,7 +19,7 @@
   <div id="settings"></div>
   <div id="review"></div>
   <div id="suggest"></div>
-  <script>
+  <script nonce="NONCE_PLACEHOLDER">
     const tg = window.Telegram && window.Telegram.WebApp;
     if (tg) tg.ready();
     const page = (location.pathname.split("/").pop() || "home");

@@ -183,7 +183,7 @@ def _purge_cache(ctx: Ctx) -> None:
 
 
 async def _forget_inactive(ctx: Ctx) -> None:
-    months = int(getattr(ctx.settings, "user_inactive_months", 6) or 6)
+    months = int(getattr(ctx.settings, "user_inactive_months", 3) or 3)
     before = _iso_months_ago(months)
     for user in ctx.catalog.list_inactive_users(before):
         uid = user.telegram_user_id
@@ -238,7 +238,7 @@ async def run_cleanup(ctx: Ctx) -> None:
 
 
 async def _prune_drive_review_folders(ctx: Ctx) -> None:
-    for user in ctx.catalog.list_active_users(_iso_months_ago(int(getattr(ctx.settings, "user_inactive_months", 6) or 6))):
+    for user in ctx.catalog.list_active_users(_iso_months_ago(int(getattr(ctx.settings, "user_inactive_months", 3) or 3))):
         if not user.gdrive_review_folder_id:
             continue
         bound = ctx_for_user(ctx, user.telegram_user_id)

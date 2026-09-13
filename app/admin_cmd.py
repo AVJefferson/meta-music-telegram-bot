@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 
 def _since_iso(ctx: Ctx) -> str:
-    months = int(getattr(ctx.settings, "user_inactive_months", 6) or 6)
+    months = int(getattr(ctx.settings, "user_inactive_months", 3) or 3)
     return (datetime.now(timezone.utc) - timedelta(days=30 * months)).isoformat(timespec="seconds")
 
 

@@ -13,3 +13,4 @@ data/
 *.log
 *.key.json
 *.pem
+samples/

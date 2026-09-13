@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MetaMusic</title>
+  <meta name="description" content="MetaMusic tags FLAC files in Telegram and can save them to your Google Drive. It cannot read your Drive. Music on our servers is kept for one week.">
+  <meta name="theme-color" content="#f4efe6">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <header class="top">
+    <div class="wrap wrap-wide top-inner">
+      <a class="brand" href="/">
+        <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+          <rect width="32" height="32" rx="8" fill="currentColor"/>
+          <rect x="7" y="14" width="3" height="10" rx="1.2" fill="var(--paper)"/>
+          <rect x="12.5" y="8" width="3" height="16" rx="1.2" fill="var(--accent)"/>
+          <rect x="18" y="11" width="3" height="13" rx="1.2" fill="var(--paper)"/>
+          <rect x="23.5" y="16" width="3" height="8" rx="1.2" fill="var(--accent)"/>
+        </svg>
+        MetaMusic
+      </a>
+      <nav>
+        <a href="/">Home</a>
+        <a href="/manual">Manual</a>
+        <a href="/privacy">Privacy</a>
+        <a href="/terms">Terms</a>
+      </nav>
+    </div>
+  </header>
+  <main id="content">
+    <div class="wrap">
+      <p class="kicker">Telegram bot</p>
+      <h1>Tag your FLACs.<br>Keep them in your Drive.</h1>
+      <p class="lead">MetaMusic is a Telegram bot. Send it a FLAC, and it fingerprints the file, writes clean tags, and can place a copy in <em>your</em> Google Drive. It never re-encodes the audio.</p>
+      <p class="lead">This website is the public front door: what the bot does, how to use it, what it can see, and how long it keeps anything. The Mini App itself opens inside Telegram at music.avje.in.</p>
+      <div class="hero-actions">
+        <a class="btn btn-solid" href="/manual">How to use the bot</a>
+        <a class="btn btn-ghost" href="/privacy">Privacy</a>
+      </div>
+    </div>
+    <div class="wrap">
+      <section class="features" aria-label="What the bot does">
+        <article class="card">
+          <p class="kicker">Identify</p>
+          <h2>It listens to a fingerprint, not a re-encode</h2>
+          <p>You send a FLAC. The bot sketches the sound (a compact fingerprint), asks public catalogs who recorded it, and writes a short, strict set of tags back onto that same file. Title, artists, album, genre, cover, synced lyrics when they exist. The audio itself is never converted.</p>
+        </article>
+        <article class="card">
+          <p class="kicker">Your Drive</p>
+          <h2>Optional copy. Not a Drive browser.</h2>
+          <p>Connect Drive if you want the tagged file in folders the bot creates for you. Google does not let it open the rest of your Drive. No Drive? Tagging in Telegram still works. Unlink any time in settings.</p>
+        </article>
+        <article class="card">
+          <p class="kicker">In the chat</p>
+          <h2>React on the posted song</h2>
+          <p>👍 puts the current file in your library. 👎 puts it in review. 💩 or 🙉 removes it from yours only. 🙏 identifies again. ✍️ opens the tag editor — and on save, the group audio is replaced for everyone. Confirmations stay private.</p>
+        </article>
+        <article class="card">
+          <p class="kicker">Your pile</p>
+          <h2>Review and suggest, in a Mini App</h2>
+          <p>Review is a holding folder for tracks you are not ready to keep. Suggest looks at what you already have and proposes nearby music. Login, settings, review, and suggest open inside Telegram. Search-by-name is off for now: send a FLAC.</p>
+        </article>
+      </section>
+      <section class="cards" aria-label="The two things people ask first">
+        <article class="card">
+          <p class="kicker">Google Drive</p>
+          <h2>This bot cannot read your Drive</h2>
+          <p>Connecting Drive does not hand us your photos, documents, or the rest of your files. Google only lets MetaMusic touch files <strong>it created</strong> and the music <strong>you sent it in Telegram</strong>. Everything else in Drive stays invisible to the bot.</p>
+        </article>
+        <article class="card">
+          <p class="kicker">How long we keep things</p>
+          <h2>Short clocks, on purpose</h2>
+          <div class="metrics">
+            <div class="metric">
+              <strong>1 week</strong>
+              <span>Music files on our servers</span>
+            </div>
+            <div class="metric">
+              <strong>3 months</strong>
+              <span>Your bot session if you go quiet</span>
+            </div>
+          </div>
+          <p>Copies we hold while tagging are deleted after one week. If you do not use the bot for three months, we forget your stored login and session. Files already saved in your Drive stay there until you remove them.</p>
+        </article>
+      </section>
+      <p class="note">Open MetaMusic from Telegram. Do not paste login links in a public group. Step-by-step is in the <a href="/manual">manual</a>. Data rules are on the <a href="/privacy">privacy page</a>.</p>
+    </div>
+  </main>
+  <footer class="foot">
+    <div class="wrap wrap-wide foot-inner">
+      <p>© <span id="y"></span> MetaMusic</p>
+      <p><a href="/manual">Manual</a> · <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a></p>
+    </div>
+  </footer>
+  <script src="/js/site.js" nonce="NONCE_PLACEHOLDER"></script>
+</body>
+</html>

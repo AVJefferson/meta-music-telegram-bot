@@ -165,7 +165,7 @@ async def api_me(request: web.Request) -> web.Response:
     except AppError as exc:
         return web.json_response(exc.as_json(), status=exc.http_status)
     user = ctx.catalog.ensure_user(user_id)
-    months = int(getattr(ctx.settings, "user_inactive_months", 6) or 6)
+    months = int(getattr(ctx.settings, "user_inactive_months", 3) or 3)
     settings = {}
     try:
         settings = json.loads(user.settings_json or "{}")
