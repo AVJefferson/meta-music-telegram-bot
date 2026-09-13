@@ -194,6 +194,13 @@ class WebAppKeyboardTests(unittest.TestCase):
         self.assertEqual(btn.web_app.url, "https://music.example/app/login")
         self.assertIsNone(btn.url)
 
+    def test_https_suggest_query_on_webapp_url(self) -> None:
+        from app.user_cmd import _web_or_url_keyboard
+
+        ctx = SimpleNamespace(settings=SimpleNamespace(public_base_url="https://music.example"))
+        kb = _web_or_url_keyboard(ctx, "suggest", None, "Open suggestions", q="radiohead")
+        self.assertEqual(kb.inline_keyboard[0][0].web_app.url, "https://music.example/app/suggest?q=radiohead")
+
     def test_http_without_fallback_has_no_keyboard(self) -> None:
         from app.user_cmd import _web_or_url_keyboard
 

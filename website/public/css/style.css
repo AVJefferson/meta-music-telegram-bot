@@ -127,23 +127,13 @@ a:hover { color: var(--accent); }
   background: #000;
 }
 
-.hero-logo {
-  display: block;
-  width: min(13.5rem, 58vw);
-  height: auto;
-  margin: 0 0 1.75rem;
-  border-radius: 1.25rem;
-  background: #000;
-  box-shadow: var(--shadow);
-}
-
 .qr-card {
-  margin: 2rem 0 0;
+  margin: 1.6rem 0 0;
 }
 
 .qr-card > a {
   display: block;
-  width: min(16rem, 100%);
+  width: 7.25rem;
   line-height: 0;
 }
 
@@ -151,7 +141,7 @@ a:hover { color: var(--accent); }
   display: block;
   width: 100%;
   height: auto;
-  border-radius: 1.15rem;
+  border-radius: 0.7rem;
   background: #000;
   box-shadow: var(--shadow);
 }
@@ -169,11 +159,11 @@ a:hover { color: var(--accent); }
 }
 
 .qr-card--compact {
-  margin: 1.4rem 0 1.8rem;
+  margin: 1.25rem 0 1.5rem;
 }
 
 .qr-card--compact > a {
-  width: min(12.5rem, 100%);
+  width: 6.5rem;
 }
 
 nav {
@@ -426,6 +416,8 @@ code, .cmd {
 
 @media (min-width: 720px) {
   .features { grid-template-columns: 1fr 1fr; }
+  .qr-card > a { width: 10.5rem; }
+  .qr-card--compact > a { width: 8.5rem; }
 }
 
 .foot {
@@ -447,7 +439,11 @@ code, .cmd {
 @media (max-width: 640px) {
   html { font-size: 100%; }
   .metrics { grid-template-columns: 1fr; }
-  main { padding-top: 2rem; }
+  main { padding-top: 1.6rem; }
+  h1 { font-size: 1.85rem; }
+  .top-inner { padding: 0.7rem 0; }
+  nav { flex-wrap: wrap; }
+  nav a { font-size: 0.86rem; padding: 0.28rem 0.55rem; }
 }
 
 @media (prefers-reduced-motion: reduce) {

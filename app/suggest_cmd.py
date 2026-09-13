@@ -458,7 +458,8 @@ def build_suggest_command_router() -> Router:
         from app.user_cmd import _web_or_url_keyboard
 
         touch(ctx, message.from_user.id)
-        kb = _web_or_url_keyboard(ctx, "suggest", None, "Open suggestions")
+        query = parse_command_args(message, command)
+        kb = _web_or_url_keyboard(ctx, "suggest", None, "Open suggestions", q=query or None)
         await send_private(
             ctx,
             chat_id=message.chat.id,
@@ -466,7 +467,7 @@ def build_suggest_command_router() -> Router:
             text="Suggestions. Mini App if available, or pick below.",
             reply_markup=kb,
         )
-        await _run_suggest(message, ctx, parse_command_args(message, command))
+        await _run_suggest(message, ctx, query)
 
     @router.callback_query(F.data.regexp(r"^sg:\d+:\d+$"))
     async def suggest_page(callback: CallbackQuery, ctx: Ctx) -> None:

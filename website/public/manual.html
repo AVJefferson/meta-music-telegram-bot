@@ -23,7 +23,7 @@
         <a href="/manual">Manual</a>
         <a href="/privacy">Privacy</a>
         <a href="/terms">Terms</a>
-        <a href="https://t.me/MetaMusicProBot">Telegram</a>
+        <a href="https://t.me/MetaMusicProBot" target="_blank" rel="noopener noreferrer">Telegram</a>
       </nav>
     </div>
   </header>
@@ -31,12 +31,12 @@
     <div class="wrap prose">
       <p class="kicker">User manual</p>
       <h1>How to use MetaMusic</h1>
-      <p class="lead">This is a Telegram bot, not a website you upload to. Open <a href="https://t.me/MetaMusicProBot">@MetaMusicProBot</a>, then send it a FLAC in a chat. It listens to a fingerprint of that file, looks up the recording, writes a short set of tags, and can drop a copy into your own Google Drive. The audio bits stay as they were — nothing is converted to MP3.</p>
+      <p class="lead">This is a Telegram bot, not a website you upload to. Open <a href="https://t.me/MetaMusicProBot" target="_blank" rel="noopener noreferrer">@MetaMusicProBot</a>, then send it a FLAC in a chat. It listens to a fingerprint of that file, looks up the recording, writes a short set of tags, and can drop a copy into your own Google Drive. The audio bits stay as they were — nothing is converted to MP3.</p>
       <figure class="qr-card qr-card--compact">
-        <a href="https://t.me/MetaMusicProBot">
-          <img src="/img/qr.jpg" width="1013" height="1024" alt="QR code for @MetaMusicProBot">
+        <a href="https://t.me/MetaMusicProBot" target="_blank" rel="noopener noreferrer">
+          <img src="/img/qr.jpg" width="136" height="138" alt="QR code for @MetaMusicProBot">
         </a>
-        <figcaption>Scan, or open <a href="https://t.me/MetaMusicProBot">@MetaMusicProBot</a>.</figcaption>
+        <figcaption>Scan, or open <a href="https://t.me/MetaMusicProBot" target="_blank" rel="noopener noreferrer">@MetaMusicProBot</a>.</figcaption>
       </figure>
       <p>Search-by-name is off right now. Send a file. Song-name lookup will come back when the operator turns it on.</p>
 
@@ -58,7 +58,7 @@
         </li>
         <li>
           <h3>Say hello with <code>/start</code></h3>
-          <p>Send <code>/start</code> in a private chat with <a href="https://t.me/MetaMusicProBot">@MetaMusicProBot</a>. You should see when you first showed up, how many songs you have edited, whether Drive is connected, and that idle sessions are forgotten after three months. Do this once so later private confirmations have somewhere to land.</p>
+          <p>Send <code>/start</code> in a private chat with <a href="https://t.me/MetaMusicProBot" target="_blank" rel="noopener noreferrer">@MetaMusicProBot</a>. You should see when you first showed up, how many songs you have edited, whether Drive is connected, and that idle sessions are forgotten after three months. Do this once so later private confirmations have somewhere to land.</p>
         </li>
         <li>
           <h3>Send a FLAC — that is the whole job</h3>
@@ -93,20 +93,20 @@
       <p>These are for the public audio+caption the bot posted. Your confirmations stay private (a quiet message only you see, or a DM).</p>
       <dl class="cmds">
         <dt><span class="react">👍</span> Save to your library</dt>
-        <dd><p>Copies the <em>current</em> Telegram file into your library. If Drive is connected, that is your Drive library folder. You get your own copy. The group message stays.</p></dd>
+        <dd><p>The bot asks first. No copy yet? It copies the <em>current</em> Telegram file into your library (Drive, if connected). Already in review? It offers to <em>move</em> that Drive copy to the library. Already in the library? Nothing happens. The group message stays.</p></dd>
         <dt><span class="react">👎</span> Save to review</dt>
-        <dd><p>Same idea, but into your review pile — songs you want to sit with before they join the library.</p></dd>
+        <dd><p>Same confirm: copy Telegram → review, or move your library copy into review, or skip if it is already there.</p></dd>
         <dt><span class="react">💩</span> or <span class="react">🙉</span> Remove from yours</dt>
         <dd><p>Deletes the copy from <em>your</em> library or review only. The group message is not removed. Other people keep whatever they already saved. Either emoji does the same job.</p></dd>
         <dt><span class="react">🙏</span> Identify again</dt>
-        <dd><p>Runs fingerprinting and lookup once more if the first guess felt wrong.</p></dd>
+        <dd><p>Fingerprints and looks up again, then replaces the <strong>group or channel audio</strong> if the tags change. Individual Drive libraries are left alone until someone 👍 or 👎.</p></dd>
         <dt><span class="react">✍️</span> Edit tags</dt>
-        <dd><p>Opens the tag editor. When you commit, the <strong>group audio is replaced for everyone</strong>. Later thumbs-up copies that new file. The caption remembers who edited. Treat that as a group decision, not a private tweak.</p></dd>
+        <dd><p>Opens the tag editor. Commit replaces the <strong>group or channel audio for everyone</strong>. Drive copies stay as they are. Later 👍 copies that new Telegram file; 👎 copies it into review. The caption remembers who edited. Treat that as a group decision, not a private tweak.</p></dd>
       </dl>
       <p>The group needs those reactions enabled: 👍 👎 💩 🙉 🙏 ✍️.</p>
 
       <h2 id="edit">Editing, review, and suggestions</h2>
-      <p>The editor lets you fix title, artists, album, and the rest of the allowlist, and pick a cover. Commit only when the group should all see the new file.</p>
+      <p>The editor lets you fix title, artists, album, and the rest of the allowlist, and pick a cover. Commit only when the group should all see the new file. That commit does not rewrite anyone’s Drive copy.</p>
       <p><code>/review</code> opens your review folder. From the Mini App (or the private fallback) you can promote a track to the library, keep it as a draft, or cancel. This is your pile, not the group’s.</p>
       <p><code>/suggest</code> looks at what you already have and, with Last.fm, proposes nearby artists and tracks. It is a “what next” list, not a download button. Search-by-name for files you do <em>not</em> have is off at the moment — send a FLAC instead of hoping <code>/get</code> will fetch one.</p>
 
@@ -131,14 +131,14 @@
       <p>Login link expired or Google denied access: <code>/login</code> again. Do not reuse an old URL.</p>
       <p>Private chat blocked: join the known group, then <code>/start</code> the bot in DM.</p>
       <p>No cover pictures: give the bot permission to send photos in that group.</p>
-      <p>Someone else’s edit showed up in your Drive after a thumbs-up: that is expected. ✍️ replaces the group file; 👍 copies whatever is current. Only thumbs-up files you still want.</p>
+      <p>Someone else’s 🙏 or ✍️ showed up in your Drive after a thumbs-up: that is expected. Identify-again and edit tags replace the group file only. Drive changes when you confirm 👍 or 👎. Only thumbs-up files you still want.</p>
       <p>Want Drive gone: unlink in <code>/settings</code>. Music we still have on our servers is deleted after one week. Idle bot sessions are forgotten after three months. Copies already in your Drive stay until you delete them in Drive. Details are on the <a href="/privacy">privacy page</a>.</p>
     </div>
   </main>
   <footer class="foot">
     <div class="wrap wrap-wide foot-inner">
       <p>© <span id="y"></span> MetaMusic</p>
-      <p><a href="https://t.me/MetaMusicProBot">@MetaMusicProBot</a> · <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a></p>
+      <p><a href="https://t.me/MetaMusicProBot" target="_blank" rel="noopener noreferrer">@MetaMusicProBot</a> · <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a></p>
     </div>
   </footer>
   <script src="/js/site.js" nonce="NONCE_PLACEHOLDER"></script>

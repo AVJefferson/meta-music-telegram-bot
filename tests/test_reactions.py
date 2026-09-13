@@ -98,19 +98,50 @@ class EmojiReactionTests(unittest.TestCase):
         self.assertEqual(FOLDED, "🙏")
         self.assertEqual(THUMBS_UP, "👍")
 
-    def test_exit_keyboard_has_three_choices(self) -> None:
+    def test_exit_keyboard_has_commit_and_cancel(self) -> None:
         markup = exit_edit_keyboard(9)
         labels = [btn.text for row in markup.inline_keyboard for btn in row]
         data = [btn.callback_data for row in markup.inline_keyboard for btn in row]
-        self.assertEqual(labels, ["Commit to library", "Save draft", "Cancel"])
-        self.assertEqual(data, ["r9:library", "r9:draft", "r9:cancel"])
+        self.assertEqual(labels, ["Commit", "Cancel"])
+        self.assertEqual(data, ["r9:commit", "r9:cancel"])
 
     def test_parse_react_callback(self) -> None:
         self.assertEqual(parse_react_callback("r12:yes"), (12, "yes"))
         self.assertEqual(parse_react_callback("r12:draft"), (12, "draft"))
         self.assertEqual(parse_react_callback("r12:library"), (12, "library"))
+        self.assertEqual(parse_react_callback("r12:commit"), (12, "commit"))
         self.assertEqual(parse_react_callback("r12:cancel"), (12, "cancel"))
         self.assertIsNone(parse_react_callback("p12:ok"))
+
+    def test_thumb_plan_copy_move_skip(self) -> None:
+        from app.reactions import thumb_plan
+
+        op, prompt = thumb_plan("library", None)
+        self.assertEqual(op, "library")
+        self.assertIn("library", prompt)
+        op, prompt = thumb_plan("review", None)
+        self.assertEqual(op, "review")
+        already = SimpleNamespace(status="uploaded", kind="library")
+        op, prompt = thumb_plan("library", already)
+        self.assertEqual(op, "skip")
+        self.assertIn("Already", prompt)
+        op, prompt = thumb_plan("review", already)
+        self.assertEqual(op, "move_review")
+        piled = SimpleNamespace(status="uploaded", kind="review")
+        op, prompt = thumb_plan("library", piled)
+        self.assertEqual(op, "move_library")
+        op, prompt = thumb_plan("review", piled)
+        self.assertEqual(op, "skip")
+
+
+class WantDriveTests(unittest.TestCase):
+    def test_none_is_telegram_only(self) -> None:
+        from app.queue import _want_drive
+
+        self.assertFalse(_want_drive({"drive_dest": "none"}))
+        self.assertTrue(_want_drive({"drive_dest": "library"}))
+        self.assertTrue(_want_drive({}))
+        self.assertTrue(_want_drive(None))
 
 
 class EditUiTests(unittest.TestCase):
@@ -852,6 +883,7 @@ class RestartTrackListenTests(unittest.IsolatedAsyncioTestCase):
                 source_message_id=0,
                 user_id=0,
                 public_message_id=None,
+                source_report_json="{}",
             )
             jobs: asyncio.Queue = asyncio.Queue()
             ctx = SimpleNamespace(
@@ -878,6 +910,8 @@ class RestartTrackListenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(job.file_id, "")
             self.assertEqual(job.private, chat_id > 0)
             self.assertEqual(job.fallback_send, chat_id > 0)
+            self.assertEqual(job.drive_dest, "none")
+            self.assertTrue(job.correct_telegram)
             return sent
 
     async def test_dm_sends_flac_for_listening(self) -> None:

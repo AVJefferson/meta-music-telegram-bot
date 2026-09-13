@@ -69,11 +69,10 @@ Mini App for login/settings/review/suggest. DM fallback if Mini App fails. Never
 
 ## Reactions (on the public audio+caption)
 
-- 👍 copy **current** Telegram file into **your** library
-- 👎 copy into **your** review
+- 👍 / 👎 ask first: copy **current** Telegram file into **your** library or review, or **move** a Drive copy you already have (library ↔ review). Same pile → skip.
 - 💩 delete from **your** library/review only (group message stays)
-- 🙏 re-identify
-- ✍️ tag editor. On commit the **group audio is replaced** for everyone; later 👍 copies that new file.
+- 🙏 re-identify and replace the **group/channel audio**. Drive copies stay until someone 👍 or 👎.
+- ✍️ tag editor. On commit the **group audio is replaced** for everyone; Drive is untouched. Later 👍 copies that new file.
 
 Confirm UI is private (ephemeral or DM).
 

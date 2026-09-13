@@ -1,107 +1,40 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
   <title>MetaMusic</title>
-  <script src="https://telegram.org/js/telegram-web-app.js" nonce="NONCE_PLACEHOLDER"></script>
-  <style nonce="NONCE_PLACEHOLDER">
-    body { font-family: sans-serif; margin: 1rem; }
-    button { margin: 0.25rem 0; }
-    .row { padding: 0.4rem 0; border-bottom: 1px solid #ddd; }
-    .err { color: #b00; }
-  </style>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/app/static/app.css">
 </head>
 <body>
-  <h1 id="title">MetaMusic</h1>
-  <p id="status">Loading…</p>
-  <pre id="err" class="err"></pre>
-  <div id="settings"></div>
-  <div id="review"></div>
-  <div id="suggest"></div>
-  <script nonce="NONCE_PLACEHOLDER">
-    const tg = window.Telegram && window.Telegram.WebApp;
-    if (tg) tg.ready();
-    const page = (location.pathname.split("/").pop() || "home");
-    async function api(path, opts) {
-      const headers = Object.assign({"X-Telegram-Init-Data": tg ? tg.initData : ""}, (opts && opts.headers) || {});
-      const res = await fetch(path, Object.assign({}, opts, {headers}));
-      const data = await res.json();
-      if (!data.ok) throw data;
-      return data;
-    }
-    function showErr(e) {
-      document.getElementById("err").textContent = (e && e.error) || "Failed";
-    }
-    (async () => {
-      try {
-        const me = await api("/api/me");
-        document.getElementById("status").textContent =
-          "Since " + me.user_since + " · edited " + me.songs_edited +
-          (me.logged_in ? (" · " + (me.google_email || "Drive on")) : " · Drive off");
-        if (page === "settings" || page === "login") {
-          const box = document.getElementById("settings");
-          if (page === "login" && !me.logged_in) {
-            try {
-              const data = await api("/api/login");
-              if (data.url) {
-                if (tg && tg.openLink) tg.openLink(data.url);
-                else location.href = data.url;
-              }
-            } catch (e) { showErr(e); }
-          }
-          box.innerHTML = "<p>Inactive after " + me.inactive_months + " months.</p>" +
-            (me.logged_in
-              ? "<button id=unlink>Unlink Drive</button>"
-              : "<p>Use /login in Telegram if this screen did not open Google.</p>") +
-            "<p>Default save</p>" +
-            "<button data-d=library>library</button>" +
-            "<button data-d=review>review</button>" +
-            "<button data-d=none>none</button>";
-          const unlink = document.getElementById("unlink");
-          if (unlink) unlink.onclick = async () => {
-            await api("/api/settings", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({unlink:true})});
-            location.reload();
-          };
-          box.querySelectorAll("button[data-d]").forEach(btn => {
-            btn.onclick = async () => {
-              await api("/api/settings", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({default_dest: btn.dataset.d})});
-            };
-          });
-        }
-        if (page === "review") {
-          const data = await api("/api/review");
-          const box = document.getElementById("review");
-          if (!data.tracks.length) box.textContent = "Review folder empty.";
-          data.tracks.forEach(t => {
-            const div = document.createElement("div");
-            div.className = "row";
-            div.textContent = (t.artist || "") + " — " + (t.album || "") + " — " + (t.title || "");
-            ["library","draft","cancel"].forEach(act => {
-              const b = document.createElement("button");
-              b.textContent = act;
-              b.onclick = async () => {
-                await api("/api/review/" + t.id + "/action", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({action: act})});
-                location.reload();
-              };
-              div.appendChild(b);
-            });
-            box.appendChild(div);
-          });
-        }
-        if (page === "suggest") {
-          const q = new URLSearchParams(location.search).get("q") || "";
-          const data = await api("/api/suggest?q=" + encodeURIComponent(q));
-          const box = document.getElementById("suggest");
-          (data.results || []).forEach(r => {
-            const div = document.createElement("div");
-            div.className = "row";
-            div.textContent = JSON.stringify(r);
-            box.appendChild(div);
-          });
-        }
-      } catch (e) { showErr(e); }
-    })();
-  </script>
+  <div id="app">
+    <header class="top">
+      <p class="kicker">MetaMusic</p>
+      <h1 id="heading">Home</h1>
+    </header>
+    <div id="banner" class="banner" hidden></div>
+    <main id="main"></main>
+  </div>
+  <nav id="tabs" class="tabs" hidden>
+    <button type="button" data-page="home">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10.5 12 4l8 6.5V20a1 1 0 0 1-1 1h-5v-6H10v6H5a1 1 0 0 1-1-1z"/></svg>
+      Home
+    </button>
+    <button type="button" data-page="review">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h9l3 3v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm8 1.5V8h2.5"/></svg>
+      Review
+    </button>
+    <button type="button" data-page="suggest">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.6 4.6L18 9.2l-4.4 1.6L12 15l-1.6-4.2L6 9.2l4.4-1.6zM6 16l.8 2.2L9 19l-2.2.8L6 22l-.8-2.2L3 19l2.2-.8z"/></svg>
+      Suggest
+    </button>
+    <button type="button" data-page="settings">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.2 3.2h3.6l.5 2.1a6.8 6.8 0 0 1 1.7 1l2-1.1 2.5 2.5-1.1 2a6.8 6.8 0 0 1 1 1.7l2.1.5v3.6l-2.1.5a6.8 6.8 0 0 1-1 1.7l1.1 2-2.5 2.5-2-1.1a6.8 6.8 0 0 1-1.7 1l-.5 2.1h-3.6l-.5-2.1a6.8 6.8 0 0 1-1.7-1l-2 1.1-2.5-2.5 1.1-2a6.8 6.8 0 0 1-1-1.7L3.2 13.8V10.2l2.1-.5a6.8 6.8 0 0 1 1-1.7l-1.1-2 2.5-2.5 2 1.1a6.8 6.8 0 0 1 1.7-1zm1.8 6.3a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5z"/></svg>
+      Settings
+    </button>
+  </nav>
+  <script src="/app/static/app.js" defer></script>
 </body>
 </html>

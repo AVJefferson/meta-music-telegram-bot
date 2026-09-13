@@ -25,12 +25,43 @@ WEBAPP_DIR = Path(__file__).resolve().parent / "webapp"
 
 
 def _html(title: str, body: str, status: int = 200) -> web.Response:
-    page = (
-        "<!doctype html><html><head><meta charset=utf-8>"
-        f"<meta name=viewport content='width=device-width,initial-scale=1'>"
-        f"<title>{html_esc(title)}</title></head><body>"
-        f"<p>{body}</p></body></html>"
-    )
+    page = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>{html_esc(title)}</title>
+  <style>
+    :root {{ color-scheme: dark light; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 1.5rem;
+      font: 17px/1.5 ui-sans-serif, system-ui, sans-serif;
+      background: #12100e;
+      color: #f3eee6;
+    }}
+    main {{
+      width: min(28rem, 100%);
+      padding: 1.5rem 1.35rem;
+      border-radius: 1rem;
+      background: #1c1814;
+      border: 1px solid rgba(243, 238, 230, 0.12);
+    }}
+    h1 {{ font-size: 1.25rem; margin: 0 0 0.6rem; letter-spacing: -0.03em; }}
+    p {{ margin: 0; color: #b7aea1; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{html_esc(title)}</h1>
+    <p>{body}</p>
+  </main>
+</body>
+</html>"""
     return web.Response(text=page, content_type="text/html", status=status)
 
 
@@ -47,8 +78,9 @@ def create_http_app(ctx: Ctx) -> web.Application:
     app.router.add_get("/api/review", api_review)
     app.router.add_post("/api/review/{track_id}/action", api_review_action)
     app.router.add_get("/api/suggest", api_suggest)
-    if WEBAPP_DIR.is_dir():
-        app.router.add_static("/app/static/", WEBAPP_DIR)
+    static_dir = WEBAPP_DIR / "static"
+    if static_dir.is_dir():
+        app.router.add_static("/app/static/", static_dir)
     return app
 
 
@@ -116,7 +148,7 @@ async def oauth_callback(request: web.Request) -> web.Response:
     except Exception:
         log.exception("oauth callback failed")
         return _html("Login", "Failed. Use /login again.", 502)
-    return _html("Login", "Google Drive connected. You can close this window.")
+    return _html("Login", "Google Drive connected. You can close this and return to Telegram.")
 
 
 def _page_html(page: str) -> str:
@@ -180,6 +212,8 @@ async def api_me(request: web.Request) -> web.Response:
             "inactive_months": months,
             "default_dest": settings.get("default_dest") or "none",
             "admin": is_admin(ctx, user_id),
+            "library_count": len(ctx.catalog.list_library_tracks(user_id)),
+            "review_count": len(ctx.catalog.list_review_tracks(user_id)),
         }
     )
 
@@ -218,16 +252,23 @@ async def api_review(request: web.Request) -> web.Response:
         ctx, user_id = await _api_user(request)
     except AppError as exc:
         return web.json_response(exc.as_json(), status=exc.http_status)
+    from app.review_cmd import _sync_drive_review
+
+    await _sync_drive_review(ctx, user_id)
     tracks = ctx.catalog.list_review_tracks(user_id)
     return _json_ok(
         {
             "tracks": [
                 {
                     "id": t.id,
-                    "title": t.title,
-                    "artist": t.artist,
-                    "album": t.album,
+                    "title": t.title or "",
+                    "artist": t.artist or "",
+                    "album": t.album or "",
                     "kind": t.kind,
+                    "file_name": t.file_name or "",
+                    "relative_path": t.relative_path or "",
+                    "drive_url": t.drive_url or "",
+                    "status": t.status or "",
                 }
                 for t in tracks[:100]
             ]
@@ -250,12 +291,26 @@ async def api_review_action(request: web.Request) -> web.Response:
         return web.json_response(AppError("not_found").as_json(), status=404)
     action = str(body.get("action") or "")
     if action == "cancel":
+        from app.relocate import delete_track
+
+        try:
+            await delete_track(ctx, track)
+        except AppError as exc:
+            return web.json_response(exc.as_json(), status=exc.http_status)
+        except Exception as exc:
+            err = to_app_error(exc)
+            return web.json_response(err.as_json(), status=err.http_status)
         return _json_ok({"action": "cancel"})
     if action in {"library", "draft"}:
-        from app.relocate import identity_from_track, relocate_track, tags_from_track
+        from app.relocate import hydrate_track_tags, identity_from_track, relocate_track, tags_from_track
 
         kind = "library" if action == "library" else "review"
         try:
+            try:
+                track = await hydrate_track_tags(ctx, track)
+            except Exception:
+                log.debug("hydrate before review action failed track=%s", track.id, exc_info=True)
+                track = ctx.catalog.get_track(track.id) or track
             await relocate_track(
                 ctx,
                 track,
@@ -281,11 +336,17 @@ async def api_suggest(request: web.Request) -> web.Response:
     except AppError as exc:
         return web.json_response(exc.as_json(), status=exc.http_status)
     query = str(request.query.get("q") or "").strip()
-    from app.suggest import suggest_for_user
+    from app.suggest import owned_key, suggest_for_user
 
+    lastfm = bool((getattr(ctx.settings, "lastfm_api_key", None) or "").strip())
     try:
         rows = await suggest_for_user(ctx, user_id, query)
     except Exception as exc:
         err = to_app_error(exc)
         return web.json_response(err.as_json(), status=err.http_status)
-    return _json_ok({"results": rows[:20]})
+    shown = rows[:20]
+    ctx.catalog.mark_suggest_shown(
+        user_id,
+        [owned_key(str(row.get("artist") or ""), str(row.get("title") or "")) for row in shown],
+    )
+    return _json_ok({"results": shown, "lastfm": lastfm})

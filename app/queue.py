@@ -160,6 +160,9 @@ def _expires_at() -> str:
 
 
 def _job_from_pending(row: PendingReview) -> Job:
+    report = _loads(row.source_report_json, {})
+    if not isinstance(report, dict):
+        report = {}
     return Job(
         chat_id=row.chat_id,
         thread_id=row.thread_id,
@@ -173,6 +176,8 @@ def _job_from_pending(row: PendingReview) -> Job:
         source_message_id=getattr(row, "source_message_id", None) or 0,
         user_id=getattr(row, "user_id", 0) or 0,
         public_message_id=getattr(row, "public_message_id", None) or 0,
+        drive_dest=str(report.get("drive_dest") or ""),
+        correct_telegram=bool(report.get("correct_telegram")),
     )
 
 
@@ -408,6 +413,13 @@ async def process_job(job: Job, ctx: Ctx) -> None:
             report = stamp_report(report, auth)
             stamp_identity(identity, auth)
 
+        if job.drive_dest:
+            report["drive_dest"] = job.drive_dest
+            report["dest_confirmed"] = True
+        if job.correct_telegram:
+            report["correct_telegram"] = True
+
+        telegram_only = not _want_drive(report)
         restart_replace = None
         restart_old_drive = None
         if job.source_pending_id:
@@ -416,7 +428,7 @@ async def process_job(job: Job, ctx: Ctx) -> None:
                 restart_replace = pending_row.replace_id
                 restart_old_drive = pending_row.old_drive_id
 
-        if identity.confidence == "high" and identity.mb_recording_id:
+        if identity.confidence == "high" and identity.mb_recording_id and not telegram_only:
             existing = ctx.catalog.find_library_by_mbid(
                 identity.mb_recording_id, job.user_id or None
             )
@@ -1631,6 +1643,10 @@ def _dest_state(report: dict) -> tuple[str, bool]:
     return dest, bool(report.get("correct_telegram"))
 
 
+def _want_drive(report: dict | None) -> bool:
+    return str((report or {}).get("drive_dest") or "library") != "none"
+
+
 def _stamp_languages(ctx: Ctx, report: dict, tags: TagSet) -> list[str]:
     extra = list(report.get("languages") or []) + list(report.get("lastfm_tags") or [])
     langs = ctx.genre.languages_from_tags(extra + genre_tokens(tags.genre))
@@ -2028,29 +2044,29 @@ async def _commit_upload(
     from app.paths import user_kind_root
     from app.relocate import ctx_for_user
 
-    if uid:
+    want_drive = _want_drive(source_report)
+    if uid and want_drive:
         ctx = ctx_for_user(ctx, uid)
-    want_drive = str((source_report or {}).get("drive_dest") or "library") != "none"
     if kind == "library":
         relative = library_relative(job.topic_name, tags)
-        dest = (user_kind_root(ctx, uid, "library") if uid else settings.library_root) / relative
-        if uid:
-            root_id = user_drive_root(ctx, "library", uid) if want_drive else ""
-        else:
-            root_id = settings.gdrive_folder_id
+        dest = local
+        root_id = ""
+        if want_drive:
+            dest = (user_kind_root(ctx, uid, "library") if uid else settings.library_root) / relative
+            root_id = user_drive_root(ctx, "library", uid) if uid else settings.gdrive_folder_id
     else:
         relative = review_relative(job.file_name)
-        dest = (user_kind_root(ctx, uid, "review") if uid else settings.review_root) / relative
-        if uid:
-            root_id = user_drive_root(ctx, "review", uid) if want_drive else ""
-        else:
-            root_id = settings.gdrive_review_folder_id
+        dest = local
+        root_id = ""
+        if want_drive:
+            dest = (user_kind_root(ctx, uid, "review") if uid else settings.review_root) / relative
+            root_id = user_drive_root(ctx, "review", uid) if uid else settings.gdrive_review_folder_id
 
-    if local.resolve() != dest.resolve():
+    if want_drive and local.resolve() != dest.resolve():
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest = await asyncio.to_thread(place_file, local, dest)
 
-    if kind == "review":
+    if want_drive and kind == "review":
         sidecar_path = dest.with_suffix(".json")
         await asyncio.to_thread(write_sidecar, sidecar_path, _sidecar_payload(job, tags, identity))
 
@@ -2066,9 +2082,9 @@ async def _commit_upload(
         {"id": c.id, "name": c.name, "size": c.size, "modified": c.modified}
         for c in found
     ]
-    catalog_row = ctx.catalog.find_uploaded_by_relative(relative.as_posix(), uid or None)
+    catalog_row = ctx.catalog.find_uploaded_by_relative(relative.as_posix(), uid or None) if want_drive else None
     catalog_note = False
-    if not conflict_dicts and catalog_row:
+    if want_drive and not conflict_dicts and catalog_row:
         catalog_note = True
         meta = None
         if catalog_row.drive_file_id:
@@ -2174,10 +2190,18 @@ async def _commit_upload(
         track_id = None
 
     if replace_id is not None and conflict_action != "skip":
+        existing = ctx.catalog.get_track(replace_id)
+        local_path = str(dest)
+        sidecar_arg = str(sidecar_path) if sidecar_path else None
+        if not want_drive and existing:
+            if existing.local_path:
+                local_path = existing.local_path
+            if existing.sidecar_path:
+                sidecar_arg = existing.sidecar_path
         ctx.catalog.update_quality_and_local(
             replace_id,
-            local_path=str(dest),
-            sidecar_path=str(sidecar_path) if sidecar_path else None,
+            local_path=local_path,
+            sidecar_path=sidecar_arg,
             relative_path=relative.as_posix(),
             bit_depth=identity.bit_depth,
             sample_rate=identity.sample_rate,
@@ -2229,10 +2253,18 @@ async def _commit_upload(
             identity_json=_dumps(asdict(identity)),
             source_report_json=_dumps(source_report),
             drive_root_id=root_id,
-            status="uploading",
+            status="uploading" if want_drive else "processing",
         )
 
-    await edit_status(ctx, job, f"Uploading to Drive…\n\n{_preview(tags, identity, dest, source_report)}")
+    if not want_drive:
+        status = (
+            "Updating the group file…"
+            if (replace_id is not None or job.correct_telegram)
+            else "Saving without Drive…"
+        )
+        await edit_status(ctx, job, f"{status}\n\n{_preview(tags, identity, dest, source_report)}")
+    else:
+        await edit_status(ctx, job, f"Uploading to Drive…\n\n{_preview(tags, identity, dest, source_report)}")
     log.debug("drive upload path=%s parent=%s replace=%s", relative, parent_id, replace_file_id)
     try:
         if not root_id:
@@ -2261,29 +2293,33 @@ async def _commit_upload(
                 identity=identity,
                 kind=kind,
             )
-        ctx.catalog.mark_uploaded(track_id, file_id, url)
-        telegram_file_id = job.file_id or None
+        fields = {
+            "telegram_file_id": job.file_id or None,
+            "source_report_json": _dumps(source_report),
+            "tags_json": _dumps(asdict(tags)),
+            "identity_json": _dumps(asdict(identity)),
+            "topic_name": job.topic_name,
+            "file_name": job.file_name,
+            "thread_id": job.thread_id,
+            "kind": kind,
+            "source_chat_id": job.chat_id,
+            "source_message_id": job.source_message_id or None,
+        }
         if pending_id is not None:
             completed = ctx.catalog.get_pending_review(pending_id)
             if completed and completed.telegram_file_id:
-                telegram_file_id = completed.telegram_file_id
-        ctx.catalog.update_track(
-            track_id,
-            telegram_file_id=telegram_file_id,
-            source_report_json=_dumps(source_report),
-            tags_json=_dumps(asdict(tags)),
-            identity_json=_dumps(asdict(identity)),
-            topic_name=job.topic_name,
-            file_name=job.file_name,
-            drive_sidecar_id=sidecar_id,
-            drive_log_id=log_id,
-            thread_id=job.thread_id,
-            kind=kind,
-            source_chat_id=job.chat_id,
-            source_message_id=job.source_message_id or None,
-            user_id=uid,
-        )
-        if old_drive_id and old_drive_id != file_id and conflict_action != "keep_both":
+                fields["telegram_file_id"] = completed.telegram_file_id
+        if want_drive:
+            ctx.catalog.mark_uploaded(track_id, file_id, url)
+            fields["drive_sidecar_id"] = sidecar_id
+            fields["drive_log_id"] = log_id
+            fields["user_id"] = uid
+        elif replace_id is None:
+            fields["user_id"] = uid
+        else:
+            fields.pop("kind", None)
+        ctx.catalog.update_track(track_id, **fields)
+        if want_drive and old_drive_id and old_drive_id != file_id and conflict_action != "keep_both":
             await asyncio.to_thread(ctx.drive.delete_file, old_drive_id)
         if pending_id is not None:
             completed = ctx.catalog.get_pending_review(pending_id)
@@ -2295,25 +2331,37 @@ async def _commit_upload(
             else:
                 ctx.catalog.update_pending_review(pending_id, status="done")
     except Exception as exc:
-        ctx.catalog.mark_failed(track_id, str(exc))
-        if pending_id is not None:
-            ctx.catalog.update_pending_review(pending_id, status="failed")
         from app.notify import notify_user
 
+        if want_drive or replace_id is None:
+            ctx.catalog.mark_failed(track_id, str(exc))
+        if pending_id is not None:
+            ctx.catalog.update_pending_review(pending_id, status="failed")
         if job.user_id:
-            await notify_user(ctx, job.user_id, "Drive upload failed. File kept locally.", chat_id=job.chat_id)
+            note = "Could not update the group file." if not want_drive else "Drive upload failed. File kept locally."
+            await notify_user(ctx, job.user_id, note, chat_id=job.chat_id)
+        fail = (
+            "Could not update the group file."
+            if not want_drive
+            else "Tagged, but Drive upload failed. Kept locally."
+        )
         await edit_status(
             ctx,
             job,
-            f"Tagged, but Drive upload failed. Kept locally.\n\n{_preview(tags, identity, dest, source_report)}\n\n"
+            f"{fail}\n\n{_preview(tags, identity, dest, source_report)}\n\n"
             f"<code>{html_esc(dest)}</code>",
         )
         return dest
 
-    dest_label = "library" if kind == "library" else "review"
     extra = ""
     if replaced and old_q and new_q:
         extra = f"\nReplaced lower-quality copy ({old_q[0]}/{old_q[1]} → {new_q[0]}/{new_q[1]})."
+    dest_label = "library" if kind == "library" else "review"
+    correct = bool(job.correct_telegram or (source_report or {}).get("correct_telegram"))
+    if not want_drive:
+        saved = "Updated the group file" if (replace_id is not None or correct) else "Tagged (not copied to Drive)"
+    else:
+        saved = f"Saved ({dest_label})"
     href = safe_link(url)
     link = f'\nDrive: <a href="{href}">open</a>' if href else ""
     from app.captions import music_caption
@@ -2326,13 +2374,17 @@ async def _commit_upload(
             public_id = completed.public_message_id
     if not public_id:
         public_id = job.status_message_id
+    telegram_file_id = job.file_id or None
+    if pending_id is not None:
+        completed = ctx.catalog.get_pending_review(pending_id)
+        if completed and completed.telegram_file_id:
+            telegram_file_id = completed.telegram_file_id
     caption = music_caption(
         tags=tags,
         relative_path=relative.as_posix(),
-        extra=f"Saved ({dest_label}){extra}",
+        extra=f"{saved}{extra}",
         last_editor_user_id=uid or None,
     )
-    correct = bool(job.correct_telegram or (source_report or {}).get("correct_telegram"))
     if public_id:
         new_file = await update_public_audio(
             ctx,
@@ -2349,16 +2401,20 @@ async def _commit_upload(
     await edit_status(
         ctx,
         job,
-        f"Saved ({dest_label}, {identity.confidence} confidence).{extra}\n\n"
+        f"{saved} ({identity.confidence} confidence).{extra}\n\n"
         f"{_preview(tags, identity, dest, source_report)}{link}\n"
         f"<code>{html_esc(relative.as_posix())}</code>",
     )
+    index_drive = file_id or None
+    if not want_drive:
+        existing = ctx.catalog.get_track(track_id)
+        index_drive = (existing.drive_file_id if existing else None) or None
     await asyncio.to_thread(
         remember_library_tags,
         ctx,
         kind=kind,
         relative_path=relative.as_posix(),
-        drive_file_id=file_id,
+        drive_file_id=index_drive,
         topic_name=job.topic_name,
         tags=tags,
         telegram_file_id=telegram_file_id,
@@ -2750,7 +2806,7 @@ async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
     report = apply_chosen(report, tags, identity)
 
     job = _job_from_pending(row)
-    if kind == "library" and identity.mb_recording_id:
+    if kind == "library" and identity.mb_recording_id and _want_drive(report):
         existing = ctx.catalog.find_library_by_mbid(
             identity.mb_recording_id, getattr(row, "user_id", 0) or None
         )

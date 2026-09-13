@@ -108,6 +108,38 @@ def local_kind_root(ctx: Ctx, kind: str, user_id: int = 0) -> Path:
     return ctx.settings.library_root if kind == "library" else ctx.settings.review_root
 
 
+def _stage_dest(ctx: Ctx, track: TrackRecord) -> Path:
+    name = sanitize_filename(Path(track.file_name or track.relative_path or "track.flac").name)
+    if not name.lower().endswith(".flac"):
+        name = f"{name}.flac"
+    dest = ctx.settings.pending_root / str(uuid.uuid4()) / name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    return dest
+
+
+async def stage_track_flac(ctx: Ctx, track: TrackRecord) -> Path:
+    """Copy the current Telegram audio when possible; else local/Drive. Always a new pending file."""
+    from app.botapi import discard_download
+
+    dest = _stage_dest(ctx, track)
+    if track.telegram_file_id:
+        try:
+            file = await ctx.bot.get_file(track.telegram_file_id)
+            await ctx.bot.download(file, destination=dest)
+            await asyncio.to_thread(discard_download, file.file_path)
+            if dest.is_file() and dest.stat().st_size > 0:
+                log.info("stage source=telegram track=%s", track.id)
+                return dest
+        except Exception:
+            log.warning("telegram original unavailable track=%s", track.id, exc_info=True)
+            shutil.rmtree(dest.parent, ignore_errors=True)
+            dest = _stage_dest(ctx, track)
+    local = await ensure_local_flac(ctx, track)
+    await asyncio.to_thread(shutil.copy2, local, dest)
+    log.info("stage source=local/drive track=%s path=%s", track.id, dest)
+    return dest
+
+
 async def _resolve_drive_file_id(ctx: Ctx, track: TrackRecord) -> str | None:
     if track.drive_file_id:
         return track.drive_file_id
@@ -522,6 +554,7 @@ async def copy_track_for_user(
     report = _loads(track.source_report_json, {})
     if not isinstance(report, dict):
         report = {}
+    staged = await stage_track_flac(ctx, track)
     if getattr(track, "user_id", 0) == user_id:
         return await relocate_track(
             ctx,
@@ -532,11 +565,8 @@ async def copy_track_for_user(
             source_report=report,
             topic_name=track.topic_name or "Unknown",
             file_name=track.file_name or "track.flac",
+            staged=staged,
         )
-    local = await ensure_local_flac(ctx, track)
-    staged = ctx.settings.pending_root / str(uuid.uuid4()) / Path(local.name)
-    staged.parent.mkdir(parents=True, exist_ok=True)
-    await asyncio.to_thread(shutil.copy2, local, staged)
     new_id = ctx.catalog.insert_pending(
         kind=kind,
         mb_recording_id=track.mb_recording_id,

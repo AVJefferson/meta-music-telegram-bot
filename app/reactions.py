@@ -20,14 +20,13 @@ from app.edit_ui import (
 )
 from app.genre import genre_tokens
 from app.membership import allow_from_callback, allow_user, touch, user_is_bot
-from app.models import Ctx, Job, PendingReview, TrackRecord, identity_from_dict, tagset_from_dict
+from app.models import Ctx, Job, PendingReview, TrackRecord, tagset_from_dict
 from app.relocate import (
     copy_track_for_user,
     delete_track,
     ensure_local_flac,
     identity_from_track,
     read_tags_for_card,
-    relocate_track,
     user_copy_of,
 )
 from app.tags import normalize_tagset, read_cover, read_tagset, write_tags
@@ -46,10 +45,12 @@ ADD_ONLY = {THUMBS_UP, THUMBS_DOWN, POO, MONKEY, FOLDED}
 DELETE_EMOJIS = {POO, MONKEY}
 
 _OP_LABELS = {
-    "library": "Copy this track into your library?",
-    "review": "Copy this track into your review folder?",
+    "library": "Copy the current Telegram file into your library?",
+    "review": "Copy the current Telegram file into your review folder?",
+    "move_library": "This is in your review folder. Move that Drive copy to your library?",
+    "move_review": "This is in your library. Move that Drive copy to your review folder?",
     "delete": "Delete this track from your library/review only?",
-    "restart": "Re-identify from Telegram, local, or Drive? A successful run replaces the Drive copy.",
+    "restart": "Re-identify this group/channel file? Drive copies stay as they are until someone 👍 or 👎.",
 }
 
 
@@ -99,9 +100,24 @@ def parse_react_callback(data: str | None) -> tuple[int, str] | None:
     prefix, rest = data.split(":", 1)
     if not prefix[1:].isdigit():
         return None
-    if rest not in {"yes", "no", "cancel", "draft", "library"}:
+    if rest not in {"yes", "no", "cancel", "draft", "library", "commit"}:
         return None
     return int(prefix[1:]), rest
+
+
+def thumb_plan(want: str, mine: TrackRecord | None) -> tuple[str, str]:
+    """Map 👍/👎 plus the user's existing copy to an op and confirm prompt."""
+    have = mine is not None and mine.status == "uploaded"
+    if have and mine.kind == want:
+        place = "library" if want == "library" else "review folder"
+        return "skip", f"Already in your {place}."
+    if have and mine.kind == "review" and want == "library":
+        return "move_library", _OP_LABELS["move_library"]
+    if have and mine.kind == "library" and want == "review":
+        return "move_review", _OP_LABELS["move_review"]
+    if want == "library":
+        return "library", _OP_LABELS["library"]
+    return "review", _OP_LABELS["review"]
 
 
 def build_reactions_router() -> Router:
@@ -279,28 +295,37 @@ async def _confirm_reaction(ctx: Ctx, event: MessageReactionUpdated, track: Trac
         )
         return
     if emoji == THUMBS_UP:
-        op = "library"
+        want = "library"
         mine = user_copy_of(ctx, track, user_id)
-        if mine and mine.kind == "library" and mine.status == "uploaded":
-            await _reply_card(
-                ctx, event, "Already in your library.", None, thread_id=track.thread_id
-            )
+        op, prompt = thumb_plan(want, mine)
+        if op == "skip":
+            await _reply_card(ctx, event, prompt, None, thread_id=track.thread_id)
             return
     elif emoji == THUMBS_DOWN:
-        op = "review"
+        want = "review"
         mine = user_copy_of(ctx, track, user_id)
-        if mine and mine.kind == "review" and mine.status == "uploaded":
-            await _reply_card(
-                ctx, event, "Already in your review folder.", None, thread_id=track.thread_id
-            )
+        op, prompt = thumb_plan(want, mine)
+        if op == "skip":
+            await _reply_card(ctx, event, prompt, None, thread_id=track.thread_id)
             return
     elif emoji in DELETE_EMOJIS:
         op = "delete"
+        prompt = _OP_LABELS[op]
+        mine = None
     else:
         op = "restart"
+        prompt = _OP_LABELS[op]
+        mine = None
     tags = read_tags_for_card(track)
     identity = identity_from_track(track)
     report = _report_op(_loads(track.source_report_json, {}), op)
+    if op == "restart":
+        report["drive_dest"] = "none"
+        report["dest_confirmed"] = True
+        report["correct_telegram"] = True
+    payload = {"op": op}
+    if mine is not None and op.startswith("move_"):
+        payload["copy_id"] = mine.id
     row = await _upsert_react_pending(
         ctx,
         track,
@@ -317,7 +342,7 @@ async def _confirm_reaction(ctx: Ctx, event: MessageReactionUpdated, track: Trac
     )
     if not row:
         return
-    ctx.catalog.update_pending_review(row.id, candidates_json=_dumps({"op": op}))
+    ctx.catalog.update_pending_review(row.id, candidates_json=_dumps(payload))
     if op == "restart":
         from app.queue import _job_from_pending, edit_status
 
@@ -325,14 +350,14 @@ async def _confirm_reaction(ctx: Ctx, event: MessageReactionUpdated, track: Trac
         await edit_status(
             ctx,
             _job_from_pending(refreshed),
-            _OP_LABELS[op],
+            prompt,
             drive_confirm_keyboard(row.id),
             fallback_send=event.chat.id > 0,
         )
         ctx.catalog.bind_track_message(track.id, event.chat.id, event.message_id)
         return
     status_id = await _reply_card(
-        ctx, event, _OP_LABELS[op], drive_confirm_keyboard(row.id), thread_id=track.thread_id
+        ctx, event, prompt, drive_confirm_keyboard(row.id), thread_id=track.thread_id
     )
     if status_id:
         ctx.catalog.update_pending_review(row.id, status_message_id=status_id)
@@ -412,9 +437,9 @@ async def _exit_edit_prompt(ctx: Ctx, event: MessageReactionUpdated, track: Trac
             ctx,
             _job_from_pending(row),
             "<b>Finish editing</b>\n"
-            "Cancel discards this session.\n"
-            "Save draft writes to Drive review.\n"
-            "Commit to library writes to Drive library.",
+            "Commit replaces the audio in this group or channel.\n"
+            "Drive copies stay as they are until someone 👍 or 👎.\n"
+            "Cancel discards this session.",
             exit_edit_keyboard(row.id),
         )
 
@@ -434,7 +459,11 @@ async def _handle_confirm(ctx: Ctx, row: PendingReview, action: str) -> None:
     from app.queue import _job_from_pending, edit_status
 
     job = _job_from_pending(row)
-    op = str((_loads(row.candidates_json, {}) or {}).get("op") or _loads(row.source_report_json, {}).get("react_op") or "")
+    payload = _loads(row.candidates_json, {}) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    op = str(payload.get("op") or _loads(row.source_report_json, {}).get("react_op") or "")
+    copy_id = payload.get("copy_id")
     if action == "no":
         ctx.catalog.update_pending_review(row.id, status="cancelled")
         if op == "restart" and row.track_id:
@@ -455,10 +484,43 @@ async def _handle_confirm(ctx: Ctx, row: PendingReview, action: str) -> None:
     try:
         if op == "library":
             await copy_track_for_user(ctx, track, row.user_id or 0, kind="library")
-            await edit_status(ctx, job, "Copied to your library.")
+            await edit_status(ctx, job, "Copied the Telegram file to your library.")
         elif op == "review":
             await copy_track_for_user(ctx, track, row.user_id or 0, kind="review")
-            await edit_status(ctx, job, "Copied to your review folder.")
+            await edit_status(ctx, job, "Copied the Telegram file to your review folder.")
+        elif op in {"move_library", "move_review"}:
+            from app.relocate import hydrate_track_tags, identity_from_track, relocate_track, tags_from_track
+
+            mine = None
+            if copy_id is not None:
+                try:
+                    mine = ctx.catalog.get_track(int(copy_id))
+                except (TypeError, ValueError):
+                    mine = None
+            if mine is None:
+                mine = user_copy_of(ctx, track, row.user_id or 0)
+            if mine is None or getattr(mine, "user_id", 0) != (row.user_id or 0):
+                ctx.catalog.update_pending_review(row.id, status="failed")
+                await edit_status(ctx, job, "Nothing to move in your library.")
+                return
+            kind = "library" if op == "move_library" else "review"
+            try:
+                mine = await hydrate_track_tags(ctx, mine)
+            except Exception:
+                log.debug("hydrate before move failed track=%s", mine.id, exc_info=True)
+                mine = ctx.catalog.get_track(mine.id) or mine
+            await relocate_track(
+                ctx,
+                mine,
+                kind=kind,
+                tags=tags_from_track(mine),
+                identity=identity_from_track(mine),
+                source_report=_loads(mine.source_report_json, {}) or {},
+                topic_name=mine.topic_name or "Unknown",
+                file_name=mine.file_name or "track.flac",
+            )
+            dest = "library" if kind == "library" else "review folder"
+            await edit_status(ctx, job, f"Moved to your {dest}.")
         elif op == "delete":
             mine = user_copy_of(ctx, track, row.user_id or 0)
             if mine is None:
@@ -485,29 +547,9 @@ async def _handle_confirm(ctx: Ctx, row: PendingReview, action: str) -> None:
 
 
 async def _restart_source(ctx: Ctx, track: TrackRecord) -> Path:
-    from app.botapi import discard_download
+    from app.relocate import stage_track_flac
 
-    name = sanitize_filename(Path(track.file_name or track.relative_path or "track.flac").name)
-    if not name.lower().endswith(".flac"):
-        name = f"{name}.flac"
-    dest = ctx.settings.pending_root / str(uuid.uuid4()) / name
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if track.telegram_file_id:
-        try:
-            file = await ctx.bot.get_file(track.telegram_file_id)
-            await ctx.bot.download(file, destination=dest)
-            await asyncio.to_thread(discard_download, file.file_path)
-            if dest.is_file() and dest.stat().st_size > 0:
-                log.info("restart source=telegram track=%s", track.id)
-                return dest
-        except Exception:
-            log.warning("telegram original unavailable track=%s", track.id, exc_info=True)
-            shutil.rmtree(dest.parent, ignore_errors=True)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-    local = await ensure_local_flac(ctx, track)
-    await asyncio.to_thread(shutil.copy2, local, dest)
-    log.info("restart source=local/drive track=%s path=%s", track.id, dest)
-    return dest
+    return await stage_track_flac(ctx, track)
 
 
 async def _send_listen_copy(ctx: Ctx, chat_id: int, path: Path) -> None:
@@ -540,6 +582,9 @@ async def _restart_track(ctx: Ctx, row: PendingReview, track: TrackRecord) -> No
         return
     if row.chat_id > 0:
         await _send_listen_copy(ctx, row.chat_id, source)
+    prev = _loads(getattr(row, "source_report_json", None), {})
+    if not isinstance(prev, dict):
+        prev = {}
     ctx.catalog.update_pending_review(
         row.id,
         phase="intake",
@@ -547,8 +592,17 @@ async def _restart_track(ctx: Ctx, row: PendingReview, track: TrackRecord) -> No
         local_path=str(source),
         telegram_file_id=track.telegram_file_id,
         replace_id=track.id,
-        old_drive_id=track.drive_file_id,
+        old_drive_id=None,
         expires_at=_expires_at(24),
+        source_report_json=_dumps(
+            {
+                **prev,
+                "drive_dest": "none",
+                "dest_confirmed": True,
+                "correct_telegram": True,
+                "react_op": "restart",
+            }
+        ),
     )
     await ctx.jobs.put(
         Job(
@@ -563,6 +617,10 @@ async def _restart_track(ctx: Ctx, row: PendingReview, track: TrackRecord) -> No
             source_pending_id=row.id,
             fallback_send=not reuse_card,
             source_message_id=getattr(track, "source_message_id", None) or 0,
+            user_id=row.user_id or 0,
+            public_message_id=getattr(track, "source_message_id", None) or 0,
+            drive_dest="none",
+            correct_telegram=True,
         )
     )
     await edit_status(ctx, job, "Restarting from the original file…", fallback_send=not reuse_card)
@@ -581,6 +639,48 @@ async def _apply_manual_cover(row: PendingReview, tags, local: Path) -> None:
     await asyncio.to_thread(write_tags, local, tags, cover, mime)
 
 
+async def _publish_group_edit(
+    ctx: Ctx,
+    *,
+    track: TrackRecord,
+    row: PendingReview,
+    staged: Path,
+    tags,
+    editor_user_id: int,
+) -> None:
+    from app.captions import music_caption
+    from app.telegram_file import update_public_audio
+
+    ctx.catalog.update_track(
+        track.id,
+        tags_json=_dumps(asdict(tags)),
+        identity_json=row.identity_json,
+        title=tags.title or track.title,
+        artist=tags.artist or track.artist,
+        album=tags.album or track.album,
+        last_editor_user_id=editor_user_id or None,
+        source_report_json=row.source_report_json,
+    )
+    refreshed = ctx.catalog.get_track(track.id) or track
+    chat_id = refreshed.source_chat_id or row.chat_id
+    message_id = refreshed.source_message_id or 0
+    if not message_id:
+        message_id = row.status_message_id
+    caption = music_caption(tags=tags, track=refreshed, last_editor_user_id=editor_user_id or None)
+    new_id = await update_public_audio(
+        ctx,
+        chat_id=chat_id,
+        message_id=message_id,
+        path=staged,
+        caption=caption,
+        correct_media=True,
+    )
+    if new_id:
+        ctx.catalog.update_track(track.id, telegram_file_id=new_id)
+    if editor_user_id:
+        ctx.catalog.increment_songs_edited(editor_user_id)
+
+
 async def _handle_exit(ctx: Ctx, row: PendingReview, action: str) -> None:
     from app.edit_ui import _clear_edit_cover, show_saved_card
     from app.queue import _job_from_pending, edit_status
@@ -597,12 +697,10 @@ async def _handle_exit(ctx: Ctx, row: PendingReview, action: str) -> None:
         ctx.catalog.update_pending_review(row.id, status="failed")
         await edit_status(ctx, job, "Track is gone.")
         return
-    if action not in {"draft", "library"}:
+    if action not in {"draft", "library", "commit"}:
         ctx.catalog.update_pending_review(row.id, status="waiting")
         return
     tags = tagset_from_dict(_loads(row.working_json, {}))
-    identity = identity_from_dict(_loads(row.identity_json, {}))
-    report = _loads(row.source_report_json, {})
     staged = Path(row.local_path) if row.local_path else None
     if staged is None or not staged.is_file():
         ctx.catalog.update_pending_review(row.id, status="waiting")
@@ -613,18 +711,12 @@ async def _handle_exit(ctx: Ctx, row: PendingReview, action: str) -> None:
     try:
         await _clear_edit_cover(ctx, row)
         await _apply_manual_cover(row, tags, staged)
-        kind = "review" if action == "draft" else "library"
-        await relocate_track(
+        await _publish_group_edit(
             ctx,
-            track,
-            kind=kind,
-            tags=tags,
-            identity=identity,
-            source_report=report,
-            topic_name=row.topic_name or track.topic_name or "Unknown",
-            file_name=row.file_name or track.file_name or "track.flac",
+            track=track,
+            row=row,
             staged=staged,
-            correct_telegram=True,
+            tags=tags,
             editor_user_id=row.user_id or 0,
         )
         shutil.rmtree(staged.parent, ignore_errors=True)
@@ -636,8 +728,11 @@ async def _handle_exit(ctx: Ctx, row: PendingReview, action: str) -> None:
         await edit_status(ctx, job, to_app_error(exc).user_message)
         return
     ctx.catalog.update_pending_review(row.id, status="done")
-    dest = "review" if action == "draft" else "library"
-    await show_saved_card(ctx, row, prefix=f"Saved to Drive {dest}.")
+    await show_saved_card(
+        ctx,
+        row,
+        prefix="Group file updated. Drive copies stay until someone 👍 or 👎.",
+    )
 
 
 async def expire_react_exit(ctx: Ctx, row: PendingReview) -> None:

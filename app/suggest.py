@@ -968,7 +968,7 @@ async def suggest_for_user(ctx, user_id: int, query: str, *, language: str | Non
         {
             "artist": item.artist,
             "title": item.title,
-            "in_library": "1" if item.in_library else "0",
+            "in_library": bool(item.in_library),
             "why": item.why,
             "url": item.url,
         }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+from urllib.parse import urlencode
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
@@ -29,7 +30,7 @@ SEARCH_ENABLED = False
 SEARCH_DISABLED_TEXT = "Song search is temporarily off. Send a FLAC instead."
 
 
-def _webapp_url(ctx: Ctx, page: str) -> str | None:
+def _webapp_url(ctx: Ctx, page: str, *, q: str | None = None) -> str | None:
     try:
         base = public_base_url(ctx.settings)
     except AppError:
@@ -37,11 +38,17 @@ def _webapp_url(ctx: Ctx, page: str) -> str | None:
     # Telegram WebAppInfo rejects anything but HTTPS, including http://localhost.
     if not base.lower().startswith("https://"):
         return None
-    return f"{base}/app/{page}"
+    url = f"{base}/app/{page}"
+    extra = (q or "").strip()
+    if extra:
+        return f"{url}?{urlencode({'q': extra})}"
+    return url
 
 
-def _web_or_url_keyboard(ctx: Ctx, page: str, url: str | None, label: str) -> InlineKeyboardMarkup | None:
-    app = _webapp_url(ctx, page)
+def _web_or_url_keyboard(
+    ctx: Ctx, page: str, url: str | None, label: str, *, q: str | None = None
+) -> InlineKeyboardMarkup | None:
+    app = _webapp_url(ctx, page, q=q)
     if app:
         return InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text=label, web_app=WebAppInfo(url=app))]]

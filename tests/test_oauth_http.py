@@ -121,6 +121,8 @@ class OauthHttpTests(unittest.IsolatedAsyncioTestCase):
                 text = await resp.text()
             self.assertNotIn("csec", text)
             self.assertNotIn("client_secret", text.casefold())
+            self.assertIn("Google denied access", text)
+            self.assertIn("<main>", text)
 
 
 def _id_token(email: str) -> str:

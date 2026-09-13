@@ -212,8 +212,7 @@ def cover_edit_keyboard(pending_id: int, options: list[dict] | None = None) -> I
 def exit_edit_keyboard(pending_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Commit to library", callback_data=f"r{pending_id}:library")],
-            [InlineKeyboardButton(text="Save draft", callback_data=f"r{pending_id}:draft")],
+            [InlineKeyboardButton(text="Commit", callback_data=f"r{pending_id}:commit")],
             [InlineKeyboardButton(text="Cancel", callback_data=f"r{pending_id}:cancel")],
         ]
     )
