@@ -6,7 +6,8 @@
   <title>Manual — MetaMusic</title>
   <meta name="description" content="How to use MetaMusic in Telegram: send a FLAC, connect Drive, react to save, edit tags, review, and suggest.">
   <meta name="theme-color" content="#f4efe6">
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/favicon.png" type="image/png" sizes="64x64">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
@@ -14,13 +15,7 @@
   <header class="top">
     <div class="wrap wrap-wide top-inner">
       <a class="brand" href="/">
-        <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
-          <rect width="32" height="32" rx="8" fill="currentColor"/>
-          <rect x="7" y="14" width="3" height="10" rx="1.2" fill="var(--paper)"/>
-          <rect x="12.5" y="8" width="3" height="16" rx="1.2" fill="var(--accent)"/>
-          <rect x="18" y="11" width="3" height="13" rx="1.2" fill="var(--paper)"/>
-          <rect x="23.5" y="16" width="3" height="8" rx="1.2" fill="var(--accent)"/>
-        </svg>
+        <img class="mark" src="/img/mark.png" alt="" width="40" height="40">
         MetaMusic
       </a>
       <nav>
@@ -28,6 +23,7 @@
         <a href="/manual">Manual</a>
         <a href="/privacy">Privacy</a>
         <a href="/terms">Terms</a>
+        <a href="https://t.me/MetaMusicProBot">Telegram</a>
       </nav>
     </div>
   </header>
@@ -35,7 +31,13 @@
     <div class="wrap prose">
       <p class="kicker">User manual</p>
       <h1>How to use MetaMusic</h1>
-      <p class="lead">This is a Telegram bot, not a website you upload to. You send it a FLAC in a chat. It listens to a fingerprint of that file, looks up the recording, writes a short set of tags, and can drop a copy into your own Google Drive. The audio bits stay as they were — nothing is converted to MP3.</p>
+      <p class="lead">This is a Telegram bot, not a website you upload to. Open <a href="https://t.me/MetaMusicProBot">@MetaMusicProBot</a>, then send it a FLAC in a chat. It listens to a fingerprint of that file, looks up the recording, writes a short set of tags, and can drop a copy into your own Google Drive. The audio bits stay as they were — nothing is converted to MP3.</p>
+      <figure class="qr-card qr-card--compact">
+        <a href="https://t.me/MetaMusicProBot">
+          <img src="/img/qr.jpg" width="1013" height="1024" alt="QR code for @MetaMusicProBot">
+        </a>
+        <figcaption>Scan, or open <a href="https://t.me/MetaMusicProBot">@MetaMusicProBot</a>.</figcaption>
+      </figure>
       <p>Search-by-name is off right now. Send a file. Song-name lookup will come back when the operator turns it on.</p>
 
       <nav class="toc" aria-label="On this page">
@@ -56,7 +58,7 @@
         </li>
         <li>
           <h3>Say hello with <code>/start</code></h3>
-          <p>Send <code>/start</code> in a private chat with the bot. You should see when you first showed up, how many songs you have edited, whether Drive is connected, and that idle sessions are forgotten after three months. Do this once so later private confirmations have somewhere to land.</p>
+          <p>Send <code>/start</code> in a private chat with <a href="https://t.me/MetaMusicProBot">@MetaMusicProBot</a>. You should see when you first showed up, how many songs you have edited, whether Drive is connected, and that idle sessions are forgotten after three months. Do this once so later private confirmations have somewhere to land.</p>
         </li>
         <li>
           <h3>Send a FLAC — that is the whole job</h3>
@@ -136,7 +138,7 @@
   <footer class="foot">
     <div class="wrap wrap-wide foot-inner">
       <p>© <span id="y"></span> MetaMusic</p>
-      <p><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a></p>
+      <p><a href="https://t.me/MetaMusicProBot">@MetaMusicProBot</a> · <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a></p>
     </div>
   </footer>
   <script src="/js/site.js" nonce="NONCE_PLACEHOLDER"></script>

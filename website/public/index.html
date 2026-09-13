@@ -6,7 +6,8 @@
   <title>MetaMusic</title>
   <meta name="description" content="MetaMusic tags FLAC files in Telegram and can save them to your Google Drive. It cannot read your Drive. Music on our servers is kept for one week.">
   <meta name="theme-color" content="#f4efe6">
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/favicon.png" type="image/png" sizes="64x64">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
@@ -14,13 +15,7 @@
   <header class="top">
     <div class="wrap wrap-wide top-inner">
       <a class="brand" href="/">
-        <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
-          <rect width="32" height="32" rx="8" fill="currentColor"/>
-          <rect x="7" y="14" width="3" height="10" rx="1.2" fill="var(--paper)"/>
-          <rect x="12.5" y="8" width="3" height="16" rx="1.2" fill="var(--accent)"/>
-          <rect x="18" y="11" width="3" height="13" rx="1.2" fill="var(--paper)"/>
-          <rect x="23.5" y="16" width="3" height="8" rx="1.2" fill="var(--accent)"/>
-        </svg>
+        <img class="mark" src="/img/mark.png" alt="" width="40" height="40">
         MetaMusic
       </a>
       <nav>
@@ -28,19 +23,27 @@
         <a href="/manual">Manual</a>
         <a href="/privacy">Privacy</a>
         <a href="/terms">Terms</a>
+        <a href="https://t.me/MetaMusicProBot">Telegram</a>
       </nav>
     </div>
   </header>
   <main id="content">
     <div class="wrap">
+      <img class="hero-logo" src="/img/logo.jpg" width="1024" height="1024" alt="MetaMusic Telegram Bot">
       <p class="kicker">Telegram bot</p>
       <h1>Tag your FLACs.<br>Keep them in your Drive.</h1>
       <p class="lead">MetaMusic is a Telegram bot. Send it a FLAC, and it fingerprints the file, writes clean tags, and can place a copy in <em>your</em> Google Drive. It never re-encodes the audio.</p>
       <p class="lead">This website is the public front door: what the bot does, how to use it, what it can see, and how long it keeps anything. The Mini App itself opens inside Telegram at music.avje.in.</p>
       <div class="hero-actions">
-        <a class="btn btn-solid" href="/manual">How to use the bot</a>
-        <a class="btn btn-ghost" href="/privacy">Privacy</a>
+        <a class="btn btn-solid" href="https://t.me/MetaMusicProBot">Open @MetaMusicProBot</a>
+        <a class="btn btn-ghost" href="/manual">How to use the bot</a>
       </div>
+      <figure class="qr-card">
+        <a href="https://t.me/MetaMusicProBot">
+          <img src="/img/qr.jpg" width="1013" height="1024" alt="QR code for @MetaMusicProBot">
+        </a>
+        <figcaption>Scan to open the bot, or tap <a href="https://t.me/MetaMusicProBot">@MetaMusicProBot</a>.</figcaption>
+      </figure>
     </div>
     <div class="wrap">
       <section class="features" aria-label="What the bot does">
@@ -87,13 +90,13 @@
           <p>Copies we hold while tagging are deleted after one week. If you do not use the bot for three months, we forget your stored login and session. Files already saved in your Drive stay there until you remove them.</p>
         </article>
       </section>
-      <p class="note">Open MetaMusic from Telegram. Do not paste login links in a public group. Step-by-step is in the <a href="/manual">manual</a>. Data rules are on the <a href="/privacy">privacy page</a>.</p>
+      <p class="note">Open <a href="https://t.me/MetaMusicProBot">@MetaMusicProBot</a> in Telegram. Do not paste login links in a public group. Step-by-step is in the <a href="/manual">manual</a>. Data rules are on the <a href="/privacy">privacy page</a>.</p>
     </div>
   </main>
   <footer class="foot">
     <div class="wrap wrap-wide foot-inner">
       <p>© <span id="y"></span> MetaMusic</p>
-      <p><a href="/manual">Manual</a> · <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a></p>
+      <p><a href="https://t.me/MetaMusicProBot">@MetaMusicProBot</a> · <a href="/manual">Manual</a> · <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a></p>
     </div>
   </footer>
   <script src="/js/site.js" nonce="NONCE_PLACEHOLDER"></script>

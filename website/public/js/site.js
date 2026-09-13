@@ -1,7 +1,8 @@
 (function () {
   var path = location.pathname.replace(/\/$/, "") || "/";
-  document.querySelectorAll("nav a").forEach(function (a) {
+  document.querySelectorAll(".top nav a").forEach(function (a) {
     var href = a.getAttribute("href") || "";
+    if (href.indexOf("://") !== -1) return;
     if (href === path || (path === "/" && href === "/")) {
       a.setAttribute("aria-current", "page");
     }
