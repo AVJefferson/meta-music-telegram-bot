@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -59,6 +60,15 @@ def _child_from_meta(meta: dict) -> DriveChild:
 
 class DriveAccessError(RuntimeError):
     """Folder missing, wrong auth, or Drive rejected the upload."""
+
+
+_INVALID_GRANT = (
+    "Google OAuth refresh token is invalid or expired (invalid_grant). "
+    "Consent apps left in Testing expire the token after ~7 days. "
+    "Re-run `python -m app.drive_auth` and update GOOGLE_REFRESH_TOKEN. "
+    "Keep the same OAuth client and GDRIVE_* folder IDs. "
+    "To stop the 7-day expiry, set the consent screen to In production."
+)
 
 
 def _oauth_email(creds: Credentials) -> str:
@@ -119,20 +129,22 @@ class DriveClient:
 
     @classmethod
     def from_settings(cls, settings: Settings) -> DriveClient:
-        if (
-            settings.google_refresh_token
-            and settings.google_client_id
-            and settings.google_client_secret
-        ):
+        client_id = (settings.google_client_id or "").strip()
+        client_secret = (settings.google_client_secret or "").strip()
+        refresh_token = (settings.google_refresh_token or "").strip()
+        if client_id and client_secret and refresh_token:
             creds = Credentials(
                 token=None,
-                refresh_token=settings.google_refresh_token,
+                refresh_token=refresh_token,
                 token_uri="https://oauth2.googleapis.com/token",
-                client_id=settings.google_client_id,
-                client_secret=settings.google_client_secret,
+                client_id=client_id,
+                client_secret=client_secret,
                 scopes=DRIVE_SCOPE,
             )
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except RefreshError as exc:
+                raise DriveAccessError(_INVALID_GRANT) from exc
             email = _oauth_email(creds)
             log.info("drive auth=oauth drive.file user=%s", email)
             return cls(creds, email=email)

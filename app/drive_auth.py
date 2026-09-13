@@ -30,6 +30,7 @@ from pathlib import Path
 # Google adds `openid` when email is requested; oauthlib otherwise aborts.
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -335,13 +336,22 @@ def run_setup_folders(settings: AuthSettings) -> int:
         return 1
     creds = Credentials(
         token=None,
-        refresh_token=settings.google_refresh_token,
+        refresh_token=settings.google_refresh_token.strip(),
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=settings.google_client_id,
-        client_secret=settings.google_client_secret,
+        client_id=settings.google_client_id.strip(),
+        client_secret=settings.google_client_secret.strip(),
         scopes=DRIVE_SCOPE,
     )
-    creds.refresh(Request())
+    try:
+        creds.refresh(Request())
+    except RefreshError:
+        print(
+            "Google OAuth refresh token is invalid or expired (invalid_grant). "
+            "Re-run `python -m app.drive_auth` (without --setup-folders) "
+            "and update GOOGLE_REFRESH_TOKEN.",
+            file=sys.stderr,
+        )
+        return 1
     library_id, review_id = _make_folders(creds)
     if not library_id or not review_id:
         return 1

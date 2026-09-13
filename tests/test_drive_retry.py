@@ -6,9 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
-from app.drive import DriveAccessError, retry_drive_io
+from app.drive import DriveAccessError, DriveClient, retry_drive_io
 
 
 def _http_error(status: int) -> HttpError:
@@ -71,3 +72,29 @@ class RetryDriveIoTests(unittest.TestCase):
                 result = retry_drive_io(op, label="download", on_fail=on_fail)
             self.assertEqual(result.read_bytes(), b"full")
             self.assertEqual(calls["n"], 2)
+
+
+class FromSettingsAuthTests(unittest.TestCase):
+    def test_invalid_grant_becomes_drive_access_error(self) -> None:
+        settings = SimpleNamespace(
+            google_refresh_token="tok",
+            google_client_id="id",
+            google_client_secret="secret",
+        )
+        with patch("app.drive.Credentials") as creds_cls:
+            creds = creds_cls.return_value
+            creds.refresh.side_effect = RefreshError("invalid_grant: Bad Request")
+            with self.assertRaises(DriveAccessError) as ctx:
+                DriveClient.from_settings(settings)
+        self.assertIn("drive_auth", str(ctx.exception))
+        self.assertIn("GOOGLE_REFRESH_TOKEN", str(ctx.exception))
+
+    def test_missing_credentials(self) -> None:
+        settings = SimpleNamespace(
+            google_refresh_token="",
+            google_client_id="id",
+            google_client_secret="secret",
+        )
+        with self.assertRaises(DriveAccessError) as ctx:
+            DriveClient.from_settings(settings)
+        self.assertIn("No Drive credentials", str(ctx.exception))
