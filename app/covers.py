@@ -204,11 +204,11 @@ def _download_drive_cover(ctx: Ctx, topic: str, albumartist: str, album: str) ->
     parts = album_folder_parts(topic, albumartist, album)
     if not parts:
         return None
-    from app.drive import resolve_drive, user_drive_root
+    from app.drive import require_drive, user_drive_root
 
     uid = getattr(ctx, "index_user_id", 0) or 0
     root = user_drive_root(ctx, "library", uid)
-    drive = resolve_drive(ctx, uid)
+    drive = require_drive(ctx, uid, method="find_path")
     if not root or drive is None:
         return None
     folder_id = drive.find_path(root, parts)

@@ -505,11 +505,9 @@ def remember_library_tags(
     if kind != "library" or not relative_path:
         return
     if user_id:
-        from dataclasses import replace as _replace
+        from app.relocate import ctx_for_user
 
-        from app.drive import resolve_drive
-
-        ctx = _replace(ctx, index_user_id=user_id, drive=resolve_drive(ctx, user_id) or ctx.drive)
+        ctx = ctx_for_user(ctx, user_id)
     try:
         upsert_library_index(
             ctx,

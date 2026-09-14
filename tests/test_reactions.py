@@ -851,8 +851,11 @@ class RestartTrackListenTests(unittest.IsolatedAsyncioTestCase):
         sent: list = []
 
         class Bot:
+            async def send_audio(self, chat_id, audio=None, **kwargs):
+                sent.append({"chat_id": chat_id, "audio": audio, **kwargs})
+
             async def send_document(self, **kwargs):
-                sent.append(kwargs)
+                sent.append({"via": "document", **kwargs})
 
             async def edit_message_text(self, *args, **kwargs):
                 return None
@@ -918,6 +921,8 @@ class RestartTrackListenTests(unittest.IsolatedAsyncioTestCase):
         sent = await self._run(chat_id=42)
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["chat_id"], 42)
+        self.assertNotIn("via", sent[0])
+        self.assertIn("audio", sent[0])
 
     async def test_group_does_not_send_flac(self) -> None:
         sent = await self._run(chat_id=-100)

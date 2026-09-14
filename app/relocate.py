@@ -8,7 +8,7 @@ import uuid
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from app.drive import resolve_drive, user_drive_root
+from app.drive import require_drive, resolve_drive, user_drive_root
 from app.genre import genre_tokens
 from app.library import library_relative, place_file, review_relative, rmdir_empty, unlink_quiet, write_sidecar
 from app.models import Ctx, Identity, TagSet, TrackRecord, identity_from_dict, tagset_from_dict
@@ -121,6 +121,9 @@ async def stage_track_flac(ctx: Ctx, track: TrackRecord) -> Path:
     """Copy the current Telegram audio when possible; else local/Drive. Always a new pending file."""
     from app.botapi import discard_download
 
+    uid = getattr(track, "user_id", 0) or getattr(ctx, "index_user_id", 0) or 0
+    if uid:
+        ctx = ctx_for_user(ctx, uid)
     dest = _stage_dest(ctx, track)
     if track.telegram_file_id:
         try:
@@ -146,9 +149,11 @@ async def _resolve_drive_file_id(ctx: Ctx, track: TrackRecord) -> str | None:
     if not track.relative_path:
         return None
     relative = Path(track.relative_path)
-    uid = getattr(track, "user_id", 0) or 0
+    uid = getattr(track, "user_id", 0) or getattr(ctx, "index_user_id", 0) or 0
     root = drive_root_id(ctx, track.kind, uid)
-    drive = resolve_drive(ctx, uid) or ctx.drive
+    drive = require_drive(ctx, uid, method="find_path")
+    if drive is None:
+        return None
     parent = await asyncio.to_thread(drive.find_path, root, list(relative.parts[:-1]))
     if not parent:
         return None
@@ -177,10 +182,13 @@ async def _ensure_local_flac_locked(ctx: Ctx, track: TrackRecord) -> Path:
     file_id = await _resolve_drive_file_id(ctx, track)
     if not file_id:
         raise FileNotFoundError("Track has no local file and no Drive copy.")
+    uid = getattr(track, "user_id", 0) or getattr(ctx, "index_user_id", 0) or 0
+    drive = require_drive(ctx, uid, method="download_to")
+    if drive is None:
+        raise FileNotFoundError("Track has a Drive copy but no Drive client for this user.")
     name = Path(track.relative_path or track.file_name or "track.flac").name
     dest = ctx.settings.pending_root / str(uuid.uuid4()) / sanitize_filename(name)
     log.info("downloading track=%s from Drive id=%s to %s", track.id, file_id, dest)
-    drive = resolve_drive(ctx, getattr(track, "user_id", 0) or 0) or ctx.drive
     await asyncio.to_thread(drive.download_to, file_id, dest)
     ctx.catalog.update_track(track.id, local_path=str(dest), drive_file_id=file_id)
     return dest
@@ -190,8 +198,8 @@ async def _delete_drive_named(
     ctx: Ctx, kind: str, relative: Path | None, extra_ids: list[str | None], user_id: int = 0
 ) -> None:
     seen: set[str] = set()
-    drive = resolve_drive(ctx, user_id) or ctx.drive
-    if not callable(getattr(drive, "delete_file", None)):
+    drive = require_drive(ctx, user_id, method="delete_file")
+    if drive is None:
         return
     for file_id in extra_ids:
         if not file_id or file_id in seen:
