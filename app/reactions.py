@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiogram import F, Router
-from aiogram.types import CallbackQuery, FSInputFile, MessageReactionUpdated
+from aiogram.types import CallbackQuery, MessageReactionUpdated
 
 from app.card_resolve import resolve_track_for_reaction
 from app.edit_ui import (
@@ -23,6 +23,7 @@ from app.membership import allow_from_callback, allow_user, touch, user_is_bot
 from app.models import Ctx, Job, PendingReview, TrackRecord, tagset_from_dict
 from app.relocate import (
     copy_track_for_user,
+    ctx_for_user,
     delete_track,
     ensure_local_flac,
     identity_from_track,
@@ -363,7 +364,10 @@ async def _confirm_reaction(ctx: Ctx, event: MessageReactionUpdated, track: Trac
         ctx.catalog.update_pending_review(row.id, status_message_id=status_id)
 
 
-async def _stage_copy(ctx: Ctx, track: TrackRecord) -> Path:
+async def _stage_copy(ctx: Ctx, track: TrackRecord, user_id: int = 0) -> Path:
+    uid = getattr(track, "user_id", 0) or user_id or 0
+    if uid:
+        ctx = ctx_for_user(ctx, uid)
     source = await ensure_local_flac(ctx, track)
     pending_dir = ctx.settings.pending_root / str(uuid.uuid4())
     pending_dir.mkdir(parents=True, exist_ok=True)
@@ -384,7 +388,7 @@ async def _enter_edit(ctx: Ctx, event: MessageReactionUpdated, track: TrackRecor
                     log.exception("edit UI refresh failed track=%s", track.id)
         return
     try:
-        staged = await _stage_copy(ctx, track)
+        staged = await _stage_copy(ctx, track, user_id=event.user.id if event.user else 0)
     except Exception:
         log.exception("stage for edit failed track=%s", track.id)
         await _reply_card(ctx, event, "Could not load this file for editing.", None, thread_id=track.thread_id)
@@ -553,11 +557,10 @@ async def _restart_source(ctx: Ctx, track: TrackRecord) -> Path:
 
 
 async def _send_listen_copy(ctx: Ctx, chat_id: int, path: Path) -> None:
+    from app.telegram_file import send_public_audio
+
     try:
-        await ctx.bot.send_document(
-            chat_id=chat_id,
-            document=FSInputFile(path, filename=path.name),
-        )
+        await send_public_audio(ctx, chat_id, path)
     except Exception:
         log.warning("dm listen send failed chat=%s", chat_id, exc_info=True)
 
@@ -674,6 +677,7 @@ async def _publish_group_edit(
         path=staged,
         caption=caption,
         correct_media=True,
+        tags=tags,
     )
     if new_id:
         ctx.catalog.update_track(track.id, telegram_file_id=new_id)

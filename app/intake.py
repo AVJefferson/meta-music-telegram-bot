@@ -5,7 +5,6 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from aiogram.types import FSInputFile
 from aiogram.types.chat import Chat
 
 from app.captions import music_caption
@@ -13,6 +12,7 @@ from app.errors import AppError
 from app.membership import check_upload_rate, touch
 from app.models import Ctx, Job, TagSet
 from app.paths import file_sha256, remember_cache
+from app.telegram_file import message_file_id, send_public_audio
 from app.util import sanitize_filename
 
 log = logging.getLogger(__name__)
@@ -43,23 +43,26 @@ async def ingest_local_flac(
     existing = ctx.catalog.find_user_track_by_sha(user_id, sha)
     if existing:
         caption = music_caption(track=existing, extra="already in library/review")
-        await ctx.bot.send_document(
+        await send_public_audio(
+            ctx,
             chat.id,
-            FSInputFile(existing.local_path or local),
+            Path(existing.local_path or local),
             caption=caption,
-            parse_mode="HTML",
-            message_thread_id=thread_id,
+            thread_id=thread_id,
         )
         return existing.id
     remember_cache(ctx, sha, local)
-    caption = music_caption(tags=TagSet(title=Path(file_name).stem), extra="identifying…")
-    sent = await ctx.bot.send_document(
+    tags = TagSet(title=Path(file_name).stem)
+    caption = music_caption(tags=tags, extra="identifying…")
+    sent = await send_public_audio(
+        ctx,
         chat.id,
-        FSInputFile(local),
+        local,
         caption=caption,
-        parse_mode="HTML",
-        message_thread_id=thread_id,
+        thread_id=thread_id,
+        tags=tags,
     )
+    sent_file_id = telegram_file_id or message_file_id(sent)
     pending_id = ctx.catalog.insert_pending_review(
         phase="intake",
         status="queued",
@@ -78,7 +81,7 @@ async def ingest_local_flac(
         status_message_id=sent.message_id,
         topic_name=topic_name or "",
         file_name=sanitize_filename(file_name) or "track.flac",
-        telegram_file_id=telegram_file_id or (sent.document.file_id if sent.document else ""),
+        telegram_file_id=sent_file_id,
         source_message_id=source_message_id or sent.message_id,
         expires_at=_expires(),
         user_id=user_id,
@@ -89,7 +92,7 @@ async def ingest_local_flac(
             chat_id=chat.id,
             thread_id=thread_id,
             topic_name=topic_name or "",
-            file_id=telegram_file_id or (sent.document.file_id if sent.document else ""),
+            file_id=sent_file_id,
             file_name=file_name,
             status_message_id=sent.message_id,
             local_path=str(local),

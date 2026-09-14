@@ -121,7 +121,9 @@ async def _purge_uploaded_local(ctx: Ctx, row: TrackRecord) -> None:
         return
     uid = getattr(row, "user_id", 0) or 0
     bound = ctx_for_user(ctx, uid) if uid else ctx
-    drive = resolve_drive(bound, uid) or bound.drive
+    drive = resolve_drive(bound, uid)
+    if drive is None or not callable(getattr(drive, "file_exists", None)):
+        return
     exists = await asyncio.to_thread(drive.file_exists, row.drive_file_id)
     if not exists:
         log.warning("drive file missing for track %s, re-uploading", row.id)

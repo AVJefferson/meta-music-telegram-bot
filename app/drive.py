@@ -717,16 +717,35 @@ class DriveHub:
             self._clients.pop(user_id, None)
 
 
+def _is_drive_hub(obj) -> bool:
+    return isinstance(obj, DriveHub)
+
+
 def resolve_drive(ctx, user_id: int = 0):
+    """Return a DriveClient (or test fake), never a DriveHub.
+
+    DriveClient.for_user is a classmethod; calling it as hub.for_user(uid)
+    raises TypeError. Bind DriveHub first, then treat any other object as
+    an already-resolved client.
+    """
     hub = getattr(ctx, "drive", None)
     if hub is None:
         return None
-    getter = getattr(hub, "for_user", None)
-    if callable(getter) and user_id:
-        return getter(user_id)
-    if callable(getattr(hub, "find_path", None)):
+    if _is_drive_hub(hub):
+        return hub.for_user(user_id) if user_id else None
+    return hub
+
+
+def require_drive(ctx, user_id: int = 0, *, method: str = "download_to"):
+    """Resolve a client that actually implements `method`. Never return DriveHub."""
+    uid = user_id or getattr(ctx, "index_user_id", 0) or 0
+    client = resolve_drive(ctx, uid)
+    if client is not None and callable(getattr(client, method, None)):
+        return client
+    hub = getattr(ctx, "drive", None)
+    if hub is not None and not _is_drive_hub(hub) and callable(getattr(hub, method, None)):
         return hub
-    return None if callable(getter) else hub
+    return None
 
 
 def user_drive_root(ctx, kind: str, user_id: int = 0) -> str:

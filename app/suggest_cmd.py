@@ -226,12 +226,10 @@ async def _run_suggest(message: Message, ctx: Ctx, query: str) -> None:
         reply_track = ctx.catalog.get_track_by_message(message.chat.id, reply.message_id)
     library = ctx.catalog.list_library_tracks(message.from_user.id if message.from_user else None)
     if not library:
-        from dataclasses import replace
-
-        from app.drive import resolve_drive
+        from app.relocate import ctx_for_user
 
         uid = message.from_user.id if message.from_user else 0
-        bound = replace(ctx, index_user_id=uid, drive=resolve_drive(ctx, uid) or ctx.drive)
+        bound = ctx_for_user(ctx, uid) if uid else ctx
         library = await load_drive_library(
             bound,
             topic=None,

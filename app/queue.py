@@ -2393,6 +2393,7 @@ async def _commit_upload(
             path=dest,
             caption=caption,
             correct_media=correct,
+            tags=tags,
         )
         if new_file:
             telegram_file_id = new_file

@@ -941,12 +941,10 @@ async def suggest_for_user(ctx, user_id: int, query: str, *, language: str | Non
         return []
     library = ctx.catalog.list_library_tracks(user_id)
     if not library:
-        from dataclasses import replace
-
-        from app.drive import resolve_drive
         from app.library_index import entries_to_tracks, load_index_entries
+        from app.relocate import ctx_for_user
 
-        bound = replace(ctx, index_user_id=user_id, drive=resolve_drive(ctx, user_id) or ctx.drive)
+        bound = ctx_for_user(ctx, user_id)
         entries = load_index_entries(bound) or []
         library = entries_to_tracks(entries)
     seeds = select_library_seeds(library, ctx.genre, language=language)

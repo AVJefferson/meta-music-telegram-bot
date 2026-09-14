@@ -409,20 +409,29 @@ async def _run_private_claimed(ctx: Ctx, row: PendingReview, operation) -> None:
 
 
 async def _recall_review(ctx: Ctx, row: PendingReview, index: int) -> None:
+    from app.drive import require_drive
+    from app.relocate import ctx_for_user
+
     items = _loads(row.candidates_json, [])
     if index < 0 or index >= len(items):
         return
     item = items[index]
+    uid = getattr(row, "user_id", 0) or 0
+    if uid:
+        ctx = ctx_for_user(ctx, uid)
+    drive = require_drive(ctx, uid, method="download_to")
+    if drive is None:
+        raise FileNotFoundError("Drive client unavailable for review recall.")
     pending_dir = ctx.settings.pending_root / str(uuid.uuid4())
     pending_dir.mkdir(parents=True, exist_ok=True)
     local = pending_dir / sanitize_filename(item["name"])
     ctx.catalog.update_pending_review(row.id, local_path=str(local))
-    await asyncio.to_thread(ctx.drive.download_to, item["file_id"], local)
+    await asyncio.to_thread(drive.download_to, item["file_id"], local)
     sidecar_path: Path | None = None
     sidecar: dict = {}
     if item.get("sidecar_id"):
         sidecar_path = local.with_suffix(".json")
-        await asyncio.to_thread(ctx.drive.download_to, item["sidecar_id"], sidecar_path)
+        await asyncio.to_thread(drive.download_to, item["sidecar_id"], sidecar_path)
         sidecar = _loads(sidecar_path.read_text(encoding="utf-8"), {})
     tags = await asyncio.to_thread(read_tagset, local)
     duration, bit_depth, sample_rate = await asyncio.to_thread(audio_info, local)
