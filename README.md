@@ -122,7 +122,7 @@ No live Google, HiFi, or Telegram in CI.
 
 **`invalid_grant` / needs_login.** Testing-mode token died. `/login` again.
 
-**Ephemeral missing.** Local Bot API older than 10.2; UI falls back to DM. User must `/start` the bot first.
+**Ephemeral missing.** Local Bot API older than 10.3; UI falls back to DM. User must `/start` the bot first.
 
 **Cover picker shows no images.** Bot lacks photo permission in that group.
 

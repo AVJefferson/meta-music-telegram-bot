@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -165,7 +164,7 @@ def build_hifi_router() -> Router:
     from aiogram import F
     from aiogram.types import CallbackQuery
 
-    from app.ephemeral import send_private
+    from app.ephemeral import edit_private_markup
     from app.membership import allow_from_callback, check_upload_rate, touch
     from app.notify import notify_error
 
@@ -216,16 +215,14 @@ def build_hifi_router() -> Router:
             return
         await callback.answer()
         if callback.message:
-            try:
-                await callback.message.edit_reply_markup(reply_markup=markup)
-            except Exception:
-                await send_private(
-                    ctx,
-                    chat_id=callback.message.chat.id,
-                    user_id=callback.from_user.id,
-                    text="More results",
-                    reply_markup=markup,
-                )
+            await edit_private_markup(
+                ctx,
+                chat_id=callback.message.chat.id,
+                user_id=callback.from_user.id,
+                message=callback.message,
+                reply_markup=markup,
+                text="More results",
+            )
 
     @router.callback_query(F.data.startswith("hfcancel:"))
     async def on_cancel(callback: CallbackQuery, ctx: Ctx) -> None:
@@ -236,8 +233,13 @@ def build_hifi_router() -> Router:
             return
         _sessions.pop(session_id, None)
         await callback.answer("Cancelled")
-        if callback.message:
-            with contextlib.suppress(Exception):
-                await callback.message.edit_reply_markup(reply_markup=None)
+        if callback.message and callback.from_user:
+            await edit_private_markup(
+                ctx,
+                chat_id=callback.message.chat.id,
+                user_id=callback.from_user.id,
+                message=callback.message,
+                reply_markup=None,
+            )
 
     return router

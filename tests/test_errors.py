@@ -15,18 +15,22 @@ class EphemeralFallbackTests(unittest.IsolatedAsyncioTestCase):
         from app.ephemeral import send_private
 
         sent: list[tuple] = []
-
-        async def call(method):
-            raise TelegramBadRequest(method=method, message="ephemeral unsupported")
+        group_kwargs: list[dict] = []
 
         async def send_message(chat_id, text, **kwargs):
+            if chat_id == -100:
+                group_kwargs.append(kwargs)
+                raise TelegramBadRequest(method="sendMessage", message="ephemeral unsupported")
             sent.append((chat_id, text))
             return SimpleNamespace(message_id=1, chat=SimpleNamespace(id=chat_id))
 
-        ctx = SimpleNamespace(bot=SimpleNamespace(__call__=call, send_message=send_message))
+        ctx = SimpleNamespace(bot=SimpleNamespace(send_message=send_message))
         msg = await send_private(ctx, chat_id=-100, user_id=9, text="hi")
         self.assertEqual(sent, [(9, "hi")])
         self.assertIsNotNone(msg)
+        self.assertTrue(group_kwargs)
+        self.assertIn("ephemeral_message_parameters", group_kwargs[0])
+        self.assertNotIn("receiver_user_id", group_kwargs[0])
 
 
 class ErrorRedactTests(unittest.TestCase):
