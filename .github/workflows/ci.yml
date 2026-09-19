@@ -18,7 +18,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libsndfile1
           python -m pip install --upgrade pip
-          pip install -r requirements.txt ruff
+          pip install -r requirements.txt
       - name: Lint
         run: ruff check .
       - name: Tests

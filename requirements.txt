@@ -13,3 +13,4 @@ Pillow>=11.0,<12
 flac-detective>=1.11,<2
 telethon>=1.36,<2
 aiohttp>=3.10,<4
+ruff==0.16.8

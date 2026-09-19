@@ -1,10 +1,10 @@
-import urllib.request
 import json
 import re
+import urllib.request
 
 req_file = '/home/avjef/Projects/telegram-music-bot/requirements.txt'
 
-with open(req_file, 'r') as f:
+with open(req_file) as f:
     lines = f.readlines()
 
 for line in lines:
