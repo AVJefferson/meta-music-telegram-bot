@@ -759,6 +759,22 @@ class RankTests(unittest.TestCase):
         )
         self.assertEqual([item.title for item in ranked], ["Fresh", "Old"])
 
+    def test_min_match_drops_weak_unowned(self) -> None:
+        weak = Hit(artist="X", title="Far", match=0.05, vias=("similar to A",))
+        strong = Hit(artist="Y", title="Near", match=0.8, vias=("similar to A",))
+        owned_hit = Hit(artist="Z", title="Mine", match=0.05, vias=("in your library",))
+        ranked = rank_suggestions(
+            [weak, strong, owned_hit],
+            owned={owned_key("Z", "Mine")},
+            shown=set(),
+            mapper=mapper(),
+            min_match=0.4,
+        )
+        titles = {item.title for item in ranked}
+        self.assertNotIn("Far", titles)
+        self.assertIn("Near", titles)
+        self.assertIn("Mine", titles)
+
 
 class LastfmParseTests(unittest.TestCase):
     def test_single_item_not_list(self) -> None:

@@ -103,6 +103,8 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(track["relative_path"], "pile/song.flac")
             self.assertEqual(track["drive_url"], "https://drive.google.com/file/d/abc/view")
             self.assertEqual(track["status"], "uploaded")
+            self.assertIn("genre", track)
+            self.assertIn("albumartist", track)
 
     async def test_cancel_deletes_own_track_not_other(self) -> None:
         directory, catalog = temp_catalog()
@@ -203,6 +205,7 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
                     "in_library": True,
                     "why": "near",
                     "url": "https://www.last.fm/music/A/_/T",
+                    "mbid": "rec-1",
                 }
             ]
             with patch("app.suggest.suggest_for_user", AsyncMock(return_value=rows)):
@@ -212,6 +215,14 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(data["ok"])
             self.assertFalse(data["lastfm"])
             self.assertIs(data["results"][0]["in_library"], True)
+            self.assertEqual(data["results"][0]["mbid"], "rec-1")
+            links = data["results"][0]["links"]
+            self.assertTrue(links["youtube"].startswith("https://music.youtube.com/search"))
+            self.assertTrue(links["lastfm"].startswith("https://www.last.fm/"))
+            self.assertTrue(links["google"].startswith("https://www.google.com/search"))
+            self.assertIn("HiFiAudioBot", links["hifi"])
+            self.assertEqual(links["apple"], "")
+            self.assertEqual(links["musicbrainz"], "https://musicbrainz.org/recording/rec-1")
 
     async def test_app_shell_and_static(self) -> None:
         directory, catalog = temp_catalog()
@@ -233,3 +244,106 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(css_status, 200)
             self.assertEqual(js_status, 200)
             self.assertIn("text/css", css_type)
+
+    async def test_library_count_prefers_index(self) -> None:
+        directory, catalog = temp_catalog()
+        with directory:
+            catalog.ensure_user(11)
+            catalog.insert_pending(
+                kind="library",
+                mb_recording_id=None,
+                acoustid=None,
+                local_path="",
+                sidecar_path=None,
+                relative_path="lib/a.flac",
+                bit_depth=None,
+                sample_rate=None,
+                title="Lib",
+                artist="A",
+                album="A",
+                status="uploaded",
+                user_id=11,
+            )
+            ctx = make_ctx(catalog)
+            app = create_http_app(ctx)
+            entries = [{"title": "a"}, {"title": "b"}, {"title": "c"}]
+            with patch("app.library_index.load_index_entries", return_value=entries):
+                async with TestClient(TestServer(app)) as client:
+                    resp = await client.get("/api/me", headers=_headers())
+                    data = await resp.json()
+            self.assertEqual(data["library_count"], 3)
+            self.assertEqual(data["suggest_similarity"], 0.5)
+            self.assertFalse(data["suggest_allow_dissimilar"])
+
+    async def test_draft_rejected_and_tags_action(self) -> None:
+        directory, catalog = temp_catalog()
+        with directory:
+            mine = _review_track(catalog, 11)
+            ctx = make_ctx(catalog)
+            app = create_http_app(ctx)
+            with (
+                patch("app.relocate.hydrate_track_tags", AsyncMock(side_effect=lambda _ctx, track: track)),
+                patch("app.relocate.relocate_track", AsyncMock()) as reloc,
+            ):
+                async with TestClient(TestServer(app)) as client:
+                    draft = await client.post(
+                        f"/api/review/{mine}/action",
+                        headers=_headers(**{"Content-Type": "application/json"}),
+                        data=json.dumps({"action": "draft"}),
+                    )
+                    tags = await client.post(
+                        f"/api/review/{mine}/action",
+                        headers=_headers(**{"Content-Type": "application/json"}),
+                        data=json.dumps({"action": "tags", "title": "New", "artist": "B"}),
+                    )
+                    draft_status = draft.status
+                    tags_status = tags.status
+                    tags_data = await tags.json()
+            self.assertEqual(draft_status, 400)
+            self.assertEqual(tags_status, 200)
+            self.assertEqual(tags_data["action"], "tags")
+            self.assertEqual(reloc.await_args.kwargs["kind"], "review")
+            self.assertEqual(reloc.await_args.kwargs["tags"].title, "New")
+            self.assertEqual(reloc.await_args.kwargs["tags"].artist, "B")
+
+    async def test_settings_similarity_round_trip(self) -> None:
+        directory, catalog = temp_catalog()
+        with directory:
+            catalog.ensure_user(11)
+            ctx = make_ctx(catalog)
+            app = create_http_app(ctx)
+            async with TestClient(TestServer(app)) as client:
+                saved = await client.post(
+                    "/api/settings",
+                    headers=_headers(**{"Content-Type": "application/json"}),
+                    data=json.dumps({"suggest_similarity": 0.8, "suggest_allow_dissimilar": True}),
+                )
+                me = await client.get("/api/me", headers=_headers())
+                saved_data = await saved.json()
+                me_data = await me.json()
+            self.assertAlmostEqual(saved_data["suggest_similarity"], 0.8)
+            self.assertTrue(saved_data["suggest_allow_dissimilar"])
+            self.assertAlmostEqual(me_data["suggest_similarity"], 0.8)
+            self.assertTrue(me_data["suggest_allow_dissimilar"])
+            stored = json.loads(catalog.get_user(11).settings_json)
+            self.assertEqual(stored["suggest_similarity"], 0.8)
+            self.assertTrue(stored["suggest_allow_dissimilar"])
+
+    async def test_suggest_art_returns_urls(self) -> None:
+        from dataclasses import replace
+
+        directory, catalog = temp_catalog()
+        with directory:
+            ctx = replace(make_ctx(catalog), http=object())
+            app = create_http_app(ctx)
+            art = {"covers": ["https://example/a.jpg"], "apple": "https://music.apple.com/x"}
+            with patch("app.enrich.list_cover_urls", AsyncMock(return_value=art)):
+                async with TestClient(TestServer(app)) as client:
+                    resp = await client.get(
+                        "/api/suggest/art?artist=A&title=T",
+                        headers=_headers(),
+                    )
+                    data = await resp.json()
+            self.assertTrue(data["ok"])
+            self.assertEqual(data["covers"], ["https://example/a.jpg"])
+            self.assertEqual(data["apple"], "https://music.apple.com/x")

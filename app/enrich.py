@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import re
@@ -288,6 +289,98 @@ async def _itunes_album_search(http: httpx.AsyncClient, identity: Identity) -> l
         except httpx.HTTPError:
             continue
     return out
+
+
+def _itunes_artwork_url(item: dict | None) -> str:
+    if not item:
+        return ""
+    art = str(item.get("artworkUrl100") or item.get("artworkUrl60") or "")
+    if not art:
+        return ""
+    return art.replace("100x100bb", "600x600bb").replace("60x60bb", "600x600bb")
+
+
+def _caa_image_url(image: dict) -> str:
+    thumbs = image.get("thumbnails") or {}
+    for key in ("1200", "large", "500", "small"):
+        thumb = thumbs.get(key)
+        if thumb:
+            return str(thumb)
+    return str(image.get("image") or "")
+
+
+def _dedupe_urls(urls: list[str], limit: int = 8) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in urls:
+        url = (raw or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _itunes_term_search(http: httpx.AsyncClient, term: str, entity: str, limit: int = 5) -> list[dict]:
+    if not (term or "").strip():
+        return []
+    try:
+        response = await http.get(
+            "https://itunes.apple.com/search",
+            params={"term": term, "entity": entity, "limit": limit},
+            timeout=20.0,
+        )
+        response.raise_for_status()
+        return response.json().get("results") or []
+    except httpx.HTTPError:
+        return []
+
+
+async def list_cover_urls(
+    http: httpx.AsyncClient,
+    *,
+    artist: str = "",
+    title: str = "",
+    album: str = "",
+    mbid: str | None = None,
+) -> dict:
+    identity = Identity(
+        confidence="low",
+        title=title or "",
+        album=album or "",
+        artists=[artist] if artist else [],
+        album_artists=[artist] if artist else [],
+        mb_recording_id=mbid or None,
+    )
+    extra_term = " ".join(part for part in [artist, title] if part)
+    song_results, album_results, extra_albums = await asyncio.gather(
+        _itunes_search(http, identity),
+        _itunes_album_search(http, identity),
+        _itunes_term_search(http, extra_term, "album"),
+    )
+    covers: list[str] = []
+    apple = ""
+    song = _itunes_match(identity, song_results)
+    if song:
+        apple = str(song.get("trackViewUrl") or song.get("collectionViewUrl") or "")
+    album_item = _itunes_album_match(identity, album_results)
+    if album_item and not apple:
+        apple = str(album_item.get("collectionViewUrl") or "")
+    for item in (*song_results, *album_results, *extra_albums):
+        url = _itunes_artwork_url(item)
+        if url:
+            covers.append(url)
+    if identity.mb_release_group_id or identity.mb_release_id:
+        for _mbid, payload in await _caa_payloads(http, identity):
+            images = payload.get("images") or []
+            fronts = [img for img in images if img.get("front")] or images
+            for image in fronts:
+                url = _caa_image_url(image)
+                if url:
+                    covers.append(url)
+    return {"covers": _dedupe_urls(covers), "apple": apple}
 
 
 def _itunes_album_match(identity: Identity, results: list[dict]) -> dict | None:

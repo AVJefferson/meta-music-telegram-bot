@@ -11,7 +11,7 @@ from urllib.parse import quote
 
 import httpx
 
-from app.formats import detect_format
+from app.formats import clamp_suggest_similarity, detect_format, suggest_allow_dissimilar, user_settings_dict
 from app.genre import GenreMapper, genre_tokens
 from app.models import TagSet, TrackRecord
 from app.relocate import tags_from_track
@@ -148,6 +148,38 @@ def lastfm_track_url(artist: str, title: str) -> str:
     artist_part = quote((artist or "").replace(" ", "+"), safe="+")
     title_part = quote((title or "").replace(" ", "+"), safe="+")
     return f"https://www.last.fm/music/{artist_part}/_/{title_part}"
+
+
+def suggest_knobs(similarity: float = 0.5, allow_dissimilar: bool = False) -> dict[str, float | bool]:
+    sim = _match_float(similarity, 0.5)
+    min_match = 0.0 if allow_dissimilar else (0.15 + 0.45 * sim)
+    return {
+        "min_match": min_match,
+        "seed_weight": 0.08 + 0.14 * sim,
+        "library_ratio": 0.25 + 0.5 * sim,
+    }
+
+
+def suggest_links(
+    artist: str,
+    title: str,
+    *,
+    mbid: str | None = None,
+    apple: str = "",
+    hifi_user: str = "HiFiAudioBot",
+) -> dict[str, str]:
+    query = " ".join(part for part in [artist or "", title or ""] if part).strip()
+    q = quote(query)
+    user = (hifi_user or "HiFiAudioBot").lstrip("@")
+    mb = str(mbid or "").strip()
+    return {
+        "youtube": f"https://music.youtube.com/search?q={q}" if query else "",
+        "apple": apple or "",
+        "lastfm": lastfm_track_url(artist, title) if artist or title else "",
+        "musicbrainz": f"https://musicbrainz.org/recording/{mb}" if mb else "",
+        "google": f"https://www.google.com/search?q={q}" if query else "",
+        "hifi": f"https://t.me/{user}?text={q}" if query else "",
+    }
 
 
 def session_expires_at() -> str:
@@ -487,11 +519,18 @@ def query_tokens_ok(hit: Hit, query_tokens: list[str], mapper: GenreMapper) -> b
     return bool(want & have)
 
 
-def score_hit(hit: Hit, query_tokens: list[str], seed_profile: list[str], mapper: GenreMapper) -> float:
+def score_hit(
+    hit: Hit,
+    query_tokens: list[str],
+    seed_profile: list[str],
+    mapper: GenreMapper,
+    *,
+    seed_weight: float = 0.15,
+) -> float:
     extra = max(0, len(unique_fold(list(hit.vias))) - 1)
     score = hit.match * (1.0 + 0.8 * extra)
     score += 0.2 * token_overlap(query_tokens, (*hit.tags, *hit.seed_tokens, *hit.artist_tags), mapper)
-    score += 0.15 * token_overlap(seed_profile, (*hit.tags, *hit.artist_tags), mapper)
+    score += seed_weight * token_overlap(seed_profile, (*hit.tags, *hit.artist_tags), mapper)
     if hit.boosted:
         score += 0.25
     return score
@@ -520,6 +559,9 @@ def rank_suggestions(
     exclude: set[str] | None = None,
     per_artist: int = PER_ARTIST_CAP,
     limit: int = MAX_RESULTS,
+    min_match: float = 0.0,
+    seed_weight: float = 0.15,
+    library_ratio: float = LIBRARY_PAGE_RATIO,
 ) -> list[Suggestion]:
     query_tokens = query_tokens or []
     seed_profile = seed_profile or []
@@ -535,13 +577,15 @@ def rank_suggestions(
             continue
         if not query_tokens_ok(hit, query_tokens, mapper):
             continue
+        if key not in owned and hit.match < min_match:
+            continue
         if key in shown:
             repeats.append(hit)
         else:
             fresh.append(hit)
 
     def order(hit: Hit) -> float:
-        return score_hit(hit, query_tokens, seed_profile, mapper)
+        return score_hit(hit, query_tokens, seed_profile, mapper, seed_weight=seed_weight)
 
     ranked = sorted(fresh, key=order, reverse=True) + sorted(repeats, key=order, reverse=True)
     in_hits = [hit for hit in ranked if owned_key(hit.artist, hit.title) in owned]
@@ -565,7 +609,7 @@ def rank_suggestions(
                 in_library=key in owned,
             )
         )
-    return mix_library_pages(out)
+    return mix_library_pages(out, library_ratio=library_ratio)
 
 
 def _weave(left: list[Suggestion], right: list[Suggestion]) -> list[Suggestion]:
@@ -916,6 +960,9 @@ async def suggest_tracks(
     language: str | None = None,
     query_tokens: list[str] | None = None,
     library: list[TrackRecord] | None = None,
+    min_match: float = 0.0,
+    seed_weight: float = 0.15,
+    library_ratio: float = LIBRARY_PAGE_RATIO,
 ) -> list[Suggestion]:
     query_tokens = query_tokens or []
     seeds = narrow_seeds_for_query(seeds, query_tokens, mapper)
@@ -932,11 +979,14 @@ async def suggest_tracks(
         query_tokens=query_tokens,
         seed_profile=seed_profile_tokens(seeds),
         exclude=exclude,
+        min_match=min_match,
+        seed_weight=seed_weight,
+        library_ratio=library_ratio,
     )
     return attach_library_meta(items, library or [])
 
 
-async def suggest_for_user(ctx, user_id: int, query: str, *, language: str | None = None) -> list[dict[str, str]]:
+async def suggest_for_user(ctx, user_id: int, query: str, *, language: str | None = None) -> list[dict]:
     api_key = (getattr(ctx.settings, "lastfm_api_key", None) or "").strip()
     if not api_key:
         return []
@@ -953,6 +1003,12 @@ async def suggest_for_user(ctx, user_id: int, query: str, *, language: str | Non
     shown = ctx.catalog.list_suggest_shown(user_id)
     client = LastfmClient(ctx.http, api_key, ctx.catalog)
     tokens = [part for part in (query or "").replace(",", " ").split() if part]
+    user = ctx.catalog.get_user(user_id)
+    settings = user_settings_dict(user)
+    knobs = suggest_knobs(
+        clamp_suggest_similarity(settings.get("suggest_similarity", 0.5)),
+        suggest_allow_dissimilar(settings.get("suggest_allow_dissimilar")),
+    )
     items = await suggest_tracks(
         client,
         seeds,
@@ -962,7 +1018,11 @@ async def suggest_for_user(ctx, user_id: int, query: str, *, language: str | Non
         language=language,
         query_tokens=tokens,
         library=library,
+        min_match=float(knobs["min_match"]),
+        seed_weight=float(knobs["seed_weight"]),
+        library_ratio=float(knobs["library_ratio"]),
     )
+    hifi = str(getattr(ctx.settings, "hifi_bot_username", None) or "HiFiAudioBot")
     return [
         {
             "artist": item.artist,
@@ -970,6 +1030,8 @@ async def suggest_for_user(ctx, user_id: int, query: str, *, language: str | Non
             "in_library": bool(item.in_library),
             "why": item.why,
             "url": item.url,
+            "mbid": item.mbid or "",
+            "links": suggest_links(item.artist, item.title, mbid=item.mbid, hifi_user=hifi),
         }
         for item in items
     ]

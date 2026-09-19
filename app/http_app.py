@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from dataclasses import asdict, fields
 from pathlib import Path
 
 from aiohttp import web
 
 from app.errors import AppError, to_app_error
-from app.formats import normalize_allowed, user_settings_dict
+from app.formats import (
+    clamp_suggest_similarity,
+    normalize_allowed,
+    suggest_allow_dissimilar,
+    user_settings_dict,
+)
 from app.initdata import parse_init_data
 from app.membership import check_api_rate, is_admin, user_is_blocked
-from app.models import Ctx
+from app.models import Ctx, TagSet, tagset_from_dict
 from app.oauth import (
     exchange_code,
     finish_login,
@@ -79,6 +86,7 @@ def create_http_app(ctx: Ctx) -> web.Application:
     app.router.add_get("/api/review", api_review)
     app.router.add_post("/api/review/{track_id}/action", api_review_action)
     app.router.add_get("/api/suggest", api_suggest)
+    app.router.add_get("/api/suggest/art", api_suggest_art)
     static_dir = WEBAPP_DIR / "static"
     if static_dir.is_dir():
         app.router.add_static("/app/static/", static_dir)
@@ -180,26 +188,101 @@ def _json_ok(data: dict, status: int = 200) -> web.Response:
     return web.json_response(payload, status=status)
 
 
-async def api_login(request: web.Request) -> web.Response:
+_TAG_KEYS = tuple(item.name for item in fields(TagSet))
+
+
+def _count_library(ctx: Ctx, user_id: int) -> int:
+    sqlite_n = ctx.catalog.count_library_tracks(user_id)
     try:
-        ctx, user_id = await _api_user(request)
-        url = issue_login_ticket(ctx, user_id)
-    except AppError as exc:
-        return web.json_response(exc.as_json(), status=exc.http_status)
+        from app.library_index import load_index_entries
+        from app.relocate import ctx_for_user
+
+        bound = ctx_for_user(ctx, user_id)
+        entries = load_index_entries(bound)
     except Exception:
-        log.exception("api login failed")
-        return web.json_response(AppError("internal").as_json(), status=500)
-    return _json_ok({"url": url})
+        log.debug("library index count failed user=%s", user_id, exc_info=True)
+        return sqlite_n
+    if entries:
+        return len(entries)
+    return sqlite_n
+
+
+def _suggest_prefs(settings: dict) -> tuple[float, bool]:
+    sim = clamp_suggest_similarity(settings.get("suggest_similarity", 0.5))
+    allow = suggest_allow_dissimilar(settings.get("suggest_allow_dissimilar"))
+    return sim, allow
+
+
+def _tags_from_body(body: dict, current: TagSet) -> TagSet:
+    data = asdict(current)
+    for key in _TAG_KEYS:
+        if key in body:
+            data[key] = str(body.get(key) or "")
+    return tagset_from_dict(data)
+
+
+def _track_payload(track) -> dict:
+    from app.relocate import tags_from_track
+
+    tags = asdict(tags_from_track(track))
+    return {
+        "id": track.id,
+        "kind": track.kind,
+        "file_name": track.file_name or "",
+        "relative_path": track.relative_path or "",
+        "drive_url": track.drive_url or "",
+        "status": track.status or "",
+        **tags,
+    }
+
+
+def _decorate_suggest_row(row: dict, *, hifi_user: str) -> dict:
+    from app.suggest import suggest_links
+
+    artist = str(row.get("artist") or "")
+    title = str(row.get("title") or "")
+    mbid = str(row.get("mbid") or "")
+    links = row.get("links") if isinstance(row.get("links"), dict) else None
+    if not links:
+        links = suggest_links(artist, title, mbid=mbid, hifi_user=hifi_user)
+    return {**row, "mbid": mbid, "links": links}
+
+
+async def _relocate_review(ctx: Ctx, track, *, kind: str, body: dict):
+    from app.relocate import hydrate_track_tags, identity_from_track, relocate_track, tags_from_track
+
+    try:
+        track = await hydrate_track_tags(ctx, track)
+    except Exception:
+        log.debug("hydrate before review action failed track=%s", track.id, exc_info=True)
+        track = ctx.catalog.get_track(track.id) or track
+    tags = _tags_from_body(body, tags_from_track(track))
+    await relocate_track(
+        ctx,
+        track,
+        kind=kind,
+        tags=tags,
+        identity=identity_from_track(track),
+        source_report={},
+        topic_name=track.topic_name or "Unknown",
+        file_name=track.file_name or "track.flac",
+    )
+    return ctx.catalog.get_track(track.id) or track
 
 
 async def api_me(request: web.Request) -> web.Response:
     try:
         ctx, user_id = await _api_user(request)
-    except AppError as exc:
-        return web.json_response(exc.as_json(), status=exc.http_status)
+    except AppError as cop:
+        return web.json_response(cop.as_json(), status=cop.http_status)
     user = ctx.catalog.ensure_user(user_id)
     months = int(getattr(ctx.settings, "user_inactive_months", 3) or 3)
     settings = user_settings_dict(user)
+    sim, allow = _suggest_prefs(settings)
+    library_count, review_count = await asyncio.gather(
+        asyncio.to_thread(_count_library, ctx, user_id),
+        asyncio.to_thread(ctx.catalog.count_review_tracks, user_id),
+    )
     return _json_ok(
         {
             "user_since": user.first_seen_at,
@@ -209,9 +292,11 @@ async def api_me(request: web.Request) -> web.Response:
             "inactive_months": months,
             "default_dest": settings.get("default_dest") or "none",
             "allowed_formats": normalize_allowed(settings.get("allowed_formats")),
+            "suggest_similarity": sim,
+            "suggest_allow_dissimilar": allow,
             "admin": is_admin(ctx, user_id),
-            "library_count": len(ctx.catalog.list_library_tracks(user_id)),
-            "review_count": len(ctx.catalog.list_review_tracks(user_id)),
+            "library_count": library_count,
+            "review_count": review_count,
         }
     )
 
@@ -220,8 +305,8 @@ async def api_settings(request: web.Request) -> web.Response:
     try:
         ctx, user_id = await _api_user(request)
         body = await request.json()
-    except AppError as exc:
-        return web.json_response(exc.as_json(), status=exc.http_status)
+    except AppError as cop:
+        return web.json_response(cop.as_json(), status=cop.http_status)
     except Exception:
         return web.json_response(AppError("bad_input").as_json(), status=400)
     body.pop("user_id", None)
@@ -243,16 +328,28 @@ async def api_settings(request: web.Request) -> web.Response:
         settings["default_dest"] = dest
     if "allowed_formats" in body:
         settings["allowed_formats"] = normalize_allowed(body.get("allowed_formats"))
-    if dest is None and "allowed_formats" not in body:
+    if "suggest_similarity" in body:
+        settings["suggest_similarity"] = clamp_suggest_similarity(body.get("suggest_similarity"))
+    if "suggest_allow_dissimilar" in body:
+        settings["suggest_allow_dissimilar"] = suggest_allow_dissimilar(body.get("suggest_allow_dissimilar"))
+    if (
+        dest is None
+        and "allowed_formats" not in body
+        and "suggest_similarity" not in body
+        and "suggest_allow_dissimilar" not in body
+    ):
         dest = str(body.get("default_dest") or "none")
         if dest not in {"library", "review", "none"}:
             dest = "none"
         settings["default_dest"] = dest
     ctx.catalog.update_user(user_id, settings_json=json.dumps(settings))
+    sim, allow = _suggest_prefs(settings)
     return _json_ok(
         {
             "default_dest": settings.get("default_dest") or "none",
             "allowed_formats": normalize_allowed(settings.get("allowed_formats")),
+            "suggest_similarity": sim,
+            "suggest_allow_dissimilar": allow,
             "logged_in": user.logged_in,
             "google_email": user.google_email,
         }
@@ -262,30 +359,13 @@ async def api_settings(request: web.Request) -> web.Response:
 async def api_review(request: web.Request) -> web.Response:
     try:
         ctx, user_id = await _api_user(request)
-    except AppError as exc:
-        return web.json_response(exc.as_json(), status=exc.http_status)
+    except AppError as cop:
+        return web.json_response(cop.as_json(), status=cop.http_status)
     from app.review_cmd import _sync_drive_review
 
     await _sync_drive_review(ctx, user_id)
     tracks = ctx.catalog.list_review_tracks(user_id)
-    return _json_ok(
-        {
-            "tracks": [
-                {
-                    "id": t.id,
-                    "title": t.title or "",
-                    "artist": t.artist or "",
-                    "album": t.album or "",
-                    "kind": t.kind,
-                    "file_name": t.file_name or "",
-                    "relative_path": t.relative_path or "",
-                    "drive_url": t.drive_url or "",
-                    "status": t.status or "",
-                }
-                for t in tracks[:100]
-            ]
-        }
-    )
+    return _json_ok({"tracks": [_track_payload(track) for track in tracks[:100]]})
 
 
 async def api_review_action(request: web.Request) -> web.Response:
@@ -293,8 +373,8 @@ async def api_review_action(request: web.Request) -> web.Response:
         ctx, user_id = await _api_user(request)
         track_id = int(request.match_info["track_id"])
         body = await request.json()
-    except AppError as exc:
-        return web.json_response(exc.as_json(), status=exc.http_status)
+    except AppError as cop:
+        return web.json_response(cop.as_json(), status=cop.http_status)
     except Exception:
         return web.json_response(AppError("bad_input").as_json(), status=400)
     body.pop("user_id", None)
@@ -307,58 +387,85 @@ async def api_review_action(request: web.Request) -> web.Response:
 
         try:
             await delete_track(ctx, track)
-        except AppError as exc:
-            return web.json_response(exc.as_json(), status=exc.http_status)
-        except Exception as exc:
-            err = to_app_error(exc)
+        except AppError as cop:
+            return web.json_response(cop.as_json(), status=cop.http_status)
+        except Exception as cop:
+            err = to_app_error(cop)
             return web.json_response(err.as_json(), status=err.http_status)
         return _json_ok({"action": "cancel"})
-    if action in {"library", "draft"}:
-        from app.relocate import hydrate_track_tags, identity_from_track, relocate_track, tags_from_track
-
+    if action in {"library", "tags"}:
         kind = "library" if action == "library" else "review"
         try:
-            try:
-                track = await hydrate_track_tags(ctx, track)
-            except Exception:
-                log.debug("hydrate before review action failed track=%s", track.id, exc_info=True)
-                track = ctx.catalog.get_track(track.id) or track
-            await relocate_track(
-                ctx,
-                track,
-                kind=kind,
-                tags=tags_from_track(track),
-                identity=identity_from_track(track),
-                source_report={},
-                topic_name=track.topic_name or "Unknown",
-                file_name=track.file_name or "track.flac",
-            )
-        except AppError as exc:
-            return web.json_response(exc.as_json(), status=exc.http_status)
-        except Exception as exc:
-            err = to_app_error(exc)
+            updated = await _relocate_review(ctx, track, kind=kind, body=body)
+        except AppError as cop:
+            return web.json_response(cop.as_json(), status=cop.http_status)
+        except Exception as cop:
+            err = to_app_error(cop)
             return web.json_response(err.as_json(), status=err.http_status)
-        return _json_ok({"action": action})
+        payload: dict = {"action": action}
+        if updated is not None:
+            payload["track"] = _track_payload(updated)
+        return _json_ok(payload)
     return web.json_response(AppError("bad_input").as_json(), status=400)
 
 
 async def api_suggest(request: web.Request) -> web.Response:
     try:
         ctx, user_id = await _api_user(request)
-    except AppError as exc:
-        return web.json_response(exc.as_json(), status=exc.http_status)
+    except AppError as cop:
+        return web.json_response(cop.as_json(), status=cop.http_status)
     query = str(request.query.get("q") or "").strip()
     from app.suggest import owned_key, suggest_for_user
 
     lastfm = bool((getattr(ctx.settings, "lastfm_api_key", None) or "").strip())
     try:
         rows = await suggest_for_user(ctx, user_id, query)
-    except Exception as exc:
-        err = to_app_error(exc)
+    except Exception as cop:
+        err = to_app_error(cop)
         return web.json_response(err.as_json(), status=err.http_status)
-    shown = rows[:20]
+    hifi = str(getattr(ctx.settings, "hifi_bot_username", None) or "HiFiAudioBot")
+    shown = [_decorate_suggest_row(row, hifi_user=hifi) for row in rows[:20]]
     ctx.catalog.mark_suggest_shown(
         user_id,
         [owned_key(str(row.get("artist") or ""), str(row.get("title") or "")) for row in shown],
     )
     return _json_ok({"results": shown, "lastfm": lastfm})
+
+
+async def api_suggest_art(request: web.Request) -> web.Response:
+    try:
+        ctx, _user_id = await _api_user(request)
+    except AppError as cop:
+        return web.json_response(cop.as_json(), status=cop.http_status)
+    artist = str(request.query.get("artist") or "").strip()
+    title = str(request.query.get("title") or "").strip()
+    album = str(request.query.get("album") or "").strip()
+    mbid = str(request.query.get("mbid") or "").strip() or None
+    if not artist and not title:
+        return _json_ok({"covers": [], "apple": ""})
+    from app.enrich import list_cover_urls
+
+    http = getattr(ctx, "http", None)
+    if http is None:
+        return _json_ok({"covers": [], "apple": ""})
+    try:
+        data = await list_cover_urls(http, artist=artist, title=title, album=album, mbid=mbid)
+    except Exception as cop:
+        err = to_app_error(cop)
+        return web.json_response(err.as_json(), status=err.http_status)
+    covers = data.get("covers") if isinstance(data, dict) else None
+    apple = data.get("apple") if isinstance(data, dict) else ""
+    return _json_ok({"covers": covers if isinstance(covers, list) else [], "apple": apple or ""})
+
+
+async def api_login(request: web.Request) -> web.Response:
+    try:
+        ctx, user_id = await _api_user(request)
+        url = issue_login_ticket(ctx, user_id)
+    except AppError as exc:
+        return web.json_response(exc.as_json(), status=exc.http_status)
+    except Exception:
+        log.exception("api login failed")
+        return web.json_response(AppError("internal").as_json(), status=500)
+    return _json_ok({"url": url})
+

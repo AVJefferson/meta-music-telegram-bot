@@ -35,7 +35,7 @@ body {
   padding-top: var(--safe-top);
 }
 
-button, input {
+button, input, textarea, select {
   font: inherit;
   color: inherit;
 }
@@ -52,6 +52,39 @@ button {
 .top {
   padding: 1rem 1.15rem 0.35rem;
 }
+
+.top-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.icon-btn {
+  flex: 0 0 auto;
+  width: 2.5rem;
+  height: 2.5rem;
+  margin-top: 0.15rem;
+  border: 0;
+  border-radius: 0.85rem;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.icon-btn svg {
+  width: 1.25rem;
+  height: 1.25rem;
+  fill: currentColor;
+}
+
+.icon-btn.is-spin svg {
+  animation: spin 0.7s linear infinite;
+}
+
+.icon-btn[hidden] { display: none; }
 
 .kicker {
   margin: 0 0 0.2rem;
@@ -400,5 +433,150 @@ a.link {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .spinner, .skel { animation: none; }
+  .spinner, .skel, .icon-btn.is-spin svg { animation: none; }
+}
+
+.fields {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0.55rem 0 0.15rem;
+}
+
+.field {
+  display: grid;
+  gap: 0.22rem;
+  color: var(--hint);
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.field input, .field textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--bg) 55%, var(--card));
+  border-radius: 0.7rem;
+  padding: 0.55rem 0.7rem;
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+  font-size: 0.95rem;
+  outline: none;
+}
+
+.field textarea {
+  min-height: 4.2rem;
+  resize: vertical;
+}
+
+.field input:focus, .field textarea:focus {
+  border-color: var(--accent);
+}
+
+.field-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 0.45rem;
+}
+
+.link-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-top: 0.85rem;
+}
+
+.link-ico {
+  width: 2.55rem;
+  height: 2.55rem;
+  border: 1px solid var(--line);
+  border-radius: 0.8rem;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: var(--text);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  padding: 0;
+}
+
+.link-ico svg {
+  width: 1.2rem;
+  height: 1.2rem;
+  fill: currentColor;
+}
+
+.link-ico.is-off, .link-ico:disabled {
+  opacity: 0.28;
+  pointer-events: none;
+  cursor: default;
+}
+
+.carousel {
+  display: flex;
+  gap: 0.55rem;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  margin: 0 0 0.85rem;
+  padding-bottom: 0.2rem;
+  -webkit-overflow-scrolling: touch;
+}
+
+.carousel img, .carousel .art-ph {
+  flex: 0 0 100%;
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 0.85rem;
+  scroll-snap-align: start;
+  background: color-mix(in srgb, var(--text) 8%, var(--card));
+}
+
+.art-ph {
+  animation: skel 1.15s ease-in-out infinite;
+  background: linear-gradient(
+    90deg,
+    var(--card),
+    color-mix(in srgb, var(--text) 10%, var(--card)),
+    var(--card)
+  );
+  background-size: 200% 100%;
+}
+
+.back-btn {
+  width: auto;
+  min-height: 2.2rem;
+  margin: 0 0 0.75rem;
+  padding: 0.4rem 0.85rem;
+}
+
+.slider {
+  width: 100%;
+  margin: 0.75rem 0 0.25rem;
+  accent-color: var(--accent);
+}
+
+.slider-row {
+  display: flex;
+  justify-content: space-between;
+  color: var(--hint);
+  font-size: 0.78rem;
+}
+
+.check-btn {
+  width: 100%;
+  margin-top: 0.75rem;
+  min-height: 2.5rem;
+  border: 1px solid var(--line);
+  border-radius: 0.85rem;
+  background: transparent;
+  color: var(--text);
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.check-btn.is-on {
+  border-color: color-mix(in srgb, var(--ok) 50%, var(--line));
+  background: color-mix(in srgb, var(--ok) 16%, transparent);
 }

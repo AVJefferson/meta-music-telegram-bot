@@ -876,6 +876,24 @@ class Catalog:
                 ).fetchall()
         return [_row_to_track(row) for row in rows]
 
+    def count_review_tracks(self, user_id: int) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM tracks WHERE kind='review' AND user_id=? "
+                "AND status IN ('uploaded', 'pending', 'failed')",
+                (user_id,),
+            ).fetchone()
+        return int(row[0] if row else 0)
+
+    def count_library_tracks(self, user_id: int) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM tracks WHERE kind='library' AND user_id=? "
+                "AND status IN ('uploaded', 'pending', 'failed', 'awaiting_drive')",
+                (user_id,),
+            ).fetchone()
+        return int(row[0] if row else 0)
+
     def update_track(self, track_id: int, **fields: object) -> None:
         if not fields:
             return

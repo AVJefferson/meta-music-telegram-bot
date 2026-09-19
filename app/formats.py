@@ -173,6 +173,24 @@ def user_settings_dict(user: object | None) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def clamp_suggest_similarity(value: object, default: float = 0.5) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        number = default
+    if number < 0:
+        return 0.0
+    if number > 1:
+        return 1.0
+    return number
+
+
+def suggest_allow_dissimilar(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def user_allowed_formats(ctx: object, user_id: int) -> list[str]:
     catalog = getattr(ctx, "catalog", None) if ctx is not None else None
     user = None
