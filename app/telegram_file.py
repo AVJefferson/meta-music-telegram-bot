@@ -47,7 +47,7 @@ async def send_public_audio(
     tags: TagSet | None = None,
     filename: str | None = None,
 ):
-    """Send FLAC as playable Telegram audio. Fall back to a document if the API rejects it."""
+    """Send audio as playable Telegram audio. Fall back to a document if the API rejects it."""
     name = filename or path.name
     media = FSInputFile(path, filename=name)
     extra = audio_send_kwargs(path, tags)

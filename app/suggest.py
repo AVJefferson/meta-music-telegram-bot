@@ -11,6 +11,7 @@ from urllib.parse import quote
 
 import httpx
 
+from app.formats import detect_format
 from app.genre import GenreMapper, genre_tokens
 from app.models import TagSet, TrackRecord
 from app.relocate import tags_from_track
@@ -216,7 +217,7 @@ def parse_library_relative(relative: str) -> SeedTrack | None:
     if not parts:
         return None
     filename = parts[-1]
-    if not filename.lower().endswith(".flac"):
+    if detect_format(filename, "") is None:
         return None
     topic = parts[0] if len(parts) >= 2 else ""
     album_artist = parts[1] if len(parts) >= 3 else ""

@@ -1,6 +1,7 @@
 (() => {
   const tg = window.Telegram && window.Telegram.WebApp;
   const BOT = "@MetaMusicProBot";
+  const FORMAT_IDS = ["flac", "mp3", "m4a", "ogg", "opus", "wav"];
   const mainEl = document.getElementById("main");
   const heading = document.getElementById("heading");
   const banner = document.getElementById("banner");
@@ -244,6 +245,11 @@
     return Promise.resolve(window.confirm(text));
   }
 
+  function formatLabel(list) {
+    const formats = Array.isArray(list) && list.length ? list : ["flac", "mp3"];
+    return formats.map((fmt) => String(fmt).toUpperCase()).join(", ");
+  }
+
   function destSeg(current) {
     return `<div class="seg" role="radiogroup" aria-label="Default save">
       ${["library", "review", "none"]
@@ -254,6 +260,16 @@
             }</button>`,
         )
         .join("")}
+    </div>`;
+  }
+
+  function formatSeg(selected) {
+    const on = new Set(Array.isArray(selected) && selected.length ? selected : ["flac", "mp3"]);
+    return `<div class="seg wrap" role="group" aria-label="Listen for">
+      ${FORMAT_IDS.map(
+        (fmt) =>
+          `<button type="button" class="seg-btn${on.has(fmt) ? " is-on" : ""}" data-format="${fmt}">${fmt.toUpperCase()}</button>`,
+      ).join("")}
     </div>`;
   }
 
@@ -278,7 +294,7 @@
       <div class="tiles">
         <button type="button" class="tile" data-go="review"><strong>Review pile</strong><span>Promote drafts to your library.</span></button>
         <button type="button" class="tile" data-go="suggest"><strong>Suggestions</strong><span>Nearby tracks from what you already have.</span></button>
-        <button type="button" class="tile" data-go="settings"><strong>Settings</strong><span>Default save is ${esc(destLabel(me.default_dest))}.</span></button>
+        <button type="button" class="tile" data-go="settings"><strong>Settings</strong><span>Listen for ${esc(formatLabel(me.allowed_formats))}. Default save is ${esc(destLabel(me.default_dest))}.</span></button>
       </div>`;
   }
 
@@ -303,6 +319,11 @@
         <h2>Default save</h2>
         <p class="muted">Where new saves go when Drive is connected.</p>
         ${destSeg((me && me.default_dest) || "none")}
+      </div>
+      <div class="card">
+        <h2>Listen for</h2>
+        <p class="muted">Which files the bot tags for you. FLAC and MP3 start on; the rest stay off until you tap them.</p>
+        ${formatSeg(me && me.allowed_formats)}
       </div>
       <p class="muted">Idle sessions are forgotten after ${esc(months)} months. Copies already in Drive stay until you delete them.</p>`;
   }
@@ -565,6 +586,29 @@
     }
   }
 
+  async function toggleFormat(fmt) {
+    const current = new Set((me && me.allowed_formats) || ["flac", "mp3"]);
+    if (current.has(fmt)) current.delete(fmt);
+    else current.add(fmt);
+    const next = FORMAT_IDS.filter((id) => current.has(id));
+    try {
+      const data = await api("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ allowed_formats: next }),
+      });
+      me.allowed_formats = data.allowed_formats;
+      haptic("light");
+      const on = new Set(me.allowed_formats || []);
+      mainEl.querySelectorAll("[data-format]").forEach((btn) => {
+        btn.classList.toggle("is-on", on.has(btn.dataset.format));
+      });
+    } catch (err) {
+      haptic("error");
+      showBanner(err);
+    }
+  }
+
   async function unlinkDrive() {
     const ok = await confirmUnlink();
     if (!ok) return;
@@ -610,6 +654,8 @@
   mainEl.addEventListener("click", (event) => {
     const dest = event.target.closest("[data-dest]");
     if (dest) setDest(dest.dataset.dest);
+    const fmt = event.target.closest("[data-format]");
+    if (fmt) toggleFormat(fmt.dataset.format);
   });
 
   mainEl.addEventListener("submit", (event) => {

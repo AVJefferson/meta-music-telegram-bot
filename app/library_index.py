@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from app.drive import DriveReviewItem
+from app.formats import extension_from_path
 from app.library import unlink_quiet
 from app.models import Ctx, TagSet, TrackRecord, tagset_from_dict
 from app.suggest import parse_library_relative, track_from_library_item
@@ -402,7 +403,7 @@ def extract_item_tags(ctx: Ctx, item: DriveReviewItem, tmp_root: Path) -> TagSet
             log.debug("index song log read failed %s", item.relative_path, exc_info=True)
     if _index_tags_ready(tags):
         return tags
-    tmp = tmp_root / "index" / f"{uuid.uuid4().hex}.flac"
+    tmp = tmp_root / "index" / f"{uuid.uuid4().hex}{extension_from_path(item.relative_path or item.name)}"
     try:
         ctx.drive.download_to(item.file_id, tmp)
         tags = overlay_tagset(tags, read_tagset(tmp))
@@ -416,7 +417,7 @@ def extract_item_tags(ctx: Ctx, item: DriveReviewItem, tmp_root: Path) -> TagSet
 def rebuild_index(ctx: Ctx, *, on_progress: Callable[[int, int], None] | None = None) -> list[dict[str, str]]:
     from app.drive import user_drive_root
 
-    log.info("library tag index: walking Drive FLACs (once)")
+    log.info("library tag index: walking Drive audio (once)")
     root = user_drive_root(ctx, "library", getattr(ctx, "index_user_id", 0) or 0)
     if not root:
         return []

@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from app.formats import format_from_path
 from app.tags import read_audio_metrics
 
 log = logging.getLogger(__name__)
@@ -129,6 +130,8 @@ def analyze_flac(
     flag_hires: bool = True,
 ) -> AuthenticityResult:
     if not enabled:
+        return skipped_result(flag_hires=flag_hires)
+    if format_from_path(path) != "flac":
         return skipped_result(flag_hires=flag_hires)
     probe = path.parent / "probe.flac"
     try:

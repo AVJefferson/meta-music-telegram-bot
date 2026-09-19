@@ -8,6 +8,7 @@ import re
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+from app.formats import default_filename, detect_format
 from app.library_index import (
     find_entry_for_message,
     load_index_entries,
@@ -34,7 +35,7 @@ _CODE_HTML_RE = re.compile(r"<code>([^<]+)</code>", re.I)
 _HREF_RE = re.compile(r'href="([^"]+)"', re.I)
 _ARTIST_RE = re.compile(r"^Artist:\s*(.*)$", re.M)
 _ALBUM_RE = re.compile(r"^Album:\s*(.*)$", re.M)
-_FLAC_LINE_RE = re.compile(r"(?m)^(\S(?:.*\S)?\.flac)$", re.I)
+_AUDIO_LINE_RE = re.compile(r"(?m)^(\S(?:.*\S)?\.(?:flac|mp3|m4a|ogg|opus|wav))$", re.I)
 _KIND_LINE_RE = re.compile(r"(?im)^\s*(library|review)\s*$")
 _PROBE_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
 
@@ -120,7 +121,7 @@ def _plain_and_entities(message: object) -> tuple[str, list]:
     return text, entities
 
 
-def _flac_from_message(message: object | None) -> tuple[str | None, str | None]:
+def _audio_from_message(message: object | None) -> tuple[str | None, str | None]:
     if message is None:
         return None, None
     for attr in ("document", "audio"):
@@ -130,9 +131,12 @@ def _flac_from_message(message: object | None) -> tuple[str | None, str | None]:
         name = str(getattr(media, "file_name", None) or "")
         mime = str(getattr(media, "mime_type", None) or "").casefold()
         file_id = str(getattr(media, "file_id", None) or "") or None
-        if file_id and (name.casefold().endswith(".flac") or "flac" in mime):
-            return file_id, name or "track.flac"
+        if file_id and detect_format(name, mime):
+            return file_id, name or default_filename(mime)
     return None, None
+
+
+_flac_from_message = _audio_from_message
 
 
 def _normalize_relative(path: str) -> str:
@@ -197,17 +201,17 @@ def parse_card_message(message: object) -> CardHint:
         drive_file_id = parse_drive_file_id(text)
     for chunk in reversed(code_chunks):
         posix = _normalize_relative(chunk)
-        if posix.casefold().endswith(".flac"):
+        if detect_format(posix, ""):
             relative = posix
             break
     if relative is None:
         for match in reversed(list(_CODE_HTML_RE.finditer(text))):
             posix = _normalize_relative(match.group(1))
-            if posix.casefold().endswith(".flac"):
+            if detect_format(posix, ""):
                 relative = posix
                 break
     if relative is None:
-        for match in reversed(list(_FLAC_LINE_RE.finditer(text))):
+        for match in reversed(list(_AUDIO_LINE_RE.finditer(text))):
             posix = _normalize_relative(match.group(1))
             if "/" in posix:
                 relative = posix
@@ -230,7 +234,7 @@ def parse_card_message(message: object) -> CardHint:
                 continue
             if line.casefold().startswith("saved (") or line.casefold().startswith("artist:"):
                 continue
-            if line.casefold().startswith("drive:") or line.casefold().endswith(".flac"):
+            if line.casefold().startswith("drive:") or detect_format(line, ""):
                 continue
             title = html.unescape(line)
             break

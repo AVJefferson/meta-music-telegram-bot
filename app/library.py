@@ -7,6 +7,7 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.formats import detect_format, extension_for, extension_from_path
 from app.models import TagSet
 from app.tags import build_filename
 from app.util import sanitize_filename
@@ -14,15 +15,17 @@ from app.util import sanitize_filename
 UNKNOWN_LANGUAGE_FOLDER = "Unknown"
 
 
-def library_relative(topic: str, tags: TagSet) -> Path:
+def library_relative(topic: str, tags: TagSet, ext: str = ".flac") -> Path:
     album_artist = sanitize_filename(tags.albumartist or tags.artist or "Unknown Artist")
     album = sanitize_filename(tags.album or "Unknown Album")
-    return Path(sanitize_filename(topic or UNKNOWN_LANGUAGE_FOLDER)) / album_artist / album / build_filename(tags)
+    return Path(sanitize_filename(topic or UNKNOWN_LANGUAGE_FOLDER)) / album_artist / album / build_filename(tags, ext)
 
 
 def review_relative(original_name: str) -> Path:
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    safe = sanitize_filename(Path(original_name).stem) + ".flac"
+    fmt = detect_format(original_name, "")
+    ext = extension_for(fmt) if fmt else extension_from_path(original_name)
+    safe = sanitize_filename(Path(original_name).stem) + ext
     return Path(day) / safe
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,7 @@ from pathlib import Path
 from app.botapi import sweep_downloads
 from app.covers import purge_stale_covers, upload_album_cover_if_missing
 from app.drive import resolve_drive, user_drive_root
+from app.formats import detect_format, mime_for_path
 from app.library import rmdir_empty, unlink_quiet
 from app.models import Ctx, TrackRecord
 from app.notify import alert_admin, notify_user
@@ -87,7 +89,7 @@ async def _retry_row(ctx: Ctx, row: TrackRecord) -> None:
     if not root:
         return
     relative = Path(row.relative_path or local.name)
-    mime = "application/json" if local.suffix.lower() == ".json" else "audio/flac"
+    mime = "application/json" if local.suffix.lower() == ".json" else mime_for_path(local)
     try:
         file_id, url = await _upload(bound, local, root, relative, mime)
         bound.catalog.mark_uploaded(row.id, file_id, url)
@@ -95,7 +97,7 @@ async def _retry_row(ctx: Ctx, row: TrackRecord) -> None:
             sidecar = Path(row.sidecar_path)
             if sidecar.exists():
                 await _upload(bound, sidecar, root, relative.with_suffix(".json"), "application/json")
-        if row.kind == "library" and local.suffix.lower() == ".flac":
+        if row.kind == "library" and detect_format(local.name, "") is not None:
             try:
                 parent = await asyncio.to_thread(bound.drive.ensure_parent, root, relative)
                 cover, cover_mime = await asyncio.to_thread(read_cover, local)
@@ -176,11 +178,12 @@ def _purge_logged_out_locals(ctx: Ctx) -> None:
 def _purge_cache(ctx: Ctx) -> None:
     cutoff = _iso_days_ago(CACHE_TTL_DAYS)
     for sha, stored in ctx.catalog.list_cache_older_than(cutoff):
-        try:
-            path = cache_path(ctx, sha)
-        except Exception:
-            path = Path(stored)
-        unlink_quiet(path)
+        stored_path = Path(stored)
+        unlink_quiet(stored_path)
+        with contextlib.suppress(Exception):
+            unlink_quiet(cache_path(ctx, sha, stored_path.suffix))
+        with contextlib.suppress(Exception):
+            unlink_quiet(cache_path(ctx, sha))
         ctx.catalog.delete_cached_file(sha)
 
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from aiohttp import web
 
 from app.errors import AppError, to_app_error
+from app.formats import normalize_allowed, user_settings_dict
 from app.initdata import parse_init_data
 from app.membership import check_api_rate, is_admin, user_is_blocked
 from app.models import Ctx
@@ -198,11 +199,7 @@ async def api_me(request: web.Request) -> web.Response:
         return web.json_response(exc.as_json(), status=exc.http_status)
     user = ctx.catalog.ensure_user(user_id)
     months = int(getattr(ctx.settings, "user_inactive_months", 3) or 3)
-    settings = {}
-    try:
-        settings = json.loads(user.settings_json or "{}")
-    except (TypeError, ValueError):
-        settings = {}
+    settings = user_settings_dict(user)
     return _json_ok(
         {
             "user_since": user.first_seen_at,
@@ -211,6 +208,7 @@ async def api_me(request: web.Request) -> web.Response:
             "logged_in": user.logged_in,
             "inactive_months": months,
             "default_dest": settings.get("default_dest") or "none",
+            "allowed_formats": normalize_allowed(settings.get("allowed_formats")),
             "admin": is_admin(ctx, user_id),
             "library_count": len(ctx.catalog.list_library_tracks(user_id)),
             "review_count": len(ctx.catalog.list_review_tracks(user_id)),
@@ -234,17 +232,31 @@ async def api_settings(request: web.Request) -> web.Response:
         if callable(drop):
             drop(user_id)
         return _json_ok({"logged_in": False})
-    dest = str(body.get("default_dest") or "none")
-    if dest not in {"library", "review", "none"}:
-        dest = "none"
+    dest = None
+    if "default_dest" in body:
+        dest = str(body.get("default_dest") or "none")
+        if dest not in {"library", "review", "none"}:
+            dest = "none"
     user = ctx.catalog.ensure_user(user_id)
-    try:
-        settings = json.loads(user.settings_json or "{}")
-    except (TypeError, ValueError):
-        settings = {}
-    settings["default_dest"] = dest
+    settings = user_settings_dict(user)
+    if dest is not None:
+        settings["default_dest"] = dest
+    if "allowed_formats" in body:
+        settings["allowed_formats"] = normalize_allowed(body.get("allowed_formats"))
+    if dest is None and "allowed_formats" not in body:
+        dest = str(body.get("default_dest") or "none")
+        if dest not in {"library", "review", "none"}:
+            dest = "none"
+        settings["default_dest"] = dest
     ctx.catalog.update_user(user_id, settings_json=json.dumps(settings))
-    return _json_ok({"default_dest": dest, "logged_in": user.logged_in, "google_email": user.google_email})
+    return _json_ok(
+        {
+            "default_dest": settings.get("default_dest") or "none",
+            "allowed_formats": normalize_allowed(settings.get("allowed_formats")),
+            "logged_in": user.logged_in,
+            "google_email": user.google_email,
+        }
+    )
 
 
 async def api_review(request: web.Request) -> web.Response:

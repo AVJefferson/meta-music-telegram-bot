@@ -22,6 +22,14 @@ from app.config import Settings
 from app.drive import DriveHub
 from app.edit_ui import build_edit_router
 from app.errors import AppError, to_app_error
+from app.formats import (
+    default_filename,
+    detect_format,
+    is_allowed_audio_message,
+    is_known_audio_message,
+    stored_download_name,
+    user_allowed_formats,
+)
 from app.genre import GenreMapper
 from app.hifi import build_hifi_router
 from app.http_app import start_http
@@ -108,24 +116,26 @@ def intake_expires_at() -> str:
 
 
 def is_flac_message(message: Message) -> bool:
+    name, mime = "", ""
     doc = message.document
     if doc:
         name = (doc.file_name or "").lower()
         mime = (doc.mime_type or "").lower()
-        return name.endswith(".flac") or "flac" in mime
-    audio = message.audio
-    if audio:
-        name = (audio.file_name or "").lower()
-        mime = (audio.mime_type or "").lower()
-        return name.endswith(".flac") or "flac" in mime
-    return False
+    elif message.audio:
+        name = (message.audio.file_name or "").lower()
+        mime = (message.audio.mime_type or "").lower()
+    else:
+        return False
+    return detect_format(name, mime) == "flac"
 
 
 def file_info(message: Message) -> tuple[str, str]:
     if message.document:
-        return message.document.file_id, message.document.file_name or "track.flac"
+        mime = message.document.mime_type or ""
+        return message.document.file_id, message.document.file_name or default_filename(mime)
     assert message.audio is not None
-    return message.audio.file_id, message.audio.file_name or "track.flac"
+    mime = message.audio.mime_type or ""
+    return message.audio.file_id, message.audio.file_name or default_filename(mime)
 
 
 def resolve_topic(message: Message, ctx: Ctx) -> tuple[int | None, str]:
@@ -185,32 +195,34 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
         if edited and edited.name and message.message_thread_id:
             ctx.catalog.upsert_topic(message.message_thread_id, edited.name)
 
-    async def _intake_flac(message: Message, ctx: Ctx) -> None:
-        if not is_flac_message(message):
+    async def _intake_audio(message: Message, ctx: Ctx) -> None:
+        if not is_known_audio_message(message):
             return
         if message_from_bot(message, ctx.bot) or not message.from_user:
-            log.debug("ignored bot or anonymous FLAC chat=%s", message.chat.id)
+            log.debug("ignored bot or anonymous audio chat=%s", message.chat.id)
             return
         if not await allow_user(ctx, message.from_user.id, message.chat):
+            return
+        if not is_allowed_audio_message(message, user_allowed_formats(ctx, message.from_user.id)):
             return
         touch(ctx, message.from_user.id)
         file_id, file_name = file_info(message)
         thread_id, _topic_name = resolve_topic(message, ctx)
         from app.botapi import discard_download
-        from app.intake import ingest_local_flac
+        from app.intake import ingest_local_audio
 
         pending_dir = ctx.settings.pending_root / f"{message.chat.id}-{message.message_id}"
         pending_dir.mkdir(parents=True, exist_ok=True)
-        from pathlib import Path
-
-        from app.util import sanitize_filename
-
-        local = pending_dir / (sanitize_filename(Path(file_name).stem) + ".flac")
+        mime = ""
+        media = message.document or message.audio
+        if media is not None:
+            mime = getattr(media, "mime_type", None) or ""
+        local = pending_dir / stored_download_name(file_name, mime)
         try:
             telegram_file = await ctx.bot.get_file(file_id)
             await ctx.bot.download(telegram_file, destination=local)
             await asyncio.to_thread(discard_download, telegram_file.file_path)
-            await ingest_local_flac(
+            await ingest_local_audio(
                 ctx,
                 chat=message.chat,
                 user_id=message.from_user.id,
@@ -224,18 +236,18 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
         except AppError as exc:
             await notify_user(ctx, message.from_user.id, exc.user_message, chat_id=message.chat.id)
         except Exception as exc:
-            log.exception("group FLAC ingest failed")
+            log.exception("group audio ingest failed")
             await notify_user(ctx, message.from_user.id, to_app_error(exc).user_message, chat_id=message.chat.id)
 
     @router.message(F.document | F.audio)
     async def on_media(message: Message, ctx: Ctx) -> None:
         if message.chat.type == "private":
             return
-        await _intake_flac(message, ctx)
+        await _intake_audio(message, ctx)
 
     @router.channel_post(F.document | F.audio)
     async def on_channel_media(message: Message, ctx: Ctx) -> None:
-        await _intake_flac(message, ctx)
+        await _intake_audio(message, ctx)
 
     return router
 

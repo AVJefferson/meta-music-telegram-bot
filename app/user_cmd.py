@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 
 # Flip True when a USER Telethon session can talk to HiFiAudioBot again.
 SEARCH_ENABLED = False
-SEARCH_DISABLED_TEXT = "Song search is temporarily off. Send a FLAC instead."
+SEARCH_DISABLED_TEXT = "Song search is temporarily off. Send audio instead."
 
 
 def _webapp_url(ctx: Ctx, page: str, *, q: str | None = None) -> str | None:
@@ -107,11 +107,11 @@ def build_user_command_router() -> Router:
         cmds = ["/start", "/login", "/settings", "/review", "/suggest"]
         if SEARCH_ENABLED:
             if message.chat.type == "private":
-                cmds.append("send a song name or FLAC")
+                cmds.append("send a song name or audio")
             else:
                 cmds.append("/get <song> or @mention the bot")
         else:
-            cmds.append("send a FLAC")
+            cmds.append("send audio")
         if is_admin(ctx, message.from_user.id):
             cmds.extend(["/listusers", "/listgroups", "/listchannels", "/blockuser"])
         if not user.logged_in:
@@ -166,7 +166,7 @@ def build_user_command_router() -> Router:
         text = (
             f"Drive: {html_esc(user.google_email or 'not connected')}\n"
             f"Forgotten after {months} months idle.\n"
-            "Unlink Drive in the Mini App."
+            "Listen-for formats and unlink Drive are in the Mini App."
         )
         await send_private(
             ctx,

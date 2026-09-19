@@ -114,6 +114,15 @@ class ProbeCopyTests(unittest.TestCase):
             self.assertEqual(result.verdict, "skipped")
             self.assertEqual(format_line(result), "")
 
+    def test_non_flac_skips_analyzer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            src = Path(directory) / "source.mp3"
+            src.write_bytes(b"ID3")
+            with patch("app.authenticity._run_analyzer") as mocked:
+                result = analyze_flac(src)
+            mocked.assert_not_called()
+            self.assertEqual(result.verdict, "skipped")
+
 
 class StampAndPreviewTests(unittest.TestCase):
     def test_stamp_and_preview_include_flag(self) -> None:

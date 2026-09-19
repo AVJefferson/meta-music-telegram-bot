@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 from app.errors import AppError
+from app.formats import suffix_for
 from app.models import Ctx
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
@@ -15,12 +16,12 @@ def user_kind_root(ctx: Ctx, user_id: int, kind: str) -> Path:
     return Path(base) / str(int(user_id))
 
 
-def cache_path(ctx: Ctx, sha256: str) -> Path:
+def cache_path(ctx: Ctx, sha256: str, ext: str | None = None) -> Path:
     digest = (sha256 or "").strip().lower()
     if not _SHA.fullmatch(digest):
         raise AppError("bad_input")
     root = Path(getattr(ctx.settings, "cache_root", None) or Path("/data/cache"))
-    return root / f"{digest}.flac"
+    return root / f"{digest}{suffix_for(f'file{ext}' if ext else None)}"
 
 
 def file_sha256(path: Path) -> str:
@@ -32,7 +33,7 @@ def file_sha256(path: Path) -> str:
 
 
 def remember_cache(ctx: Ctx, sha256: str, path: Path) -> Path:
-    dest = cache_path(ctx, sha256)
+    dest = cache_path(ctx, sha256, path.suffix)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if path.resolve() != dest.resolve() and not dest.exists():
         dest.write_bytes(path.read_bytes())
@@ -40,11 +41,22 @@ def remember_cache(ctx: Ctx, sha256: str, path: Path) -> Path:
     return dest
 
 
-def cached_flac(ctx: Ctx, sha256: str) -> Path | None:
+def cached_audio(ctx: Ctx, sha256: str) -> Path | None:
     stored = ctx.catalog.get_cached_file(sha256)
     if stored:
         path = Path(stored)
-        if path.exists() and path.resolve() == cache_path(ctx, sha256).resolve():
+        expected = cache_path(ctx, sha256, path.suffix)
+        if path.exists() and path.resolve() == expected.resolve():
             return path
-    dest = cache_path(ctx, sha256)
-    return dest if dest.exists() else None
+        if path.exists():
+            return path
+    from app.formats import ALL_FORMATS, extension_for
+
+    for fmt in ALL_FORMATS:
+        dest = cache_path(ctx, sha256, extension_for(fmt))
+        if dest.exists():
+            return dest
+    return None
+
+
+cached_flac = cached_audio

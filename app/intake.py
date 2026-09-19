@@ -9,6 +9,7 @@ from aiogram.types.chat import Chat
 
 from app.captions import music_caption
 from app.errors import AppError
+from app.formats import stored_download_name
 from app.membership import check_upload_rate, touch
 from app.models import Ctx, Job, TagSet
 from app.paths import file_sha256, remember_cache
@@ -22,7 +23,7 @@ def _expires() -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(timespec="seconds")
 
 
-async def ingest_local_flac(
+async def ingest_local_audio(
     ctx: Ctx,
     *,
     chat: Chat,
@@ -80,7 +81,7 @@ async def ingest_local_flac(
         thread_id=thread_id,
         status_message_id=sent.message_id,
         topic_name=topic_name or "",
-        file_name=sanitize_filename(file_name) or "track.flac",
+        file_name=sanitize_filename(file_name) or stored_download_name(file_name),
         telegram_file_id=sent_file_id,
         source_message_id=source_message_id or sent.message_id,
         expires_at=_expires(),
@@ -104,3 +105,6 @@ async def ingest_local_flac(
         )
     )
     return pending_id
+
+
+ingest_local_flac = ingest_local_audio

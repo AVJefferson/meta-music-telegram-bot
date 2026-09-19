@@ -4,6 +4,7 @@ import asyncio
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from aiogram import Router
@@ -191,13 +192,18 @@ def build_hifi_router() -> Router:
             await notify_error(ctx, user_id, exc)
             await callback.answer("Failed.", show_alert=True)
             return
-        await callback.answer()
-        from app.intake import ingest_local_flac
+        from app.formats import is_allowed_audio, user_allowed_formats
+        from app.intake import ingest_local_audio
 
+        file_name = Path(path).name or "track.flac"
+        if not is_allowed_audio(file_name, "", user_allowed_formats(ctx, user_id)):
+            await callback.answer("That format is off in Settings.", show_alert=True)
+            return
+        await callback.answer()
         chat = callback.message.chat if callback.message else None
         if chat is None:
             return
-        await ingest_local_flac(ctx, chat=chat, user_id=user_id, path=path, file_name="track.flac")
+        await ingest_local_audio(ctx, chat=chat, user_id=user_id, path=path, file_name=file_name)
 
     @router.callback_query(F.data.startswith("hfmore:"))
     async def on_more(callback: CallbackQuery, ctx: Ctx) -> None:

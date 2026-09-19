@@ -400,7 +400,7 @@ def _tech_for_row(row: PendingReview) -> str:
         path = Path(row.local_path)
         if path.is_file():
             try:
-                audio = format_audio_block(read_audio_metrics(path))
+                audio = format_audio_block(read_audio_metrics(path), path=path)
             except Exception:
                 log.debug("edit card audio metrics failed", exc_info=True)
     if not audio:

@@ -200,8 +200,10 @@ def format_tech_lines(
     bit_depth: int | None = None,
     sample_rate: int | None = None,
     bitrate_kbps: int | None = None,
+    format_name: str | None = None,
 ) -> str:
-    lines = ["Format: FLAC"]
+    label = (format_name or "FLAC").strip() or "FLAC"
+    lines = [f"Format: {label}"]
     clock = format_clock(duration) if duration else ""
     if clock:
         lines.append(f"Duration: {clock}")
@@ -217,15 +219,27 @@ def format_tech_lines(
     return "\n".join(lines)
 
 
-def format_audio_block(metrics: object | None = None) -> str:
+def format_audio_block(
+    metrics: object | None = None,
+    *,
+    format_name: str | None = None,
+    path: Path | None = None,
+) -> str:
+    if format_name is None and path is not None:
+        from app.formats import format_label
+
+        format_name = format_label(path)
+    if format_name is None and metrics is not None:
+        format_name = getattr(metrics, "format_name", None)
     if metrics is None:
-        return format_tech_lines()
+        return format_tech_lines(format_name=format_name)
     duration = getattr(metrics, "duration", None) or None
     return format_tech_lines(
         duration=duration,
         bit_depth=getattr(metrics, "bit_depth", None),
         sample_rate=getattr(metrics, "sample_rate", None),
         bitrate_kbps=getattr(metrics, "bitrate_kbps", None),
+        format_name=format_name,
     )
 
 

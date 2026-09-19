@@ -9,6 +9,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 from app.drive import require_drive, resolve_drive, user_drive_root
+from app.formats import detect_format, extension_for, extension_from_path, mime_for_path
 from app.genre import genre_tokens
 from app.library import library_relative, place_file, review_relative, rmdir_empty, unlink_quiet, write_sidecar
 from app.models import Ctx, Identity, TagSet, TrackRecord, identity_from_dict, tagset_from_dict
@@ -109,9 +110,13 @@ def local_kind_root(ctx: Ctx, kind: str, user_id: int = 0) -> Path:
 
 
 def _stage_dest(ctx: Ctx, track: TrackRecord) -> Path:
-    name = sanitize_filename(Path(track.file_name or track.relative_path or "track.flac").name)
-    if not name.lower().endswith(".flac"):
-        name = f"{name}.flac"
+    raw = Path(track.file_name or track.relative_path or "track.flac").name
+    name = sanitize_filename(raw)
+    fmt = detect_format(name, "")
+    if fmt:
+        name = f"{Path(name).stem}{extension_for(fmt)}"
+    else:
+        name = f"{Path(name).stem}.flac"
     dest = ctx.settings.pending_root / str(uuid.uuid4()) / name
     dest.parent.mkdir(parents=True, exist_ok=True)
     return dest
@@ -302,7 +307,7 @@ async def relocate_track(
     from app.library_index import remember_library_tags, remove_library_index
 
     if kind == "library":
-        relative = library_relative(topic_name, tags)
+        relative = library_relative(topic_name, tags, ext=extension_from_path(local))
         dest = local_kind_root(ctx, "library", uid) / relative
         root_id = drive_root_id(ctx, "library", uid)
         sidecar_path: Path | None = None
@@ -328,11 +333,11 @@ async def relocate_track(
         try:
             if conflicts:
                 file_id, url = await asyncio.to_thread(
-                    drive.replace_file, conflicts[0].id, dest, "audio/flac"
+                    drive.replace_file, conflicts[0].id, dest, mime_for_path(dest)
                 )
             else:
                 file_id, url = await asyncio.to_thread(
-                    drive.create_file, dest, parent_id, filename, "audio/flac"
+                    drive.create_file, dest, parent_id, filename, mime_for_path(dest)
                 )
         except Exception as exc:
             log.exception("Drive relocate upload failed track=%s kind=%s", track.id, kind)

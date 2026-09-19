@@ -1,8 +1,8 @@
-# MetaMusic (Telegram FLAC tagger)
+# MetaMusic (Telegram music tagger)
 
-Multi-user, multi-group/channel bot. Fingerprints FLACs, writes a tight Vorbis-comment allowlist, optional per-user Google Drive, HiFiAudioBot name search.
+Multi-user, multi-group/channel bot. Fingerprints audio you send, writes a tight tag allowlist, optional per-user Google Drive, HiFiAudioBot name search.
 
-Audio is never re-encoded. FLAC uses Vorbis comments (not ID3).
+Audio is never re-encoded. FLAC/Ogg use Vorbis comments; MP3/WAV use ID3; M4A uses MP4 atoms. Default listen-for formats are FLAC and MP3; more formats in Mini App settings.
 
 Friends-only by obscurity + admin blacklist. The bot username is **not** a security boundary.
 
@@ -50,7 +50,7 @@ HiFi user session (full Telegram account — use a dummy if you can):
 docker compose run --rm -it bot python -m app.hifi_login
 ```
 
-FTPS is **off**. Enable only if you accept a shared FLAC dump:
+FTPS is **off**. Enable only if you accept a shared audio dump:
 
 ```bash
 docker compose --profile ftp up -d
@@ -63,7 +63,7 @@ That profile mounts `/data/cache` only. Never sqlite, refresh tokens, or `hifi.s
 Admin (env admin only, private/ephemeral lists): `/listusers` `/listgroups` `/listchannels` `/blockuser` `/unblockuser`
 
 Everyone allowed: `/start` `/login` `/settings` `/review` `/suggest`  
-Search: **off** until a user Telethon session can talk to HiFiAudioBot (`SEARCH_ENABLED` in `app/user_cmd.py`). Send a FLAC instead. `/get`, DM song names, and `@bot` search reply with that.
+Search: **off** until a user Telethon session can talk to HiFiAudioBot (`SEARCH_ENABLED` in `app/user_cmd.py`). Send audio instead. `/get`, DM song names, and `@bot` search reply with that.
 
 Mini App for login/settings/review/suggest. DM fallback if Mini App fails. Never paste an OAuth URL in a public group.
 
@@ -86,7 +86,7 @@ Daily 03:00 UTC (`CLEANUP_CRON`): Drive retry for logged-in users. Drop a local 
 - **Poisoned group file:** any member who ✍️ can replace the canonical audio; later 👍 copies it into others’ Drive. Caption stores `editor:<id>`. Accepted risk.
 - **Telethon `hifi.session`:** theft is full takeover of that Telegram account. Dedicated dummy + 2FA. Mode `0600`. Not on FTP.
 - **OAuth Testing:** refresh tokens die ~7 days. Failures say “use /login again”, never dump tokens.
-- **No FTP of sqlite/tokens/session.** Shared cache FTP is everyone’s FLACs.
+- **No FTP of sqlite/tokens/session.** Shared cache FTP is everyone’s audio.
 - **HTTPS for OAuth.** Compose binds `127.0.0.1:8080`. Wrong `PUBLIC_BASE_URL` or WAN HTTP can leak auth codes.
 - Mini App APIs trust `initData` HMAC only, scoped to that user. HiFi keyboards use opaque `hf:` ids, never raw HiFi `callback_data`.
 
@@ -126,7 +126,7 @@ No live Google, HiFi, or Telegram in CI.
 
 **Cover picker shows no images.** Bot lacks photo permission in that group.
 
-**Search is off.** `/get` and song-name DMs are gated by `SEARCH_ENABLED` in `app/user_cmd.py` until HiFi has a user Telethon session. Send a FLAC.
+**Search is off.** `/get` and song-name DMs are gated by `SEARCH_ENABLED` in `app/user_cmd.py` until HiFi has a user Telethon session. Send audio.
 
 **Search says Service unavailable.** No HiFi session at `/data/hifi.session`. Run `docker compose run --rm -it bot python -m app.hifi_login` with a **user phone**, not `BOT_TOKEN`.
 

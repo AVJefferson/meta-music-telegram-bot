@@ -188,7 +188,7 @@ async def load_drive_library(ctx: Ctx, *, topic: str | None, notify=None) -> lis
                 try:
                     await notify(
                         "Building <code>Telegram Music/library/tracks.json</code> from Drive tags (once). "
-                        "FLACs stay on Drive."
+                        "Audio stays on Drive."
                     )
                 except Exception:
                     log.debug("suggest index notice failed", exc_info=True)
@@ -236,7 +236,7 @@ async def _run_suggest(message: Message, ctx: Ctx, query: str) -> None:
             notify=lambda text: _deliver(message, text),
         )
     if not library and reply_track is None:
-        await _deliver(message, "Library is empty. Upload FLACs first.")
+        await _deliver(message, "Library is empty. Upload audio first.")
         return
     seeds = select_library_seeds(
         library,

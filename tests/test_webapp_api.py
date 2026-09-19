@@ -155,6 +155,42 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(unlink_data["logged_in"])
             self.assertFalse(catalog.get_user(11).logged_in)
 
+    async def test_settings_allowed_formats(self) -> None:
+        directory, catalog = temp_catalog()
+        with directory:
+            catalog.ensure_user(11)
+            ctx = make_ctx(catalog)
+            app = create_http_app(ctx)
+            async with TestClient(TestServer(app)) as client:
+                me = await client.get("/api/me", headers=_headers())
+                me_data = await me.json()
+                saved = await client.post(
+                    "/api/settings",
+                    headers=_headers(**{"Content-Type": "application/json"}),
+                    data=json.dumps({"allowed_formats": ["wav", "bogus", "flac"]}),
+                )
+                saved_data = await saved.json()
+                dest = await client.post(
+                    "/api/settings",
+                    headers=_headers(**{"Content-Type": "application/json"}),
+                    data=json.dumps({"default_dest": "review"}),
+                )
+                dest_data = await dest.json()
+                empty = await client.post(
+                    "/api/settings",
+                    headers=_headers(**{"Content-Type": "application/json"}),
+                    data=json.dumps({"allowed_formats": []}),
+                )
+                empty_data = await empty.json()
+            self.assertEqual(me_data["allowed_formats"], ["flac", "mp3"])
+            self.assertEqual(saved_data["allowed_formats"], ["flac", "wav"])
+            self.assertEqual(dest_data["allowed_formats"], ["flac", "wav"])
+            self.assertEqual(dest_data["default_dest"], "review")
+            self.assertEqual(empty_data["allowed_formats"], ["flac", "mp3"])
+            stored = json.loads(catalog.get_user(11).settings_json)
+            self.assertEqual(stored["default_dest"], "review")
+            self.assertEqual(stored["allowed_formats"], ["flac", "mp3"])
+
     async def test_suggest_lastfm_flag_and_bool_in_library(self) -> None:
         directory, catalog = temp_catalog()
         with directory:

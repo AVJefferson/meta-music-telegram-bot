@@ -19,6 +19,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBa
 from app.config import Settings
 from app.drive_scopes import DRIVE_SCOPE
 from app.errors import AppError
+from app.formats import detect_format
 
 log = logging.getLogger(__name__)
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -428,7 +429,7 @@ class DriveClient:
             folders += 1
             if log_progress and (folders == 1 or folders % 25 == 0):
                 here = "/".join(current_parts) or "/"
-                log.info("drive flac walk folders=%s files=%s at=%s", folders, len(items), here)
+                log.info("drive audio walk folders=%s files=%s at=%s", folders, len(items), here)
             children = self.list_children(current_id)
             files = {child.name: child for child in children if not child.is_folder}
             for child in children:
@@ -437,7 +438,7 @@ class DriveClient:
                         continue
                     walk(child.id, (*current_parts, child.name))
                     continue
-                if not child.name.lower().endswith(".flac"):
+                if detect_format(child.name, "") is None:
                     continue
                 stem = Path(child.name).stem
                 sidecar = files.get(f"{stem}.json")
@@ -462,10 +463,10 @@ class DriveClient:
         return self._list_flac_items(root_id, ())
 
     def list_library_items(self, root_id: str, *, topic: str | None = None) -> list[DriveReviewItem]:
-        """FLACs under the library root. Skips the tag-index folder. Optional topic limits to that language folder."""
+        """Audio files under the library root. Skips the tag-index folder. Optional topic limits to that language folder."""
         skip = frozenset({"library"})
         name = (topic or "").strip()
-        log.info("listing library FLACs topic=%s", name or "*")
+        log.info("listing library audio topic=%s", name or "*")
         if name and name.casefold() != "general":
             folder = next(
                 (
@@ -476,12 +477,12 @@ class DriveClient:
                 None,
             )
             if folder is None:
-                log.info("listed library FLACs count=0 missing topic=%s", name)
+                log.info("listed library audio count=0 missing topic=%s", name)
                 return []
             items = self._list_flac_items(folder.id, (folder.name,), skip_folders=skip, log_progress=True)
         else:
             items = self._list_flac_items(root_id, (), skip_folders=skip, log_progress=True)
-        log.info("listed library FLACs count=%s topic=%s", len(items), name or "*")
+        log.info("listed library audio count=%s topic=%s", len(items), name or "*")
         return items
 
     def create_file(

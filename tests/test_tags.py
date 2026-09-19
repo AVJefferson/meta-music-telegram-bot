@@ -12,7 +12,7 @@ from app.models import TagSet
 from app.queue import tag_preview
 from app.relocate import hydrate_track_tags, read_tags_for_card
 from app.review_cmd import format_song_card
-from app.tags import AudioMetrics, overlay_tagset, read_tagset
+from app.tags import AudioMetrics, overlay_tagset, read_audio_metrics, read_tagset, write_tags
 from app.util import format_tech_lines
 
 
@@ -162,6 +162,44 @@ class AudioCardTests(unittest.TestCase):
         self.assertIn("987 kbps | 44.1 kHz | 16 bits", preview)
         self.assertIn("<b>Stay</b>", preview)
         self.assertIn("Lyrics: none", preview)
+
+    def test_tech_lines_other_format(self) -> None:
+        text = format_tech_lines(duration=172, bitrate_kbps=320, format_name="MP3")
+        self.assertEqual(text, "Format: MP3\nDuration: 02\u223652\n320 kbps")
+
+    def test_mp3_write_read_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stay.mp3"
+            path.write_bytes(b"")
+            write_tags(
+                path,
+                TagSet(title="Stay With Me", artist="Sam Smith", album="In the Lonely Hour", tracknumber="3"),
+                None,
+                None,
+            )
+            tags = read_tagset(path)
+            self.assertEqual(tags.title, "Stay With Me")
+            self.assertEqual(tags.artist, "Sam Smith")
+            self.assertEqual(tags.album, "In the Lonely Hour")
+            self.assertEqual(tags.tracknumber, "3")
+
+    def test_wav_write_read_roundtrip(self) -> None:
+        import wave
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tone.wav"
+            with wave.open(str(path), "w") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(8000)
+                handle.writeframes(b"\x00\x00" * 800)
+            write_tags(path, TagSet(title="Tone", artist="Lab"), None, None)
+            tags = read_tagset(path)
+            self.assertEqual(tags.title, "Tone")
+            self.assertEqual(tags.artist, "Lab")
+            metrics = read_audio_metrics(path)
+            self.assertEqual(metrics.format_name, "WAV")
+            self.assertGreater(metrics.duration, 0)
 
     def test_tag_preview_includes_synced_lyric_lines(self) -> None:
         lrc = "[ar:Sam]\n[00:12.00] Guess it's true\n[00:16.50] I'm not good\n[00:20.00] At a one night stand\n[00:24.00] skipped"

@@ -37,6 +37,7 @@ from app.covers import (
     upload_album_cover_if_missing,
 )
 from app.enrich import enrich, lyrics_card_text
+from app.formats import extension_from_path, mime_for_path, stored_download_name, suffix_for
 from app.genre import genre_tokens
 from app.identify import identify_file, identity_from_mbid
 from app.library import UNKNOWN_LANGUAGE_FOLDER, library_relative, place_file, review_relative, unlink_quiet, write_sidecar
@@ -81,7 +82,7 @@ from app.tags import (
     read_hints,
     write_tags,
 )
-from app.util import format_audio_block, html_esc, safe_link, sanitize_filename
+from app.util import format_audio_block, html_esc, safe_link
 
 log = logging.getLogger(__name__)
 _cover_pick_lock = asyncio.Lock()
@@ -365,7 +366,7 @@ async def process_job(job: Job, ctx: Ctx) -> None:
     settings = ctx.settings
     work = settings.tmp_root / str(uuid.uuid4())
     work.mkdir(parents=True, exist_ok=True)
-    tmp = work / "source.flac"
+    tmp = work / f"source{suffix_for(job.file_name, job.local_path)}"
     try:
         await edit_status(ctx, job, f"Downloading <code>{html_esc(job.file_name)}</code>…")
         if job.local_path:
@@ -491,7 +492,7 @@ async def start_tag_review(
 ) -> None:
     pending_dir = ctx.settings.pending_root / str(uuid.uuid4())
     pending_dir.mkdir(parents=True, exist_ok=True)
-    dest = pending_dir / (sanitize_filename(Path(job.file_name).stem) + ".flac")
+    dest = pending_dir / stored_download_name(job.file_name)
     dest = await asyncio.to_thread(place_file, tmp, dest)
     original = normalize_tagset(hints_to_tagset(hints), ctx.genre)
     tags = normalize_tagset(tags, ctx.genre)
@@ -632,7 +633,7 @@ async def _park_pending_flac(ctx: Ctx, job: Job, local: Path) -> Path:
         pass
     pending_dir = ctx.settings.pending_root / str(uuid.uuid4())
     pending_dir.mkdir(parents=True, exist_ok=True)
-    dest = pending_dir / (sanitize_filename(Path(job.file_name).stem) + ".flac")
+    dest = pending_dir / stored_download_name(job.file_name)
     return await asyncio.to_thread(place_file, local, dest)
 
 
@@ -2048,7 +2049,7 @@ async def _commit_upload(
     if uid and want_drive:
         ctx = ctx_for_user(ctx, uid)
     if kind == "library":
-        relative = library_relative(job.topic_name, tags)
+        relative = library_relative(job.topic_name, tags, ext=extension_from_path(local))
         dest = local
         root_id = ""
         if want_drive:
@@ -2270,7 +2271,7 @@ async def _commit_upload(
         if not root_id:
             file_id, url, sidecar_id, log_id = "", None, None, None
         elif replace_file_id:
-            file_id, url = await asyncio.to_thread(ctx.drive.replace_file, replace_file_id, dest, "audio/flac")
+            file_id, url = await asyncio.to_thread(ctx.drive.replace_file, replace_file_id, dest, mime_for_path(dest))
             sidecar_id, log_id = await _upload_sidecars(
                 ctx,
                 parent_id=parent_id,
@@ -2282,7 +2283,7 @@ async def _commit_upload(
                 kind=kind,
             )
         else:
-            file_id, url = await asyncio.to_thread(ctx.drive.create_file, dest, parent_id, filename, "audio/flac")
+            file_id, url = await asyncio.to_thread(ctx.drive.create_file, dest, parent_id, filename, mime_for_path(dest))
             sidecar_id, log_id = await _upload_sidecars(
                 ctx,
                 parent_id=parent_id,

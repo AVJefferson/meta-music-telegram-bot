@@ -38,11 +38,14 @@ PAGE_SIZE = 8
 TOPIC_PAGE_SIZE = 10
 
 
-class FlacMessageFilter(BaseFilter):
+class AudioMessageFilter(BaseFilter):
     async def __call__(self, message: Message) -> bool:
-        from app.bot import is_flac_message
+        from app.formats import is_known_audio_message
 
-        return is_flac_message(message)
+        return is_known_audio_message(message)
+
+
+FlacMessageFilter = AudioMessageFilter
 
 
 def _expires_at() -> str:
@@ -476,19 +479,24 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
         if not await _require_private(message, ctx):
             return
         await message.reply(
-            "Send a FLAC to run tagging, /review to open the review queue, "
+            "Send audio to run tagging, /review to open the review queue, "
             "or /suggest for similar songs (✓ = already in the library)."
         )
 
-    @router.message(F.chat.type == "private", FlacMessageFilter())
+    @router.message(F.chat.type == "private", AudioMessageFilter())
     async def private_media(message: Message, ctx: Ctx) -> None:
         from app.bot import file_info
         from app.botapi import discard_download
-        from app.intake import ingest_local_flac
+        from app.formats import is_allowed_audio_message, stored_download_name, user_allowed_formats
+        from app.intake import ingest_local_audio
 
         if not await _require_private(message, ctx):
             return
         if message_from_bot(message, ctx.bot):
+            return
+        if not message.from_user:
+            return
+        if not is_allowed_audio_message(message, user_allowed_formats(ctx, message.from_user.id)):
             return
         if ctx.catalog.get_active_for_chat(message.chat.id):
             await message.reply("Finish or cancel current action first.")
@@ -496,12 +504,16 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
         file_id, file_name = file_info(message)
         pending_dir = ctx.settings.pending_root / str(uuid.uuid4())
         pending_dir.mkdir(parents=True, exist_ok=True)
-        local = pending_dir / (sanitize_filename(Path(file_name).stem) + ".flac")
+        mime = ""
+        media = message.document or message.audio
+        if media is not None:
+            mime = getattr(media, "mime_type", None) or ""
+        local = pending_dir / stored_download_name(file_name, mime)
         try:
             telegram_file = await ctx.bot.get_file(file_id)
             await ctx.bot.download(telegram_file, destination=local)
             await asyncio.to_thread(discard_download, telegram_file.file_path)
-            await ingest_local_flac(
+            await ingest_local_audio(
                 ctx,
                 chat=message.chat,
                 user_id=message.from_user.id,
@@ -512,8 +524,8 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
             )
         except Exception:
             shutil.rmtree(pending_dir, ignore_errors=True)
-            log.exception("private FLAC ingest failed")
-            await message.reply("Could not process FLAC. Try again.")
+            log.exception("private audio ingest failed")
+            await message.reply("Could not process audio. Try again.")
 
     @router.callback_query(F.data.regexp(r"^d\d+:"))
     async def private_callback(callback: CallbackQuery, ctx: Ctx) -> None:
