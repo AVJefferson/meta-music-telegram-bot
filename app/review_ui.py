@@ -38,7 +38,7 @@ FIELD_KEYS = {key for key, _ in FIELDS}
 MULTI_VALUE_FIELDS = {"artist", "albumartist", "composer"}
 SPARSE_FILL_FIELDS = {"composer", "genre", "year"}
 _CALLBACK = re.compile(
-    r"^p(\d+):(ok|rev|cancel|back|dr|dk|ds|cv(\d+)|c(\d+)|t:([a-z]+)|uf|ur|dl|dv|dn|dt|lg:([a-z]+))$"
+    r"^p(\d+):(ok|rev|cancel|back|dr|dk|ds|cv(\d+)|c(\d+)|t:([a-z]+)|uf|ur|dl|dv|dn|dt|da|lg:([a-z]+))$"
 )
 
 
@@ -84,6 +84,8 @@ def parse_callback(data: str | None) -> PendingAction | None:
         return PendingAction(pending_id, "dest_none")
     if rest == "dt":
         return PendingAction(pending_id, "dest_telegram")
+    if rest == "da":
+        return PendingAction(pending_id, "skip_ask")
     if rest.startswith("lg:") and match.group(6):
         return PendingAction(pending_id, "lang", field=match.group(6))
     if rest.startswith("cv") and match.group(3) is not None:
@@ -447,7 +449,12 @@ def conflict_keyboard(pending_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def dest_keyboard(pending_id: int, dest: str, correct_telegram: bool) -> InlineKeyboardMarkup:
+def dest_keyboard(
+    pending_id: int,
+    dest: str,
+    correct_telegram: bool,
+    skip_ask: bool = False,
+) -> InlineKeyboardMarkup:
     def mark(active: bool, label: str) -> str:
         return f"● {label}" if active else label
 
@@ -463,6 +470,12 @@ def dest_keyboard(pending_id: int, dest: str, correct_telegram: bool) -> InlineK
                 )
             ],
             [
+                InlineKeyboardButton(
+                    text=mark(skip_ask, "Do not ask again"),
+                    callback_data=f"p{pending_id}:da",
+                )
+            ],
+            [
                 InlineKeyboardButton(text="OK", callback_data=f"p{pending_id}:ok"),
                 InlineKeyboardButton(text="Cancel", callback_data=f"p{pending_id}:cancel"),
             ],
@@ -470,11 +483,12 @@ def dest_keyboard(pending_id: int, dest: str, correct_telegram: bool) -> InlineK
     )
 
 
-def dest_prompt_text(dest: str, correct_telegram: bool) -> str:
+def dest_prompt_text(dest: str, correct_telegram: bool, skip_ask: bool = False) -> str:
     return (
         "<b>Save options</b>\n"
         f"Drive: <code>{html_esc(dest)}</code>\n"
         f"Correct Telegram file: {'on' if correct_telegram else 'off (first save)'}\n"
+        f"Do not ask again: {'on' if skip_ask else 'off'}\n"
         "OK writes local + Drive per the toggles."
     )
 

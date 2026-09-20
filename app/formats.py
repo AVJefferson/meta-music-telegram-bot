@@ -164,6 +164,10 @@ def normalize_allowed(raw: object) -> list[str]:
     return ordered if ordered else list(DEFAULT_ALLOWED)
 
 
+SAVE_DESTS = ("library", "review", "none")
+SAVE_DEST_SET = frozenset(SAVE_DESTS)
+
+
 def user_settings_dict(user: object | None) -> dict:
     raw = getattr(user, "settings_json", None) if user is not None else None
     try:
@@ -171,6 +175,32 @@ def user_settings_dict(user: object | None) -> dict:
     except (TypeError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def truthy_setting(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def normalize_save_dest(value: object, default: str = "none") -> str:
+    dest = str(value or "").strip().casefold()
+    if dest in SAVE_DEST_SET:
+        return dest
+    return default if default in SAVE_DEST_SET else "none"
+
+
+def save_prefs_from_settings(settings: object) -> tuple[str, bool, bool]:
+    data = settings if isinstance(settings, dict) else {}
+    return (
+        normalize_save_dest(data.get("default_dest")),
+        truthy_setting(data.get("correct_telegram")),
+        truthy_setting(data.get("skip_save_prompt")),
+    )
+
+
+def user_save_prefs(user: object | None) -> tuple[str, bool, bool]:
+    return save_prefs_from_settings(user_settings_dict(user))
 
 
 def clamp_suggest_similarity(value: object, default: float = 0.5) -> float:
@@ -186,9 +216,7 @@ def clamp_suggest_similarity(value: object, default: float = 0.5) -> float:
 
 
 def suggest_allow_dissimilar(value: object) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
+    return truthy_setting(value)
 
 
 def user_allowed_formats(ctx: object, user_id: int) -> list[str]:

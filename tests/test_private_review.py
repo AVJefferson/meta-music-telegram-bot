@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from io import BytesIO
@@ -14,6 +15,7 @@ from app.bot import resolve_topic
 from app.catalog import Catalog, is_general_topic
 from app.drive import DriveChild, DriveClient
 from app.membership import member_status
+from app.models import Identity, Job, TagSet
 from app.private_ui import (
     EDITOR_FIELDS,
     _next_editor_phase,
@@ -23,8 +25,16 @@ from app.private_ui import (
     _review_keyboard,
     _topic_keyboard,
 )
-from app.queue import _delete_promoted_review_source, recover_interrupted
-from app.review_ui import conflict_keyboard, cover_keyboard, dest_keyboard, parse_callback, review_keyboard
+from app.queue import _delete_promoted_review_source, _maybe_prompt_dest, recover_interrupted
+from app.review_ui import (
+    conflict_keyboard,
+    cover_keyboard,
+    dest_keyboard,
+    dest_prompt_text,
+    parse_callback,
+    review_keyboard,
+)
+from tests.support import make_ctx
 
 
 class CatalogSessionTests(unittest.TestCase):
@@ -288,8 +298,20 @@ class UiTests(unittest.TestCase):
         self.assertEqual(parse_callback("p4:dv").op, "dest_review")
         self.assertEqual(parse_callback("p4:dn").op, "dest_none")
         self.assertEqual(parse_callback("p4:dt").op, "dest_telegram")
+        self.assertEqual(parse_callback("p4:da").op, "skip_ask")
         self.assertTrue(all(item.startswith("p4:") for item in data if item))
         self.assertFalse(any("drive" in (item or "") for item in data))
+        self.assertIn("p4:da", data)
+        labels = [btn.text for row in markup.inline_keyboard for btn in row]
+        self.assertIn("Do not ask again", labels)
+        marked = dest_keyboard(4, "library", True, True)
+        marked_labels = [btn.text for row in marked.inline_keyboard for btn in row]
+        self.assertIn("● Do not ask again", marked_labels)
+
+    def test_dest_prompt_mentions_skip(self) -> None:
+        text = dest_prompt_text("library", False, True)
+        self.assertIn("Do not ask again: on", text)
+        self.assertIn("library", text)
 
     def test_language_callback(self) -> None:
         from app.review_ui import language_keyboard
@@ -357,6 +379,57 @@ class UiTests(unittest.TestCase):
     def test_membership_enum_normalizes_to_api_value(self) -> None:
         member = SimpleNamespace(status=ChatMemberStatus.MEMBER)
         self.assertEqual(member_status(member), "member")
+
+
+class DestPrefTests(unittest.IsolatedAsyncioTestCase):
+    async def test_skip_save_prompt_uses_stored_prefs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = Catalog(Path(directory) / "state.sqlite")
+            catalog.ensure_user(11)
+            catalog.update_user(
+                11,
+                google_refresh_token="rt",
+                settings_json=json.dumps(
+                    {
+                        "default_dest": "library",
+                        "correct_telegram": True,
+                        "skip_save_prompt": True,
+                    }
+                ),
+            )
+            ctx = make_ctx(catalog)
+            job = Job(
+                chat_id=11,
+                thread_id=None,
+                topic_name="English",
+                file_id="f",
+                file_name="a.flac",
+                status_message_id=1,
+                user_id=11,
+            )
+            report: dict = {}
+            paused = await _maybe_prompt_dest(
+                ctx,
+                job=job,
+                local=Path(directory) / "missing.flac",
+                tags=TagSet(title="A"),
+                identity=Identity(confidence="high"),
+                report=report,
+                pending_id=None,
+                replace_id=None,
+                old_drive_id=None,
+                track_id=None,
+                replaced=False,
+                old_q=None,
+                new_q=None,
+                kind_default="library",
+            )
+            self.assertFalse(paused)
+            self.assertTrue(report["dest_confirmed"])
+            self.assertEqual(report["drive_dest"], "library")
+            self.assertTrue(report["correct_telegram"])
+            self.assertEqual(job.drive_dest, "library")
+            self.assertTrue(job.correct_telegram)
 
 
 class GeneralTopicTests(unittest.TestCase):

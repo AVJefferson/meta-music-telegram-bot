@@ -12,7 +12,10 @@ from app.errors import AppError, to_app_error
 from app.formats import (
     clamp_suggest_similarity,
     normalize_allowed,
+    normalize_save_dest,
+    save_prefs_from_settings,
     suggest_allow_dissimilar,
+    truthy_setting,
     user_settings_dict,
 )
 from app.initdata import parse_init_data
@@ -213,6 +216,15 @@ def _suggest_prefs(settings: dict) -> tuple[float, bool]:
     return sim, allow
 
 
+def _save_prefs_payload(settings: dict) -> dict:
+    dest, correct, skip = save_prefs_from_settings(settings)
+    return {
+        "default_dest": dest,
+        "correct_telegram": correct,
+        "skip_save_prompt": skip,
+    }
+
+
 def _tags_from_body(body: dict, current: TagSet) -> TagSet:
     data = asdict(current)
     for key in _TAG_KEYS:
@@ -290,7 +302,7 @@ async def api_me(request: web.Request) -> web.Response:
             "google_email": user.google_email,
             "logged_in": user.logged_in,
             "inactive_months": months,
-            "default_dest": settings.get("default_dest") or "none",
+            **_save_prefs_payload(settings),
             "allowed_formats": normalize_allowed(settings.get("allowed_formats")),
             "suggest_similarity": sim,
             "suggest_allow_dissimilar": allow,
@@ -319,9 +331,7 @@ async def api_settings(request: web.Request) -> web.Response:
         return _json_ok({"logged_in": False})
     dest = None
     if "default_dest" in body:
-        dest = str(body.get("default_dest") or "none")
-        if dest not in {"library", "review", "none"}:
-            dest = "none"
+        dest = normalize_save_dest(body.get("default_dest"))
     user = ctx.catalog.ensure_user(user_id)
     settings = user_settings_dict(user)
     if dest is not None:
@@ -332,21 +342,24 @@ async def api_settings(request: web.Request) -> web.Response:
         settings["suggest_similarity"] = clamp_suggest_similarity(body.get("suggest_similarity"))
     if "suggest_allow_dissimilar" in body:
         settings["suggest_allow_dissimilar"] = suggest_allow_dissimilar(body.get("suggest_allow_dissimilar"))
+    if "correct_telegram" in body:
+        settings["correct_telegram"] = truthy_setting(body.get("correct_telegram"))
+    if "skip_save_prompt" in body:
+        settings["skip_save_prompt"] = truthy_setting(body.get("skip_save_prompt"))
     if (
         dest is None
         and "allowed_formats" not in body
         and "suggest_similarity" not in body
         and "suggest_allow_dissimilar" not in body
+        and "correct_telegram" not in body
+        and "skip_save_prompt" not in body
     ):
-        dest = str(body.get("default_dest") or "none")
-        if dest not in {"library", "review", "none"}:
-            dest = "none"
-        settings["default_dest"] = dest
+        settings["default_dest"] = normalize_save_dest(body.get("default_dest"))
     ctx.catalog.update_user(user_id, settings_json=json.dumps(settings))
     sim, allow = _suggest_prefs(settings)
     return _json_ok(
         {
-            "default_dest": settings.get("default_dest") or "none",
+            **_save_prefs_payload(settings),
             "allowed_formats": normalize_allowed(settings.get("allowed_formats")),
             "suggest_similarity": sim,
             "suggest_allow_dissimilar": allow,

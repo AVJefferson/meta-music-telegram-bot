@@ -37,7 +37,14 @@ from app.covers import (
     upload_album_cover_if_missing,
 )
 from app.enrich import enrich, lyrics_card_text
-from app.formats import extension_from_path, mime_for_path, stored_download_name, suffix_for
+from app.formats import (
+    extension_from_path,
+    mime_for_path,
+    stored_download_name,
+    suffix_for,
+    user_save_prefs,
+    user_settings_dict,
+)
 from app.genre import genre_tokens
 from app.identify import identify_file, identity_from_mbid
 from app.library import UNKNOWN_LANGUAGE_FOLDER, library_relative, place_file, review_relative, unlink_quiet, write_sidecar
@@ -1608,20 +1615,30 @@ async def _cover_choice_from_pending(
     return _read_cover_option(Path(leader.local_path), options[0])
 
 
-def _user_default_dest(ctx: Ctx, user_id: int) -> str:
+def _user_save_prefs(ctx: Ctx, user_id: int) -> tuple[str, bool, bool]:
     if not user_id:
-        return "none"
+        return "none", False, False
     user = ctx.catalog.get_user(user_id)
+    dest, correct, skip = user_save_prefs(user)
     if not user or not user.logged_in:
-        return "none"
-    try:
-        settings = json.loads(user.settings_json or "{}")
-    except (TypeError, ValueError):
-        settings = {}
-    dest = str(settings.get("default_dest") or "none")
-    if dest not in {"library", "review", "none"}:
-        return "none"
+        return "none", correct, False
+    return dest, correct, skip
+
+
+def _user_default_dest(ctx: Ctx, user_id: int) -> str:
+    dest, _correct, _skip = _user_save_prefs(ctx, user_id)
     return dest
+
+
+def _store_user_save_prefs(ctx: Ctx, user_id: int, dest: str, correct: bool, skip: bool) -> None:
+    if not user_id:
+        return
+    user = ctx.catalog.ensure_user(user_id)
+    settings = user_settings_dict(user)
+    settings["default_dest"] = dest if dest in {"library", "review", "none"} else "none"
+    settings["correct_telegram"] = bool(correct)
+    settings["skip_save_prompt"] = bool(skip)
+    ctx.catalog.update_user(user_id, settings_json=json.dumps(settings))
 
 
 def _dest_commit_plan(ctx: Ctx, user_id: int, report: dict, fallback_kind: str) -> tuple[str, bool]:
@@ -1637,11 +1654,11 @@ def _dest_commit_plan(ctx: Ctx, user_id: int, report: dict, fallback_kind: str) 
     return (fallback_kind or "library"), False
 
 
-def _dest_state(report: dict) -> tuple[str, bool]:
+def _dest_state(report: dict) -> tuple[str, bool, bool]:
     dest = str(report.get("drive_dest") or "none")
     if dest not in {"library", "review", "none"}:
         dest = "none"
-    return dest, bool(report.get("correct_telegram"))
+    return dest, bool(report.get("correct_telegram")), bool(report.get("skip_save_prompt"))
 
 
 def _want_drive(report: dict | None) -> bool:
@@ -1870,15 +1887,15 @@ async def _restore_dest_prompt(ctx: Ctx, row: PendingReview) -> None:
     report = _loads(row.source_report_json, {})
     if not isinstance(report, dict):
         report = {}
-    dest, correct = _dest_state(report)
+    dest, correct, skip = _dest_state(report)
     uid = getattr(row, "user_id", 0) or 0
     await send_private(
         ctx,
         chat_id=row.chat_id,
         user_id=uid or row.chat_id,
-        text=dest_prompt_text(dest, correct),
+        text=dest_prompt_text(dest, correct, skip),
         parse_mode="HTML",
-        reply_markup=dest_keyboard(row.id, dest, correct),
+        reply_markup=dest_keyboard(row.id, dest, correct, skip),
     )
 
 
@@ -1905,16 +1922,29 @@ async def _maybe_prompt_dest(
         return False
     uid = job.user_id or 0
     user = ctx.catalog.get_user(uid) if uid else None
+    prefs_dest, prefs_correct, prefs_skip = _user_save_prefs(ctx, uid)
     if not user or not user.logged_in:
         report["drive_dest"] = "none"
         report["dest_confirmed"] = True
         report["correct_telegram"] = False
         return False
-    drive_dest = str(report.get("drive_dest") or _user_default_dest(ctx, uid))
+    drive_dest = str(report.get("drive_dest") or prefs_dest)
     if drive_dest not in {"library", "review", "none"}:
         drive_dest = "none"
     report["drive_dest"] = drive_dest
-    report["correct_telegram"] = bool(report.get("correct_telegram"))
+    if "correct_telegram" not in report:
+        report["correct_telegram"] = prefs_correct
+    else:
+        report["correct_telegram"] = bool(report.get("correct_telegram"))
+    if "skip_save_prompt" not in report:
+        report["skip_save_prompt"] = prefs_skip
+    else:
+        report["skip_save_prompt"] = bool(report.get("skip_save_prompt"))
+    if report["skip_save_prompt"]:
+        report["dest_confirmed"] = True
+        job.drive_dest = drive_dest
+        job.correct_telegram = bool(report.get("correct_telegram"))
+        return False
     report["quality_replace"] = {
         "replaced": replaced,
         "old_q": list(old_q) if old_q else None,
@@ -1979,8 +2009,10 @@ async def _apply_dest_confirm(ctx: Ctx, row: PendingReview) -> None:
     tags = normalize_tagset(tagset_from_dict(working), ctx.genre)
     local = Path(row.local_path)
     job = _job_from_pending(row)
-    job.correct_telegram = bool(report.get("correct_telegram"))
-    job.drive_dest = str(report.get("drive_dest") or "none")
+    dest, correct, skip = _dest_state(report)
+    job.correct_telegram = correct
+    job.drive_dest = dest
+    _store_user_save_prefs(ctx, job.user_id, dest, correct, skip)
     _bind_primary_language(job, report, ctx.genre)
     kind, _drive = _dest_commit_plan(ctx, job.user_id, report, row.kind or "library")
     qr = report.get("quality_replace") or {}
@@ -2722,7 +2754,7 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
         if row:
             await _refresh_tag_ui(ctx, row)
         return
-    if action.op in {"dest_library", "dest_review", "dest_none", "dest_telegram"}:
+    if action.op in {"dest_library", "dest_review", "dest_none", "dest_telegram", "skip_ask"}:
         report = _loads(row.source_report_json, {})
         if not isinstance(report, dict):
             report = {}
@@ -2732,6 +2764,8 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
             report["drive_dest"] = "review"
         elif action.op == "dest_none":
             report["drive_dest"] = "none"
+        elif action.op == "skip_ask":
+            report["skip_save_prompt"] = not bool(report.get("skip_save_prompt"))
         else:
             report["correct_telegram"] = not bool(report.get("correct_telegram"))
         ctx.catalog.update_pending_review(

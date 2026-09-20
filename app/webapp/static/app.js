@@ -390,6 +390,8 @@
     const months = me && me.inactive_months != null ? me.inactive_months : 3;
     const sim = Math.round(similarityValue() * 100);
     const allow = Boolean(me && me.suggest_allow_dissimilar);
+    const correct = Boolean(me && me.correct_telegram);
+    const skipAsk = Boolean(me && me.skip_save_prompt);
     return `
       <div class="card">
         <div class="row-between">
@@ -414,8 +416,14 @@
       </div>
       <div class="card">
         <h2>Default save</h2>
-        <p class="muted">Where new saves go when Drive is connected.</p>
+        <p class="muted">Where new saves go when Drive is connected. Do not ask again skips the Telegram prompt and uses these toggles.</p>
         ${destSeg((me && me.default_dest) || "none")}
+        <button type="button" class="check-btn${correct ? " is-on" : ""}" data-act="toggle-correct-tg">${
+          correct ? "Correct Telegram file on" : "Correct Telegram file"
+        }</button>
+        <button type="button" class="check-btn${skipAsk ? " is-on" : ""}" data-act="toggle-skip-save">${
+          skipAsk ? "Do not ask again on" : "Do not ask again"
+        }</button>
       </div>
       <div class="card">
         <h2>Listen for</h2>
@@ -874,22 +882,63 @@
     }
   }
 
-  async function setDest(dest) {
+  async function saveSavePrefs(extra) {
+    const body = Object.assign(
+      {
+        default_dest: (me && me.default_dest) || "none",
+        correct_telegram: Boolean(me && me.correct_telegram),
+        skip_save_prompt: Boolean(me && me.skip_save_prompt),
+      },
+      extra || {},
+    );
     try {
       const data = await api("/api/settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ default_dest: dest }),
+        body: JSON.stringify(body),
       });
       me.default_dest = data.default_dest;
-      haptic("light");
-      mainEl.querySelectorAll("[data-dest]").forEach((btn) => {
-        btn.classList.toggle("is-on", btn.dataset.dest === dest);
-      });
+      me.correct_telegram = data.correct_telegram;
+      me.skip_save_prompt = data.skip_save_prompt;
+      return data;
     } catch (err) {
       haptic("error");
       showBanner(err);
+      return null;
     }
+  }
+
+  async function setDest(dest) {
+    const data = await saveSavePrefs({ default_dest: dest });
+    if (!data) return;
+    haptic("light");
+    mainEl.querySelectorAll("[data-dest]").forEach((btn) => {
+      btn.classList.toggle("is-on", btn.dataset.dest === dest);
+    });
+  }
+
+  async function toggleCorrectTelegram() {
+    if (!me) return;
+    me.correct_telegram = !me.correct_telegram;
+    const btn = mainEl.querySelector("[data-act=toggle-correct-tg]");
+    if (btn) {
+      btn.classList.toggle("is-on", me.correct_telegram);
+      btn.textContent = me.correct_telegram ? "Correct Telegram file on" : "Correct Telegram file";
+    }
+    haptic("light");
+    await saveSavePrefs({ correct_telegram: me.correct_telegram });
+  }
+
+  async function toggleSkipSave() {
+    if (!me) return;
+    me.skip_save_prompt = !me.skip_save_prompt;
+    const btn = mainEl.querySelector("[data-act=toggle-skip-save]");
+    if (btn) {
+      btn.classList.toggle("is-on", me.skip_save_prompt);
+      btn.textContent = me.skip_save_prompt ? "Do not ask again on" : "Do not ask again";
+    }
+    haptic("light");
+    await saveSavePrefs({ skip_save_prompt: me.skip_save_prompt });
   }
 
   async function toggleFormat(fmt) {
@@ -1002,6 +1051,8 @@
     else if (kind === "unlink") unlinkDrive();
     else if (kind === "suggest-back") closeSuggestDetail();
     else if (kind === "toggle-dissimilar") toggleDissimilar();
+    else if (kind === "toggle-correct-tg") toggleCorrectTelegram();
+    else if (kind === "toggle-skip-save") toggleSkipSave();
     else if (kind === "save-tags") reviewAction(act.dataset.id, "tags", act);
     else if (kind === "library" || kind === "cancel") reviewAction(act.dataset.id, kind, act);
   });

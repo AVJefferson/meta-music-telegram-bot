@@ -11,9 +11,12 @@ from app.formats import (
     is_known_audio_message,
     mime_for_path,
     normalize_allowed,
+    normalize_save_dest,
+    save_prefs_from_settings,
     stored_download_name,
     suffix_for,
     user_allowed_formats,
+    user_save_prefs,
 )
 from app.library import review_relative
 from app.models import TagSet
@@ -43,6 +46,19 @@ class FormatRegistryTests(unittest.TestCase):
         user = SimpleNamespace(settings_json=json.dumps({"allowed_formats": ["ogg"]}))
         ctx = SimpleNamespace(catalog=SimpleNamespace(get_user=lambda _uid: user))
         self.assertEqual(user_allowed_formats(ctx, 9), ["ogg"])
+
+    def test_save_prefs(self) -> None:
+        self.assertEqual(normalize_save_dest("LIBRARY"), "library")
+        self.assertEqual(normalize_save_dest("nope"), "none")
+        dest, correct, skip = save_prefs_from_settings(
+            {"default_dest": "review", "correct_telegram": "on", "skip_save_prompt": True}
+        )
+        self.assertEqual(dest, "review")
+        self.assertTrue(correct)
+        self.assertTrue(skip)
+        self.assertEqual(user_save_prefs(None), ("none", False, False))
+        user = SimpleNamespace(settings_json="{not json")
+        self.assertEqual(user_save_prefs(user), ("none", False, False))
 
     def test_message_allowlist(self) -> None:
         mp3 = SimpleNamespace(

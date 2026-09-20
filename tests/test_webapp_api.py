@@ -274,6 +274,8 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data["library_count"], 3)
             self.assertEqual(data["suggest_similarity"], 0.5)
             self.assertFalse(data["suggest_allow_dissimilar"])
+            self.assertFalse(data["correct_telegram"])
+            self.assertFalse(data["skip_save_prompt"])
 
     async def test_draft_rejected_and_tags_action(self) -> None:
         directory, catalog = temp_catalog()
@@ -328,6 +330,33 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
             stored = json.loads(catalog.get_user(11).settings_json)
             self.assertEqual(stored["suggest_similarity"], 0.8)
             self.assertTrue(stored["suggest_allow_dissimilar"])
+
+    async def test_settings_save_prompt_prefs(self) -> None:
+        directory, catalog = temp_catalog()
+        with directory:
+            catalog.ensure_user(11)
+            catalog.update_user(11, settings_json=json.dumps({"default_dest": "library"}))
+            ctx = make_ctx(catalog)
+            app = create_http_app(ctx)
+            async with TestClient(TestServer(app)) as client:
+                saved = await client.post(
+                    "/api/settings",
+                    headers=_headers(**{"Content-Type": "application/json"}),
+                    data=json.dumps({"correct_telegram": True, "skip_save_prompt": True}),
+                )
+                me = await client.get("/api/me", headers=_headers())
+                saved_data = await saved.json()
+                me_data = await me.json()
+            self.assertTrue(saved_data["correct_telegram"])
+            self.assertTrue(saved_data["skip_save_prompt"])
+            self.assertEqual(saved_data["default_dest"], "library")
+            self.assertTrue(me_data["correct_telegram"])
+            self.assertTrue(me_data["skip_save_prompt"])
+            self.assertEqual(me_data["default_dest"], "library")
+            stored = json.loads(catalog.get_user(11).settings_json)
+            self.assertEqual(stored["default_dest"], "library")
+            self.assertTrue(stored["correct_telegram"])
+            self.assertTrue(stored["skip_save_prompt"])
 
     async def test_suggest_art_returns_urls(self) -> None:
         from dataclasses import replace
