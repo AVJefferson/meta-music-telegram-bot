@@ -217,11 +217,12 @@ def _suggest_prefs(settings: dict) -> tuple[float, bool]:
 
 
 def _save_prefs_payload(settings: dict) -> dict:
-    dest, correct, skip = save_prefs_from_settings(settings)
+    prefs = save_prefs_from_settings(settings)
     return {
-        "default_dest": dest,
-        "correct_telegram": correct,
-        "skip_save_prompt": skip,
+        "default_dest": prefs.dest,
+        "correct_telegram": prefs.correct_telegram,
+        "skip_save_prompt": prefs.skip_save_prompt,
+        "delete_original": prefs.delete_original,
     }
 
 
@@ -346,6 +347,8 @@ async def api_settings(request: web.Request) -> web.Response:
         settings["correct_telegram"] = truthy_setting(body.get("correct_telegram"))
     if "skip_save_prompt" in body:
         settings["skip_save_prompt"] = truthy_setting(body.get("skip_save_prompt"))
+    if "delete_original" in body:
+        settings["delete_original"] = truthy_setting(body.get("delete_original"))
     if (
         dest is None
         and "allowed_formats" not in body
@@ -353,6 +356,7 @@ async def api_settings(request: web.Request) -> web.Response:
         and "suggest_allow_dissimilar" not in body
         and "correct_telegram" not in body
         and "skip_save_prompt" not in body
+        and "delete_original" not in body
     ):
         settings["default_dest"] = normalize_save_dest(body.get("default_dest"))
     ctx.catalog.update_user(user_id, settings_json=json.dumps(settings))

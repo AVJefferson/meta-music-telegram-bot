@@ -25,7 +25,7 @@ from app.private_ui import (
     _review_keyboard,
     _topic_keyboard,
 )
-from app.queue import _delete_promoted_review_source, _maybe_prompt_dest, recover_interrupted
+from app.queue import _delete_original_telegram, _delete_promoted_review_source, _maybe_prompt_dest, recover_interrupted
 from app.review_ui import (
     conflict_keyboard,
     cover_keyboard,
@@ -299,18 +299,23 @@ class UiTests(unittest.TestCase):
         self.assertEqual(parse_callback("p4:dn").op, "dest_none")
         self.assertEqual(parse_callback("p4:dt").op, "dest_telegram")
         self.assertEqual(parse_callback("p4:da").op, "skip_ask")
+        self.assertEqual(parse_callback("p4:do").op, "delete_original")
         self.assertTrue(all(item.startswith("p4:") for item in data if item))
         self.assertFalse(any("drive" in (item or "") for item in data))
         self.assertIn("p4:da", data)
+        self.assertIn("p4:do", data)
         labels = [btn.text for row in markup.inline_keyboard for btn in row]
         self.assertIn("Do not ask again", labels)
-        marked = dest_keyboard(4, "library", True, True)
+        self.assertIn("Delete original file", labels)
+        marked = dest_keyboard(4, "library", True, True, True)
         marked_labels = [btn.text for row in marked.inline_keyboard for btn in row]
         self.assertIn("● Do not ask again", marked_labels)
+        self.assertIn("● Delete original file", marked_labels)
 
     def test_dest_prompt_mentions_skip(self) -> None:
-        text = dest_prompt_text("library", False, True)
+        text = dest_prompt_text("library", False, True, True)
         self.assertIn("Do not ask again: on", text)
+        self.assertIn("Delete original file: on", text)
         self.assertIn("library", text)
 
     def test_language_callback(self) -> None:
@@ -394,6 +399,7 @@ class DestPrefTests(unittest.IsolatedAsyncioTestCase):
                         "default_dest": "library",
                         "correct_telegram": True,
                         "skip_save_prompt": True,
+                        "delete_original": True,
                     }
                 ),
             )
@@ -428,8 +434,32 @@ class DestPrefTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(report["dest_confirmed"])
             self.assertEqual(report["drive_dest"], "library")
             self.assertTrue(report["correct_telegram"])
+            self.assertTrue(report["delete_original"])
             self.assertEqual(job.drive_dest, "library")
             self.assertTrue(job.correct_telegram)
+            self.assertTrue(job.delete_original)
+
+    async def test_delete_original_skips_tagged_copy(self) -> None:
+        deleted: list[tuple[int, int]] = []
+
+        async def delete_message(*, chat_id, message_id):
+            deleted.append((chat_id, message_id))
+
+        ctx = SimpleNamespace(bot=SimpleNamespace(delete_message=delete_message))
+        job = Job(
+            chat_id=9,
+            thread_id=None,
+            topic_name="English",
+            file_id="f",
+            file_name="a.flac",
+            status_message_id=11,
+            source_message_id=10,
+            public_message_id=11,
+        )
+        await _delete_original_telegram(ctx, job, 11)
+        self.assertEqual(deleted, [(9, 10)])
+        await _delete_original_telegram(ctx, job, 10)
+        self.assertEqual(deleted, [(9, 10)])
 
 
 class GeneralTopicTests(unittest.TestCase):

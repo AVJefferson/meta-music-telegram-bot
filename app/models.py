@@ -101,6 +101,7 @@ class Job:
     public_message_id: int = 0
     drive_dest: str = ""
     correct_telegram: bool = False
+    delete_original: bool = False
 
 
 @dataclass

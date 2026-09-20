@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 ALL_FORMATS = ("flac", "mp3", "m4a", "ogg", "opus", "wav")
@@ -168,6 +169,14 @@ SAVE_DESTS = ("library", "review", "none")
 SAVE_DEST_SET = frozenset(SAVE_DESTS)
 
 
+@dataclass(frozen=True)
+class SavePrefs:
+    dest: str = "none"
+    correct_telegram: bool = False
+    skip_save_prompt: bool = False
+    delete_original: bool = False
+
+
 def user_settings_dict(user: object | None) -> dict:
     raw = getattr(user, "settings_json", None) if user is not None else None
     try:
@@ -190,16 +199,17 @@ def normalize_save_dest(value: object, default: str = "none") -> str:
     return default if default in SAVE_DEST_SET else "none"
 
 
-def save_prefs_from_settings(settings: object) -> tuple[str, bool, bool]:
+def save_prefs_from_settings(settings: object) -> SavePrefs:
     data = settings if isinstance(settings, dict) else {}
-    return (
-        normalize_save_dest(data.get("default_dest")),
-        truthy_setting(data.get("correct_telegram")),
-        truthy_setting(data.get("skip_save_prompt")),
+    return SavePrefs(
+        dest=normalize_save_dest(data.get("default_dest")),
+        correct_telegram=truthy_setting(data.get("correct_telegram")),
+        skip_save_prompt=truthy_setting(data.get("skip_save_prompt")),
+        delete_original=truthy_setting(data.get("delete_original")),
     )
 
 
-def user_save_prefs(user: object | None) -> tuple[str, bool, bool]:
+def user_save_prefs(user: object | None) -> SavePrefs:
     return save_prefs_from_settings(user_settings_dict(user))
 
 

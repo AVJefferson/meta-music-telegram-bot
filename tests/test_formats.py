@@ -5,6 +5,7 @@ import unittest
 from types import SimpleNamespace
 
 from app.formats import (
+    SavePrefs,
     default_filename,
     detect_format,
     is_allowed_audio_message,
@@ -50,15 +51,21 @@ class FormatRegistryTests(unittest.TestCase):
     def test_save_prefs(self) -> None:
         self.assertEqual(normalize_save_dest("LIBRARY"), "library")
         self.assertEqual(normalize_save_dest("nope"), "none")
-        dest, correct, skip = save_prefs_from_settings(
-            {"default_dest": "review", "correct_telegram": "on", "skip_save_prompt": True}
+        prefs = save_prefs_from_settings(
+            {
+                "default_dest": "review",
+                "correct_telegram": "on",
+                "skip_save_prompt": True,
+                "delete_original": "yes",
+            }
         )
-        self.assertEqual(dest, "review")
-        self.assertTrue(correct)
-        self.assertTrue(skip)
-        self.assertEqual(user_save_prefs(None), ("none", False, False))
+        self.assertEqual(
+            prefs,
+            SavePrefs(dest="review", correct_telegram=True, skip_save_prompt=True, delete_original=True),
+        )
+        self.assertEqual(user_save_prefs(None), SavePrefs())
         user = SimpleNamespace(settings_json="{not json")
-        self.assertEqual(user_save_prefs(user), ("none", False, False))
+        self.assertEqual(user_save_prefs(user), SavePrefs())
 
     def test_message_allowlist(self) -> None:
         mp3 = SimpleNamespace(

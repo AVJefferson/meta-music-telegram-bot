@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -9,6 +10,36 @@ from aiogram.types import EphemeralMessageParameters, InlineKeyboardMarkup, Mess
 from app.errors import AppError
 
 log = logging.getLogger(__name__)
+
+
+def message_ref(message: object | None) -> dict | None:
+    if message is None:
+        return None
+    chat = getattr(message, "chat", None)
+    eph = getattr(message, "ephemeral_message_id", None)
+    mid = getattr(message, "message_id", None)
+    chat_id = getattr(chat, "id", None)
+    if not eph and not mid:
+        return None
+    return {
+        "chat_id": chat_id,
+        "message_id": mid,
+        "ephemeral_message_id": int(eph) if eph else None,
+    }
+
+
+def _message_from_ref(ref: dict | None) -> SimpleNamespace | None:
+    if not isinstance(ref, dict):
+        return None
+    eph = ref.get("ephemeral_message_id")
+    mid = ref.get("message_id")
+    if not eph and not mid:
+        return None
+    return SimpleNamespace(
+        chat=SimpleNamespace(id=ref.get("chat_id")),
+        message_id=mid or 0,
+        ephemeral_message_id=eph,
+    )
 
 
 async def send_private(
@@ -22,7 +53,7 @@ async def send_private(
     reply_markup: InlineKeyboardMarkup | None = None,
     disable_web_page_preview: bool | None = True,
 ) -> Message | None:
-    """DM, or group ephemeral, or DM fallback. Never posts OAuth URLs to the public group."""
+    """PM: ordinary message. Group/channel: editable ephemeral (Drive/personal), else DM fallback."""
     if chat_id > 0:
         return await ctx.bot.send_message(
             chat_id,
@@ -72,10 +103,18 @@ async def edit_private_text(
     text: str,
     parse_mode: str | None = None,
     reply_markup: InlineKeyboardMarkup | None = None,
-) -> None:
+    thread_id: int | None = None,
+) -> Message | None:
     if message is None:
-        await send_private(ctx, chat_id=chat_id, user_id=user_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
-        return
+        return await send_private(
+            ctx,
+            chat_id=chat_id,
+            user_id=user_id,
+            text=text,
+            thread_id=thread_id,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
     eph_id = getattr(message, "ephemeral_message_id", None)
     if eph_id:
         try:
@@ -87,11 +126,18 @@ async def edit_private_text(
                 parse_mode=parse_mode,
                 reply_markup=reply_markup,
             )
-            return
+            return message
         except Exception:
             log.info("ephemeral edit failed; sending new private message")
-            await send_private(ctx, chat_id=chat_id, user_id=user_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
-            return
+            return await send_private(
+                ctx,
+                chat_id=chat_id,
+                user_id=user_id,
+                text=text,
+                thread_id=thread_id,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
     try:
         await ctx.bot.edit_message_text(
             text,
@@ -100,8 +146,53 @@ async def edit_private_text(
             parse_mode=parse_mode,
             reply_markup=reply_markup,
         )
+        return message
     except Exception:
-        await send_private(ctx, chat_id=chat_id, user_id=user_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return await send_private(
+            ctx,
+            chat_id=chat_id,
+            user_id=user_id,
+            text=text,
+            thread_id=thread_id,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+
+
+async def send_or_edit_private(
+    ctx: Any,
+    *,
+    chat_id: int,
+    user_id: int,
+    text: str,
+    previous: dict | None = None,
+    thread_id: int | None = None,
+    parse_mode: str | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> dict | None:
+    existing = _message_from_ref(previous)
+    if existing:
+        sent = await edit_private_text(
+            ctx,
+            chat_id=chat_id,
+            user_id=user_id,
+            message=existing,  # type: ignore[arg-type]
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            thread_id=thread_id,
+        )
+        return message_ref(sent) or previous
+    sent = await send_private(
+        ctx,
+        chat_id=chat_id,
+        user_id=user_id,
+        text=text,
+        thread_id=thread_id,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
+    return message_ref(sent)
 
 
 async def edit_private_markup(
@@ -112,10 +203,13 @@ async def edit_private_markup(
     message: Message | None,
     reply_markup: InlineKeyboardMarkup | None = None,
     text: str | None = None,
+    thread_id: int | None = None,
 ) -> None:
     if message is None:
         if text:
-            await send_private(ctx, chat_id=chat_id, user_id=user_id, text=text, reply_markup=reply_markup)
+            await send_private(
+                ctx, chat_id=chat_id, user_id=user_id, text=text, thread_id=thread_id, reply_markup=reply_markup
+            )
         return
     eph_id = getattr(message, "ephemeral_message_id", None)
     if eph_id:
@@ -130,7 +224,9 @@ async def edit_private_markup(
         except Exception:
             log.info("ephemeral markup edit failed; sending new private message")
             if text:
-                await send_private(ctx, chat_id=chat_id, user_id=user_id, text=text, reply_markup=reply_markup)
+                await send_private(
+                    ctx, chat_id=chat_id, user_id=user_id, text=text, thread_id=thread_id, reply_markup=reply_markup
+                )
             return
     try:
         await ctx.bot.edit_message_reply_markup(
@@ -140,4 +236,6 @@ async def edit_private_markup(
         )
     except Exception:
         if text:
-            await send_private(ctx, chat_id=chat_id, user_id=user_id, text=text, reply_markup=reply_markup)
+            await send_private(
+                ctx, chat_id=chat_id, user_id=user_id, text=text, thread_id=thread_id, reply_markup=reply_markup
+            )

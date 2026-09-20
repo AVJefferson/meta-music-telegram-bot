@@ -392,6 +392,7 @@
     const allow = Boolean(me && me.suggest_allow_dissimilar);
     const correct = Boolean(me && me.correct_telegram);
     const skipAsk = Boolean(me && me.skip_save_prompt);
+    const deleteOrig = Boolean(me && me.delete_original);
     return `
       <div class="card">
         <div class="row-between">
@@ -416,10 +417,13 @@
       </div>
       <div class="card">
         <h2>Default save</h2>
-        <p class="muted">Where new saves go when Drive is connected. Do not ask again skips the Telegram prompt and uses these toggles.</p>
+        <p class="muted">Where new saves go when Drive is connected. Do not ask again skips the Telegram prompt and uses these toggles. Delete original file removes the message you sent after a successful save.</p>
         ${destSeg((me && me.default_dest) || "none")}
         <button type="button" class="check-btn${correct ? " is-on" : ""}" data-act="toggle-correct-tg">${
           correct ? "Correct Telegram file on" : "Correct Telegram file"
+        }</button>
+        <button type="button" class="check-btn${deleteOrig ? " is-on" : ""}" data-act="toggle-delete-orig">${
+          deleteOrig ? "Delete original file on" : "Delete original file"
         }</button>
         <button type="button" class="check-btn${skipAsk ? " is-on" : ""}" data-act="toggle-skip-save">${
           skipAsk ? "Do not ask again on" : "Do not ask again"
@@ -888,6 +892,7 @@
         default_dest: (me && me.default_dest) || "none",
         correct_telegram: Boolean(me && me.correct_telegram),
         skip_save_prompt: Boolean(me && me.skip_save_prompt),
+        delete_original: Boolean(me && me.delete_original),
       },
       extra || {},
     );
@@ -900,6 +905,7 @@
       me.default_dest = data.default_dest;
       me.correct_telegram = data.correct_telegram;
       me.skip_save_prompt = data.skip_save_prompt;
+      me.delete_original = data.delete_original;
       return data;
     } catch (err) {
       haptic("error");
@@ -939,6 +945,18 @@
     }
     haptic("light");
     await saveSavePrefs({ skip_save_prompt: me.skip_save_prompt });
+  }
+
+  async function toggleDeleteOriginal() {
+    if (!me) return;
+    me.delete_original = !me.delete_original;
+    const btn = mainEl.querySelector("[data-act=toggle-delete-orig]");
+    if (btn) {
+      btn.classList.toggle("is-on", me.delete_original);
+      btn.textContent = me.delete_original ? "Delete original file on" : "Delete original file";
+    }
+    haptic("light");
+    await saveSavePrefs({ delete_original: me.delete_original });
   }
 
   async function toggleFormat(fmt) {
@@ -1052,6 +1070,7 @@
     else if (kind === "suggest-back") closeSuggestDetail();
     else if (kind === "toggle-dissimilar") toggleDissimilar();
     else if (kind === "toggle-correct-tg") toggleCorrectTelegram();
+    else if (kind === "toggle-delete-orig") toggleDeleteOriginal();
     else if (kind === "toggle-skip-save") toggleSkipSave();
     else if (kind === "save-tags") reviewAction(act.dataset.id, "tags", act);
     else if (kind === "library" || kind === "cancel") reviewAction(act.dataset.id, kind, act);

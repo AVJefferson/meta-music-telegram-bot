@@ -32,6 +32,55 @@ class EphemeralFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ephemeral_message_parameters", group_kwargs[0])
         self.assertNotIn("receiver_user_id", group_kwargs[0])
 
+    async def test_private_chat_never_uses_ephemeral(self) -> None:
+        from app.ephemeral import send_private
+
+        kwargs_seen: list[dict] = []
+
+        async def send_message(chat_id, text, **kwargs):
+            kwargs_seen.append({"chat_id": chat_id, **kwargs})
+            return SimpleNamespace(message_id=3, chat=SimpleNamespace(id=chat_id), ephemeral_message_id=None)
+
+        ctx = SimpleNamespace(bot=SimpleNamespace(send_message=send_message))
+        msg = await send_private(ctx, chat_id=9, user_id=9, text="hi")
+        self.assertEqual(msg.message_id, 3)
+        self.assertEqual(kwargs_seen[0]["chat_id"], 9)
+        self.assertNotIn("ephemeral_message_parameters", kwargs_seen[0])
+
+    async def test_group_dest_prompt_edits_ephemeral(self) -> None:
+        from app.ephemeral import send_or_edit_private
+
+        edits: list[dict] = []
+        sends: list[dict] = []
+
+        async def send_message(chat_id, text=None, **kwargs):
+            sends.append({"chat_id": chat_id, "text": text, **kwargs})
+            return SimpleNamespace(
+                message_id=8,
+                chat=SimpleNamespace(id=chat_id),
+                ephemeral_message_id=77,
+            )
+
+        async def edit_ephemeral_message_text(**kwargs):
+            edits.append(kwargs)
+
+        ctx = SimpleNamespace(
+            bot=SimpleNamespace(
+                send_message=send_message,
+                edit_ephemeral_message_text=edit_ephemeral_message_text,
+            )
+        )
+        first = await send_or_edit_private(ctx, chat_id=-100, user_id=9, text="one")
+        self.assertEqual(first["ephemeral_message_id"], 77)
+        self.assertIn("ephemeral_message_parameters", sends[0])
+        second = await send_or_edit_private(
+            ctx, chat_id=-100, user_id=9, text="two", previous=first
+        )
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(edits[0]["ephemeral_message_id"], 77)
+        self.assertEqual(edits[0]["text"], "two")
+        self.assertEqual(second["ephemeral_message_id"], 77)
+
 
 class ErrorRedactTests(unittest.TestCase):
     def test_redacts_tokens(self) -> None:

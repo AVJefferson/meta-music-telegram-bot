@@ -276,6 +276,7 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(data["suggest_allow_dissimilar"])
             self.assertFalse(data["correct_telegram"])
             self.assertFalse(data["skip_save_prompt"])
+            self.assertFalse(data["delete_original"])
 
     async def test_draft_rejected_and_tags_action(self) -> None:
         directory, catalog = temp_catalog()
@@ -342,21 +343,26 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
                 saved = await client.post(
                     "/api/settings",
                     headers=_headers(**{"Content-Type": "application/json"}),
-                    data=json.dumps({"correct_telegram": True, "skip_save_prompt": True}),
+                    data=json.dumps(
+                        {"correct_telegram": True, "skip_save_prompt": True, "delete_original": True}
+                    ),
                 )
                 me = await client.get("/api/me", headers=_headers())
                 saved_data = await saved.json()
                 me_data = await me.json()
             self.assertTrue(saved_data["correct_telegram"])
             self.assertTrue(saved_data["skip_save_prompt"])
+            self.assertTrue(saved_data["delete_original"])
             self.assertEqual(saved_data["default_dest"], "library")
             self.assertTrue(me_data["correct_telegram"])
             self.assertTrue(me_data["skip_save_prompt"])
+            self.assertTrue(me_data["delete_original"])
             self.assertEqual(me_data["default_dest"], "library")
             stored = json.loads(catalog.get_user(11).settings_json)
             self.assertEqual(stored["default_dest"], "library")
             self.assertTrue(stored["correct_telegram"])
             self.assertTrue(stored["skip_save_prompt"])
+            self.assertTrue(stored["delete_original"])
 
     async def test_suggest_art_returns_urls(self) -> None:
         from dataclasses import replace

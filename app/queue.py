@@ -38,6 +38,8 @@ from app.covers import (
 )
 from app.enrich import enrich, lyrics_card_text
 from app.formats import (
+    SAVE_DEST_SET,
+    SavePrefs,
     extension_from_path,
     mime_for_path,
     stored_download_name,
@@ -186,6 +188,7 @@ def _job_from_pending(row: PendingReview) -> Job:
         public_message_id=getattr(row, "public_message_id", None) or 0,
         drive_dest=str(report.get("drive_dest") or ""),
         correct_telegram=bool(report.get("correct_telegram")),
+        delete_original=bool(report.get("delete_original")),
     )
 
 
@@ -426,6 +429,8 @@ async def process_job(job: Job, ctx: Ctx) -> None:
             report["dest_confirmed"] = True
         if job.correct_telegram:
             report["correct_telegram"] = True
+        if job.delete_original:
+            report["delete_original"] = True
 
         telegram_only = not _want_drive(report)
         restart_replace = None
@@ -1615,29 +1620,34 @@ async def _cover_choice_from_pending(
     return _read_cover_option(Path(leader.local_path), options[0])
 
 
-def _user_save_prefs(ctx: Ctx, user_id: int) -> tuple[str, bool, bool]:
+def _user_save_prefs(ctx: Ctx, user_id: int) -> SavePrefs:
     if not user_id:
-        return "none", False, False
+        return SavePrefs()
     user = ctx.catalog.get_user(user_id)
-    dest, correct, skip = user_save_prefs(user)
+    prefs = user_save_prefs(user)
     if not user or not user.logged_in:
-        return "none", correct, False
-    return dest, correct, skip
+        return SavePrefs(
+            dest="none",
+            correct_telegram=prefs.correct_telegram,
+            skip_save_prompt=False,
+            delete_original=prefs.delete_original,
+        )
+    return prefs
 
 
 def _user_default_dest(ctx: Ctx, user_id: int) -> str:
-    dest, _correct, _skip = _user_save_prefs(ctx, user_id)
-    return dest
+    return _user_save_prefs(ctx, user_id).dest
 
 
-def _store_user_save_prefs(ctx: Ctx, user_id: int, dest: str, correct: bool, skip: bool) -> None:
+def _store_user_save_prefs(ctx: Ctx, user_id: int, prefs: SavePrefs) -> None:
     if not user_id:
         return
     user = ctx.catalog.ensure_user(user_id)
     settings = user_settings_dict(user)
-    settings["default_dest"] = dest if dest in {"library", "review", "none"} else "none"
-    settings["correct_telegram"] = bool(correct)
-    settings["skip_save_prompt"] = bool(skip)
+    settings["default_dest"] = prefs.dest if prefs.dest in SAVE_DEST_SET else "none"
+    settings["correct_telegram"] = bool(prefs.correct_telegram)
+    settings["skip_save_prompt"] = bool(prefs.skip_save_prompt)
+    settings["delete_original"] = bool(prefs.delete_original)
     ctx.catalog.update_user(user_id, settings_json=json.dumps(settings))
 
 
@@ -1654,11 +1664,41 @@ def _dest_commit_plan(ctx: Ctx, user_id: int, report: dict, fallback_kind: str) 
     return (fallback_kind or "library"), False
 
 
-def _dest_state(report: dict) -> tuple[str, bool, bool]:
+def _dest_state(report: dict) -> SavePrefs:
     dest = str(report.get("drive_dest") or "none")
-    if dest not in {"library", "review", "none"}:
+    if dest not in SAVE_DEST_SET:
         dest = "none"
-    return dest, bool(report.get("correct_telegram")), bool(report.get("skip_save_prompt"))
+    return SavePrefs(
+        dest=dest,
+        correct_telegram=bool(report.get("correct_telegram")),
+        skip_save_prompt=bool(report.get("skip_save_prompt")),
+        delete_original=bool(report.get("delete_original")),
+    )
+
+
+def _fill_dest_defaults(report: dict, prefs: SavePrefs) -> None:
+    dest = str(report.get("drive_dest") or prefs.dest)
+    if dest not in SAVE_DEST_SET:
+        dest = "none"
+    report["drive_dest"] = dest
+    if "correct_telegram" not in report:
+        report["correct_telegram"] = prefs.correct_telegram
+    else:
+        report["correct_telegram"] = bool(report.get("correct_telegram"))
+    if "skip_save_prompt" not in report:
+        report["skip_save_prompt"] = prefs.skip_save_prompt
+    else:
+        report["skip_save_prompt"] = bool(report.get("skip_save_prompt"))
+    if "delete_original" not in report:
+        report["delete_original"] = prefs.delete_original
+    else:
+        report["delete_original"] = bool(report.get("delete_original"))
+
+
+def _apply_dest_to_job(job: Job, prefs: SavePrefs) -> None:
+    job.drive_dest = prefs.dest
+    job.correct_telegram = prefs.correct_telegram
+    job.delete_original = prefs.delete_original
 
 
 def _want_drive(report: dict | None) -> bool:
@@ -1689,21 +1729,26 @@ def _bind_primary_language(job: Job, report: dict, mapper) -> None:
 
 
 async def _restore_language_prompt(ctx: Ctx, row: PendingReview) -> None:
-    from app.ephemeral import send_private
+    from app.ephemeral import send_or_edit_private
 
     report = _loads(row.source_report_json, {})
     if not isinstance(report, dict):
         report = {}
     langs = [str(item) for item in (report.get("languages") or []) if str(item).strip()]
     uid = getattr(row, "user_id", 0) or 0
-    await send_private(
+    ref = await send_or_edit_private(
         ctx,
         chat_id=row.chat_id,
         user_id=uid or row.chat_id,
         text=language_prompt_text(langs),
+        previous=report.get("lang_prompt") if isinstance(report.get("lang_prompt"), dict) else None,
+        thread_id=row.thread_id,
         parse_mode="HTML",
         reply_markup=language_keyboard(row.id, langs),
     )
+    if ref and ref != report.get("lang_prompt"):
+        report["lang_prompt"] = ref
+        ctx.catalog.update_pending_review(row.id, source_report_json=_dumps(report))
 
 
 async def _maybe_prompt_language(
@@ -1882,21 +1927,30 @@ async def _apply_language_choice(ctx: Ctx, row: PendingReview, slug: str) -> Non
 
 
 async def _restore_dest_prompt(ctx: Ctx, row: PendingReview) -> None:
-    from app.ephemeral import send_private
+    from app.ephemeral import send_or_edit_private
 
     report = _loads(row.source_report_json, {})
     if not isinstance(report, dict):
         report = {}
-    dest, correct, skip = _dest_state(report)
+    prefs = _dest_state(report)
     uid = getattr(row, "user_id", 0) or 0
-    await send_private(
+    ref = await send_or_edit_private(
         ctx,
         chat_id=row.chat_id,
         user_id=uid or row.chat_id,
-        text=dest_prompt_text(dest, correct, skip),
+        text=dest_prompt_text(
+            prefs.dest, prefs.correct_telegram, prefs.skip_save_prompt, prefs.delete_original
+        ),
+        previous=report.get("dest_prompt") if isinstance(report.get("dest_prompt"), dict) else None,
+        thread_id=row.thread_id,
         parse_mode="HTML",
-        reply_markup=dest_keyboard(row.id, dest, correct, skip),
+        reply_markup=dest_keyboard(
+            row.id, prefs.dest, prefs.correct_telegram, prefs.skip_save_prompt, prefs.delete_original
+        ),
     )
+    if ref and ref != report.get("dest_prompt"):
+        report["dest_prompt"] = ref
+        ctx.catalog.update_pending_review(row.id, source_report_json=_dumps(report))
 
 
 async def _maybe_prompt_dest(
@@ -1922,28 +1976,19 @@ async def _maybe_prompt_dest(
         return False
     uid = job.user_id or 0
     user = ctx.catalog.get_user(uid) if uid else None
-    prefs_dest, prefs_correct, prefs_skip = _user_save_prefs(ctx, uid)
+    prefs = _user_save_prefs(ctx, uid)
     if not user or not user.logged_in:
         report["drive_dest"] = "none"
         report["dest_confirmed"] = True
         report["correct_telegram"] = False
+        if "delete_original" not in report:
+            report["delete_original"] = prefs.delete_original
+        job.delete_original = bool(report.get("delete_original"))
         return False
-    drive_dest = str(report.get("drive_dest") or prefs_dest)
-    if drive_dest not in {"library", "review", "none"}:
-        drive_dest = "none"
-    report["drive_dest"] = drive_dest
-    if "correct_telegram" not in report:
-        report["correct_telegram"] = prefs_correct
-    else:
-        report["correct_telegram"] = bool(report.get("correct_telegram"))
-    if "skip_save_prompt" not in report:
-        report["skip_save_prompt"] = prefs_skip
-    else:
-        report["skip_save_prompt"] = bool(report.get("skip_save_prompt"))
+    _fill_dest_defaults(report, prefs)
     if report["skip_save_prompt"]:
         report["dest_confirmed"] = True
-        job.drive_dest = drive_dest
-        job.correct_telegram = bool(report.get("correct_telegram"))
+        _apply_dest_to_job(job, _dest_state(report))
         return False
     report["quality_replace"] = {
         "replaced": replaced,
@@ -2009,10 +2054,9 @@ async def _apply_dest_confirm(ctx: Ctx, row: PendingReview) -> None:
     tags = normalize_tagset(tagset_from_dict(working), ctx.genre)
     local = Path(row.local_path)
     job = _job_from_pending(row)
-    dest, correct, skip = _dest_state(report)
-    job.correct_telegram = correct
-    job.drive_dest = dest
-    _store_user_save_prefs(ctx, job.user_id, dest, correct, skip)
+    prefs = _dest_state(report)
+    _apply_dest_to_job(job, prefs)
+    _store_user_save_prefs(ctx, job.user_id, prefs)
     _bind_primary_language(job, report, ctx.genre)
     kind, _drive = _dest_commit_plan(ctx, job.user_id, report, row.kind or "library")
     qr = report.get("quality_replace") or {}
@@ -2391,6 +2435,7 @@ async def _commit_upload(
         extra = f"\nReplaced lower-quality copy ({old_q[0]}/{old_q[1]} → {new_q[0]}/{new_q[1]})."
     dest_label = "library" if kind == "library" else "review"
     correct = bool(job.correct_telegram or (source_report or {}).get("correct_telegram"))
+    delete_original = bool(job.delete_original or (source_report or {}).get("delete_original"))
     if not want_drive:
         saved = "Updated the group file" if (replace_id is not None or correct) else "Tagged (not copied to Drive)"
     else:
@@ -2432,6 +2477,8 @@ async def _commit_upload(
             telegram_file_id = new_file
             ctx.catalog.update_track(track_id, telegram_file_id=new_file)
         ctx.catalog.bind_track_message(track_id, job.chat_id, public_id)
+    if delete_original:
+        await _delete_original_telegram(ctx, job, public_id)
     await edit_status(
         ctx,
         job,
@@ -2463,6 +2510,18 @@ async def _commit_upload(
         ctx.catalog.bind_track_message(track_id, job.chat_id, job.status_message_id)
     log.info("saved %s kind=%s confidence=%s path=%s", job.file_name, dest_label, identity.confidence, relative)
     return dest
+
+
+async def _delete_original_telegram(ctx: Ctx, job: Job, public_id: int) -> None:
+    src = job.source_message_id or 0
+    if not src:
+        return
+    if src in {public_id, job.status_message_id, job.public_message_id}:
+        return
+    try:
+        await ctx.bot.delete_message(chat_id=job.chat_id, message_id=src)
+    except Exception:
+        log.debug("delete original failed chat=%s message=%s", job.chat_id, src, exc_info=True)
 
 
 async def _delete_promoted_review_source(ctx: Ctx, row: PendingReview) -> bool:
@@ -2754,7 +2813,14 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
         if row:
             await _refresh_tag_ui(ctx, row)
         return
-    if action.op in {"dest_library", "dest_review", "dest_none", "dest_telegram", "skip_ask"}:
+    if action.op in {
+        "dest_library",
+        "dest_review",
+        "dest_none",
+        "dest_telegram",
+        "skip_ask",
+        "delete_original",
+    }:
         report = _loads(row.source_report_json, {})
         if not isinstance(report, dict):
             report = {}
@@ -2766,6 +2832,8 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
             report["drive_dest"] = "none"
         elif action.op == "skip_ask":
             report["skip_save_prompt"] = not bool(report.get("skip_save_prompt"))
+        elif action.op == "delete_original":
+            report["delete_original"] = not bool(report.get("delete_original"))
         else:
             report["correct_telegram"] = not bool(report.get("correct_telegram"))
         ctx.catalog.update_pending_review(

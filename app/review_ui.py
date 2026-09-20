@@ -38,7 +38,7 @@ FIELD_KEYS = {key for key, _ in FIELDS}
 MULTI_VALUE_FIELDS = {"artist", "albumartist", "composer"}
 SPARSE_FILL_FIELDS = {"composer", "genre", "year"}
 _CALLBACK = re.compile(
-    r"^p(\d+):(ok|rev|cancel|back|dr|dk|ds|cv(\d+)|c(\d+)|t:([a-z]+)|uf|ur|dl|dv|dn|dt|da|lg:([a-z]+))$"
+    r"^p(\d+):(ok|rev|cancel|back|dr|dk|ds|cv(\d+)|c(\d+)|t:([a-z]+)|uf|ur|dl|dv|dn|dt|da|do|lg:([a-z]+))$"
 )
 
 
@@ -86,6 +86,8 @@ def parse_callback(data: str | None) -> PendingAction | None:
         return PendingAction(pending_id, "dest_telegram")
     if rest == "da":
         return PendingAction(pending_id, "skip_ask")
+    if rest == "do":
+        return PendingAction(pending_id, "delete_original")
     if rest.startswith("lg:") and match.group(6):
         return PendingAction(pending_id, "lang", field=match.group(6))
     if rest.startswith("cv") and match.group(3) is not None:
@@ -454,6 +456,7 @@ def dest_keyboard(
     dest: str,
     correct_telegram: bool,
     skip_ask: bool = False,
+    delete_original: bool = False,
 ) -> InlineKeyboardMarkup:
     def mark(active: bool, label: str) -> str:
         return f"● {label}" if active else label
@@ -471,6 +474,12 @@ def dest_keyboard(
             ],
             [
                 InlineKeyboardButton(
+                    text=mark(delete_original, "Delete original file"),
+                    callback_data=f"p{pending_id}:do",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text=mark(skip_ask, "Do not ask again"),
                     callback_data=f"p{pending_id}:da",
                 )
@@ -483,11 +492,17 @@ def dest_keyboard(
     )
 
 
-def dest_prompt_text(dest: str, correct_telegram: bool, skip_ask: bool = False) -> str:
+def dest_prompt_text(
+    dest: str,
+    correct_telegram: bool,
+    skip_ask: bool = False,
+    delete_original: bool = False,
+) -> str:
     return (
         "<b>Save options</b>\n"
         f"Drive: <code>{html_esc(dest)}</code>\n"
         f"Correct Telegram file: {'on' if correct_telegram else 'off (first save)'}\n"
+        f"Delete original file: {'on' if delete_original else 'off'}\n"
         f"Do not ask again: {'on' if skip_ask else 'off'}\n"
         "OK writes local + Drive per the toggles."
     )
