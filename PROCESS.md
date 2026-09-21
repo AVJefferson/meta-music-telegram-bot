@@ -18,7 +18,7 @@ Telegram update
 
 HTTP (`PUBLIC_BASE_URL`, port 8080): Mini App `/app/*`, JSON `/api/*` (Telegram `initData` HMAC), Google OAuth `/oauth/start` + `/oauth/callback`.
 
-A background **tagger worker** consumes `Job`s. Identify / tag / cover / Drive never run on the Telegram handler thread.
+Identify / tag / cover / Drive never run on the Telegram handler thread. Same OS/`bot` container; **different triggers → different process flows** below ([scheduled and background](#7-scheduled-and-background-processes)).
 
 ---
 
@@ -167,7 +167,7 @@ Job
         7. optionally delete the user’s original message
 ```
 
-Pending review rows expire ~24h (`expire_pending`). Interrupted `queued`/`processing` jobs are re-queued on startup.
+Pending review rows that wait on the user expire ~24h on the **15-minute expire job** ([§7](#7-scheduled-and-background-processes)). Interrupted `queued`/`processing` jobs are re-queued on **boot recovery**, not on that timer.
 
 ### After a successful save
 
@@ -202,7 +202,7 @@ Copy uses the **current Telegram file** when possible, else local/Drive. Confirm
 
 🙏 sets dest to Telegram-only (`drive_dest=none`) and `correct_telegram=true`, then re-runs the identify worker against a staged original (Telegram → local → Drive). Group/channel media is replaced after identify. In a DM, a listen copy is sent first.
 
-✍️ commit **replaces the group/channel audio for everyone** and stamps `last_editor_user_id`. Drive files stay until someone 👍/👎 copies the new file. Cancel / 24h timeout discards the staged copy.
+✍️ commit **replaces the group/channel audio for everyone** and stamps `last_editor_user_id`. Drive files stay until someone 👍/👎 copies the new file. Cancel discards the staged copy. The **15-minute expire job** discards `react_exit` after 24h (`Edit timed out`). 👍/👎 confirm prompts are not auto-expired.
 
 If ✍️ is still open, 👍/👎/💩/🙏 reply “Finish or cancel ✍️ first.”
 
@@ -240,7 +240,7 @@ Toggles: Drive library / Drive review / No Drive upload, Correct Telegram file, 
 | Delete original | honors toggle | honors toggle | honors toggle |
 | 👍 / 👎 copy | local user copy only (no Drive root) | upload to that user’s Drive | same |
 | `/review` Drive sync | no remote listing | lists Drive review extras | same |
-| Daily cleanup | drop local after **7 days**; no Drive retry | keep local 7 days after Drive-confirmed upload, then drop if Drive still has the file | Drive retry on failed rows |
+| Daily cleanup cron | drop local after **7 days**; skip Drive retry | keep local 7 days after Drive-confirmed upload, then drop if Drive still has the file | Drive retry on `failed` rows |
 
 ---
 
@@ -276,7 +276,7 @@ Second Google account on the same Telegram user is refused.
 - Identify / tag / public caption still run.
 - No dest prompt; no Drive create/replace/delete.
 - 👍/👎/💩 operate on **local** per-user copies only; `relocate_track` skips Drive when folder ids are empty.
-- Cleanup: no upload retry; locals older than 7 days deleted; idle users forgotten after `USER_INACTIVE_MONTHS` (default 3; tokens first if any remain).
+- Daily cron: no upload retry; locals older than 7 days deleted; idle users forgotten after `USER_INACTIVE_MONTHS` (default 3; tokens first if any remain). See [§7](#7-scheduled-and-background-processes).
 - Mini App home: “Tagging still works in Telegram without Drive.” + Connect button.
 
 ### Logged in
@@ -285,7 +285,7 @@ Second Google account on the same Telegram user is refused.
 - 👍 copies the current Telegram file into **your** library Drive; 👎 into **your** review Drive; 💩 deletes **your** Drive+local copy.
 - 🙏 / ✍️ do **not** rewrite Drive until a later 👍/👎.
 - Name conflict on upload: Replace / Keep both / Skip (Skip keeps local).
-- Daily 03:00 UTC: retry failed Drive uploads; after 7 days drop a local whose Drive copy still exists.
+- Daily cron (`CLEANUP_CRON`, default 03:00 UTC): retry failed Drive uploads; after 7 days drop a local whose Drive copy still exists.
 - Unlink: `POST /api/settings` `{unlink: true}` — Drive files already saved stay in Google until the user deletes them.
 
 ### Login failures the user sees
@@ -310,6 +310,162 @@ Second Google account on the same Telegram user is refused.
 6. **High confidence** → language → cover → dest → tags on disk → Drive (if dest ≠ `none`) → public caption/media.
 
 Tags written: `TITLE`, `ALBUM`, `ARTIST`, `ALBUMARTIST`, `COMPOSER`, `GENRE`, `DATE`, `TRACKNUMBER`, `DISCNUMBER`, `LYRICS`, one front cover. Everything else stripped.
+
+---
+
+## 7. Scheduled and background processes
+
+All of these run **inside the `bot` container** (APScheduler + `asyncio` tasks). Compose `website` / `ftp` / `telegram-bot-api` are other services, not this scheduler. Different **triggers** are separate process flows.
+
+```text
+python -m app
+  start APScheduler
+       ├─ every 15 min: expire pending
+       └─ CLEANUP_CRON: daily cleanup
+  start tagger worker                    ← Job queue (asyncio task)
+  wait for local Bot API
+  start HTTP (Mini App + OAuth)          ← request-triggered
+  recover interrupted jobs               ← once, boot
+  warm library tag index (background)    ← once, boot
+  poll Telegram                          ← update-triggered (sections 1–6)
+```
+
+---
+
+### Process: tagger worker
+
+**Trigger:** `Job` enqueued (audio ingest, HiFi pick, 🙏 restart). Not on a clock.
+
+**Flow:** dequeue → claim pending `queued`→`processing` → `process_job` (identify / prompts / Drive) → mark done or fail → notify user on error. Telegram network drop parks the row as `queued` for boot recovery. One failed job does not kill the worker.
+
+Details: [audio worker](#worker-process_job).
+
+---
+
+### Process: boot recovery
+
+**Trigger:** once, after Telegram is up and HTTP is listening, **before** polling.
+
+**Flow:** load pending rows in `queued` / `processing` / `uploading` / `expiring` / `cleanup_pending`.
+
+```text
+recover_interrupted
+  ├─ cleanup_pending → delete promoted review Drive source; mark done
+  ├─ dm_topic queued/processing → re-queue Job (private)
+  ├─ intake queued/processing → re-queue Job (needs file id or local path)
+  ├─ uploading → phase=drive, auto Replace
+  ├─ dest → restore dest prompt (waiting)
+  ├─ lang / cover processing → waiting (prompts restored next)
+  └─ else → waiting
+  then restore waiting cover galleries + language prompts
+```
+
+Does **not** expire 24h rows; that is the interval job.
+
+---
+
+### Process: library index warmup
+
+**Trigger:** once, as a background task when polling starts. Failure is logged; bot keeps running.
+
+**Flow:** `ensure_library_index` so `/suggest` and reaction resolve can read Drive/sqlite tags without blocking the first user.
+
+---
+
+### Process: expire pending (24h waiters)
+
+**Trigger:** APScheduler **interval, every 15 minutes** (`run_expire_pending`). Also the **first step** of the daily cleanup cron (same function, not a second implementation).
+
+**Selects:** `status=waiting` and `expires_at <= now`. **Skips** `react_edit` and `react_confirm` (👍/👎/💩/🙏 confirms use a ~10-year `expires_at` so they are not auto-cleared). `react_exit` (✍️ removed, waiting commit/cancel) uses 24h and **is** expired here.
+
+Also retries `cleanup_pending` (delete leftover review-folder Drive file after a promote).
+
+```text
+claim row → status=expiring
+  ├─ phase tags     → write current tags, auto-commit to review
+  │                    (Drive keep-both if name clash)
+  ├─ phase cover    → first cover option, then dest/upload as usual
+  │                    (leader timeout promotes the next album picker)
+  ├─ phase drive    → skip Drive upload, keep local
+  ├─ phase react_exit → discard staged ✍️ copy; “Edit timed out.”
+  └─ else (lang, dest, intake, …)
+        delete pending-root files → status=expired
+        “Expired after 24 hours. Start again.”
+```
+
+Intake / dest / language prompts typically set `expires_at` to **now + 24h**. Cover/tag review same. Failure in this job marks the row `failed`.
+
+---
+
+### Process: daily cleanup
+
+**Trigger:** APScheduler **cron** `CLEANUP_CRON` (env, default `0 3 * * *`, **03:00 UTC**). Timezone UTC.
+
+**Does not run** on the 15-minute timer (except the expire-pending prefix).
+
+```text
+run_cleanup
+  1. expire pending          (same as the 15-minute job)
+  2. Drive retry             tracks status=failed
+  3. drop Drive-confirmed locals
+  4. drop logged-out locals
+  5. drop unused /data/cache entries (7 days)
+  6. forget idle users
+  7. rmdir empty library/review/cache dirs
+  8. drop /data/tmp older than 7 days
+  9. drop /data/covers older than 7 days
+ 10. sweep leftover local Bot API downloads (>24h)
+ 11. prune finished pending_reviews older than 30 days
+       (done / cancelled / expired / skipped)
+ 12. prune expired /suggest sessions + Last.fm cache rows
+ 13. prune empty Drive review subfolders (logged-in users still active)
+```
+
+Skip `processing` / `uploading` when deleting locals. Env admin is never forgotten.
+
+#### Step 2 — Drive retry (`status=failed`)
+
+| Google | What happens |
+| --- | --- |
+| Logged out, or no Drive folder id | **skip** that row |
+| Logged in, local file missing | DM: `Drive retry failed: local file missing.` |
+| Logged in, local present | re-upload audio (+ review sidecar, library cover if missing). Fail → DM `Drive upload failed. Retry later or /login.` |
+
+#### Step 3 — Drop local after Drive has it
+
+Only `status=uploaded` with a `local_path` **and** `drive_file_id`. Wait **7 days** from `uploaded_at` / `created_at`. Then `files.get`: if Drive still has the file, unlink local+sidecar and clear paths. If Drive is missing, mark failed and run the retry in step 2.
+
+Logged-out users never get this path (no successful Drive id).
+
+#### Step 4 — Logged-out locals
+
+User has no refresh token. Local+sidecar older than **7 days** (mtime) deleted; catalog paths cleared. Drive copies are not deleted (there usually are none).
+
+#### Step 6 — Forget idle users
+
+`last_active_at` older than `USER_INACTIVE_MONTHS` (default **3 months**). Skip env admin. Skip if that user still has `queued`/`processing`/`uploading` pending.
+
+Order: **clear Google tokens and folder ids first**, then drop sqlite user index / OAuth tickets / HiFi picks, delete that user’s track rows and their locals. **Drive files already saved stay in Google.**
+
+#### Step 13 — Empty review folders
+
+Only users active within the idle window **and** with a review folder id. `prune_empty_folders` on `Telegram Music Review`. Failure is logged, not DMed.
+
+---
+
+### Not a scheduler (passive TTL, checked on use)
+
+These expire when something **reads** them, not on the 15-minute or daily jobs (except Last.fm/suggest rows, which the daily job also deletes).
+
+| Item | TTL | When it dies |
+| --- | --- | --- |
+| OAuth login ticket / PKCE state | `OAUTH_TICKET_TTL_SECONDS` (default 600s), one-shot | `/oauth/start` or `/oauth/callback` |
+| Mini App `initData` | `INITDATA_MAX_AGE_SECONDS` (default 300s) | each `/api/*` |
+| HiFi result buttons | 1 hour | pick callback |
+| `/suggest` session | 24h | pick/page callback; also daily prune |
+| Last.fm cache rows | 7 days | suggest lookup; also daily prune |
+| Google refresh token (OAuth Testing) | ~7 days (Google, not us) | next Drive call → `needs_login` |
+| Membership cache | 60s (5 min grace on API fail) | next `allow_user` DM check |
 
 ---
 
