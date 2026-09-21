@@ -39,37 +39,41 @@ cp .env.example .env
 
 ## Outbound URLs (egress whitelist)
 
-Production stack needs outbound HTTPS (and a few other ports) to these hosts. Compose-internal `http://telegram-bot-api:8081` stays on the Docker network and is not WAN egress.
+Production stack needs outbound access to these URL patterns (`*` = host or path variation). Compose-internal `http://telegram-bot-api:8081` stays on the Docker network and is not WAN egress.
 
 ### Bot process (`bot` service)
 
-| Purpose | Hosts / URLs |
+| Purpose | URL pattern |
 | --- | --- |
-| Google OAuth token exchange | `https://oauth2.googleapis.com/token` |
-| Google Drive API + userinfo | `https://www.googleapis.com/` (Drive v3, OAuth2 userinfo) |
-| AcoustID fingerprint lookup | `http://api.acoustid.org/v2/` (pyacoustid default; allow `api.acoustid.org`) |
-| MusicBrainz metadata | `https://musicbrainz.org/ws/2/` |
-| Cover Art Archive JSON | `https://coverartarchive.org/` |
-| CAA image bytes (after redirect) | `*.archive.org` (e.g. `ia*.us.archive.org`, `archive.org`) |
-| iTunes search | `https://itunes.apple.com/search` |
-| iTunes / Apple artwork | `*.mzstatic.com` (artwork URLs from search results) |
-| Last.fm API (`/suggest`, tags) | `https://ws.audioscrobbler.com/2.0/` |
-| Synced lyrics | `https://lrclib.net/api/` |
-| HiFi Telethon (MTProto) | Telegram DC endpoints used by Telethon (`*.telegram.org` / Telegram IP ranges; not HTTP) |
-| Custom cover-by-URL (user paste) | Any public `http://` / `https://` image host the user supplies |
-
-Google **browser** consent (user redirect, not server fetch): `https://accounts.google.com/o/oauth2/v2/auth`. Scopes are `…/auth/userinfo.email`, `…/auth/drive.file`, `…/auth/drive.install` on `www.googleapis.com`.
+| Google OAuth token exchange | `https://oauth2.googleapis.com/*` |
+| Google Drive API + userinfo | `https://www.googleapis.com/*` |
+| Google OAuth consent (browser redirect) | `https://accounts.google.com/*` |
+| AcoustID fingerprint lookup | `http://api.acoustid.org/*` |
+| MusicBrainz metadata | `https://musicbrainz.org/*` |
+| Cover Art Archive | `https://coverartarchive.org/*` |
+| CAA image bytes (after redirect) | `https://*.archive.org/*` |
+| iTunes search | `https://itunes.apple.com/*` |
+| iTunes / Apple artwork | `https://*.mzstatic.com/*` |
+| Last.fm API (`/suggest`, tags) | `https://ws.audioscrobbler.com/*` |
+| Synced lyrics | `https://lrclib.net/*` |
+| HiFi Telethon (MTProto) | `*.telegram.org` (plus Telegram DC IP ranges; not HTTP) |
+| Custom cover-by-URL (user paste) | `http://*/*`, `https://*/*` |
 
 ### Local Bot API (`telegram-bot-api` service)
 
-Talks to Telegram’s cloud on behalf of the bot. Allow Telegram Bot API / media hosts used by that image (typically `api.telegram.org` and Telegram DC hosts). Exact set follows the `aiogram/telegram-bot-api` image, not this repo.
+Talks to Telegram’s cloud on behalf of the bot. Allow `https://api.telegram.org/*` and `*.telegram.org` (DC/media hosts used by the `aiogram/telegram-bot-api` image).
 
 ### Browser / Mini App (clients, not the bot server)
 
 Loaded or linked from the Mini App / site; whitelist only if you filter client egress or CSP:
 
-- `https://telegram.org/js/telegram-web-app.js`
-- Suggest / caption links: `https://music.youtube.com/`, `https://www.last.fm/`, `https://www.google.com/search`, `https://musicbrainz.org/`, `https://t.me/`, `https://drive.google.com/`
+- `https://telegram.org/*`
+- `https://music.youtube.com/*`
+- `https://www.last.fm/*`
+- `https://www.google.com/*`
+- `https://musicbrainz.org/*`
+- `https://t.me/*`
+- `https://drive.google.com/*`
 
 Inbound public hosts you terminate TLS for (`PUBLIC_BASE_URL`, e.g. `music.avje.in`, plus `www.music.avje.in`) are reverse-proxy targets, not outbound from the bot.
 
