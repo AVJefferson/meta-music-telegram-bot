@@ -192,6 +192,14 @@ def truthy_setting(value: object) -> bool:
     return bool(value)
 
 
+def notify_group_save_enabled(settings: object) -> bool:
+    """Private note after a group or channel save. Missing key stays on."""
+    data = settings if isinstance(settings, dict) else {}
+    if "notify_group_save" not in data:
+        return True
+    return truthy_setting(data.get("notify_group_save"))
+
+
 def normalize_save_dest(value: object, default: str = "none") -> str:
     dest = str(value or "").strip().casefold()
     if dest in SAVE_DEST_SET:

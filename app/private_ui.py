@@ -202,7 +202,6 @@ async def _show_cover_prompt(ctx: Ctx, row: PendingReview) -> None:
 
 
 async def _show_confirm(ctx: Ctx, row: PendingReview) -> None:
-    from app.authenticity import authenticity_from
     from app.queue import edit_status, tag_preview
     from app.tags import read_audio_metrics
 
@@ -217,7 +216,7 @@ async def _show_confirm(ctx: Ctx, row: PendingReview) -> None:
                 metrics = await asyncio.to_thread(read_audio_metrics, path)
             except Exception:
                 log.debug("confirm audio metrics failed", exc_info=True)
-    preview = tag_preview(tags, metrics, authenticity=authenticity_from(report))
+    preview = tag_preview(tags, metrics)
     await edit_status(
         ctx,
         Job(row.chat_id, None, row.topic_name, "", row.file_name, row.status_message_id, private=True),

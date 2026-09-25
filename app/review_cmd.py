@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from pathlib import Path
 
@@ -13,8 +12,8 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from app.membership import allow_from_callback, allow_user, touch, user_is_bot
 from app.models import Ctx, TrackRecord
 from app.queue import tag_preview
-from app.relocate import hydrate_track_tags, identity_from_track, metrics_from_track, read_tags_for_card
-from app.util import html_esc, safe_link
+from app.relocate import hydrate_track_tags, metrics_from_track, read_tags_for_card
+from app.util import safe_link
 
 log = logging.getLogger(__name__)
 PAGE_SIZE = 8
@@ -47,33 +46,19 @@ def review_list_keyboard(items: list[TrackRecord], page: int) -> InlineKeyboardM
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def format_song_card(track: TrackRecord) -> str:
-    from app.authenticity import authenticity_from
-
+def format_song_card(track: TrackRecord, *, chat_id: int | None = None) -> str:
     tags = read_tags_for_card(track)
-    dest_label = "library" if track.kind == "library" else "review"
-    href = safe_link(track.drive_url)
-    link = f'\nDrive: <a href="{href}">open</a>' if href else ""
-    relative = html_esc(track.relative_path or "")
-    path_line = f"\n<code>{relative}</code>" if relative else ""
-    identity = identity_from_track(track)
-    preview = tag_preview(
-        tags,
-        metrics_from_track(track),
-        authenticity=authenticity_from(_loads_report(track), identity),
-    )
-    return f"{dest_label}\n\n{preview}{link}{path_line}"
-
-
-def _loads_report(track: TrackRecord) -> dict:
-    raw = getattr(track, "source_report_json", None)
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-    except (TypeError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    preview = tag_preview(tags, metrics_from_track(track))
+    resolved = chat_id
+    if resolved is None:
+        raw = getattr(track, "source_chat_id", None)
+        resolved = raw if isinstance(raw, int) else None
+    link = ""
+    if isinstance(resolved, int) and resolved > 0:
+        href = safe_link(getattr(track, "drive_url", None))
+        if href:
+            link = f'\nDrive: <a href="{href}">open</a>'
+    return f"{preview}{link}"
 
 
 async def _sync_drive_review(ctx: Ctx, user_id: int) -> None:
@@ -166,8 +151,8 @@ async def _show_list(message: Message, ctx: Ctx, page: int = 0, *, edit: bool = 
 
 async def _send_card(callback: CallbackQuery, ctx: Ctx, track: TrackRecord) -> None:
     track = await hydrate_track_tags(ctx, track)
-    text = format_song_card(track)
     assert callback.message is not None
+    text = format_song_card(track, chat_id=callback.message.chat.id)
     sent = await callback.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
     ctx.catalog.bind_track_message(track.id, sent.chat.id, sent.message_id)
     thread_id = callback.message.message_thread_id

@@ -16,12 +16,10 @@ from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup
 
 from app.authenticity import (
     analyze_flac,
-    authenticity_from,
     stamp_identity,
     stamp_report,
     unknown_result,
 )
-from app.authenticity import format_line as format_authenticity_line
 from app.botapi import discard_download
 from app.covers import (
     CoverHit,
@@ -42,6 +40,7 @@ from app.formats import (
     SavePrefs,
     extension_from_path,
     mime_for_path,
+    notify_group_save_enabled,
     stored_download_name,
     suffix_for,
     user_save_prefs,
@@ -102,10 +101,9 @@ def quality(bit_depth: int | None, sample_rate: int | None) -> tuple[int, int]:
 
 
 def tag_preview(tags: TagSet, metrics: AudioMetrics | None = None, authenticity=None) -> str:
+    # The check can still run. Song cards and status previews do not print it.
+    del authenticity
     audio = format_audio_block(metrics)
-    line = format_authenticity_line(authenticity)
-    if line:
-        audio = f"{audio}\n{html_esc(line)}"
     return (
         f"<b>{html_esc(tags.title)}</b>\n"
         f"Artist: {html_esc(tags.artist)}\n"
@@ -120,19 +118,32 @@ def tag_preview(tags: TagSet, metrics: AudioMetrics | None = None, authenticity=
 
 
 def _preview(tags: TagSet, identity, path: Path | None = None, report: dict | None = None) -> str:
-    return tag_preview(
-        tags,
-        _metrics_from_identity(identity, path),
-        authenticity=authenticity_from(report, identity),
-    )
+    del report
+    return tag_preview(tags, _metrics_from_identity(identity, path))
 
 
 def _tech_block(identity, path: Path | None = None, report: dict | None = None) -> str:
-    audio = format_audio_block(_metrics_from_identity(identity, path))
-    line = format_authenticity_line(authenticity_from(report, identity))
-    if line:
-        return f"{audio}\n{html_esc(line)}"
-    return audio
+    del report
+    return format_audio_block(_metrics_from_identity(identity, path))
+
+
+def _drive_link(chat_id: int, url: str | None) -> str:
+    if chat_id <= 0:
+        return ""
+    href = safe_link(url)
+    if not href:
+        return ""
+    return f'\nDrive: <a href="{href}">open</a>'
+
+
+def _save_location_text(saved: str, relative: str, extra: str = "") -> str:
+    lines = [saved]
+    note = (extra or "").strip()
+    if note:
+        lines.append(note)
+    if relative:
+        lines.append(f"<code>{html_esc(relative)}</code>")
+    return "\n".join(lines)
 
 
 def _metrics_from_identity(identity, path: Path | None = None) -> AudioMetrics:
@@ -1639,6 +1650,11 @@ def _user_default_dest(ctx: Ctx, user_id: int) -> str:
     return _user_save_prefs(ctx, user_id).dest
 
 
+def _group_save_note_enabled(ctx: Ctx, user_id: int) -> bool:
+    user = ctx.catalog.get_user(user_id) if user_id else None
+    return notify_group_save_enabled(user_settings_dict(user))
+
+
 def _store_user_save_prefs(ctx: Ctx, user_id: int, prefs: SavePrefs) -> None:
     if not user_id:
         return
@@ -2202,8 +2218,7 @@ async def _commit_upload(
             ctx,
             job,
             "Skipped Drive upload. Kept locally.\n\n"
-            f"{_preview(tags, identity, dest, source_report)}\n"
-            f"<code>{html_esc(dest)}</code>",
+            f"{_preview(tags, identity, dest, source_report)}",
         )
         log.info("drive skip track=%s path=%s", skipped_id, relative)
         return dest
@@ -2425,8 +2440,7 @@ async def _commit_upload(
         await edit_status(
             ctx,
             job,
-            f"{fail}\n\n{_preview(tags, identity, dest, source_report)}\n\n"
-            f"<code>{html_esc(dest)}</code>",
+            f"{fail}\n\n{_preview(tags, identity, dest, source_report)}",
         )
         return dest
 
@@ -2440,8 +2454,6 @@ async def _commit_upload(
         saved = "Updated the group file" if (replace_id is not None or correct) else "Tagged (not copied to Drive)"
     else:
         saved = f"Saved ({dest_label})"
-    href = safe_link(url)
-    link = f'\nDrive: <a href="{href}">open</a>' if href else ""
     from app.captions import music_caption
     from app.telegram_file import update_public_audio
 
@@ -2457,12 +2469,7 @@ async def _commit_upload(
         completed = ctx.catalog.get_pending_review(pending_id)
         if completed and completed.telegram_file_id:
             telegram_file_id = completed.telegram_file_id
-    caption = music_caption(
-        tags=tags,
-        relative_path=relative.as_posix(),
-        extra=f"{saved}{extra}",
-        last_editor_user_id=uid or None,
-    )
+    caption = music_caption(tags=tags)
     if public_id:
         new_file = await update_public_audio(
             ctx,
@@ -2482,10 +2489,22 @@ async def _commit_upload(
     await edit_status(
         ctx,
         job,
-        f"{saved} ({identity.confidence} confidence).{extra}\n\n"
-        f"{_preview(tags, identity, dest, source_report)}{link}\n"
-        f"<code>{html_esc(relative.as_posix())}</code>",
+        f"{_preview(tags, identity, dest, source_report)}{_drive_link(job.chat_id, url)}",
     )
+    if job.chat_id <= 0 and uid and _group_save_note_enabled(ctx, uid):
+        from app.ephemeral import send_private
+
+        try:
+            await send_private(
+                ctx,
+                chat_id=job.chat_id,
+                user_id=uid,
+                text=_save_location_text(saved, relative.as_posix(), extra),
+                thread_id=job.thread_id,
+                parse_mode="HTML",
+            )
+        except Exception:
+            log.warning("save location notice failed chat=%s user=%s", job.chat_id, uid)
     index_drive = file_id or None
     if not want_drive:
         existing = ctx.catalog.get_track(track_id)
@@ -2564,7 +2583,6 @@ async def _hold_drive_conflict(
         sample_rate=identity.sample_rate,
         new_size=new_size,
         catalog_note=catalog_note,
-        authenticity=format_authenticity_line(authenticity_from(source_report, identity)),
     )
     fields = dict(
         phase="drive",

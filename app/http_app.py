@@ -15,6 +15,7 @@ from app.formats import (
     normalize_allowed,
     normalize_save_dest,
     normalize_suggest_library,
+    notify_group_save_enabled,
     save_prefs_from_settings,
     truthy_setting,
     user_settings_dict,
@@ -286,6 +287,7 @@ def _save_prefs_payload(settings: dict) -> dict:
         "correct_telegram": prefs.correct_telegram,
         "skip_save_prompt": prefs.skip_save_prompt,
         "delete_original": prefs.delete_original,
+        "notify_group_save": notify_group_save_enabled(settings),
     }
 
 
@@ -412,6 +414,8 @@ async def api_settings(request: web.Request) -> web.Response:
         settings["skip_save_prompt"] = truthy_setting(body.get("skip_save_prompt"))
     if "delete_original" in body:
         settings["delete_original"] = truthy_setting(body.get("delete_original"))
+    if "notify_group_save" in body:
+        settings["notify_group_save"] = truthy_setting(body.get("notify_group_save"))
     if (
         dest is None
         and "allowed_formats" not in body
@@ -420,6 +424,7 @@ async def api_settings(request: web.Request) -> web.Response:
         and "correct_telegram" not in body
         and "skip_save_prompt" not in body
         and "delete_original" not in body
+        and "notify_group_save" not in body
     ):
         settings["default_dest"] = normalize_save_dest(body.get("default_dest"))
     ctx.catalog.update_user(user_id, settings_json=json.dumps(settings))

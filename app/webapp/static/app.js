@@ -51,7 +51,7 @@
   let mainHandler = null;
   const SUGGEST_COUNTS = [10, 20, 50, 100];
   let suggestQuery = new URLSearchParams(location.search).get("q") || "";
-  let suggestCount = 100;
+  let suggestCount = 10;
   let reviewCache = { tracks: null, fetchedAt: 0 };
   let suggestCache = { q: null, n: null, data: null };
   let detailRow = null;
@@ -379,7 +379,7 @@
 
   function suggestCountValue(raw) {
     const n = Number(raw);
-    return SUGGEST_COUNTS.includes(n) ? n : 100;
+    return SUGGEST_COUNTS.includes(n) ? n : 10;
   }
 
   function patchHomeMetrics() {
@@ -440,6 +440,7 @@
     const correct = Boolean(me && me.correct_telegram);
     const skipAsk = Boolean(me && me.skip_save_prompt);
     const deleteOrig = Boolean(me && me.delete_original);
+    const notifySave = !(me && me.notify_group_save === false);
     const adminCard =
       me && me.admin
         ? `<div class="card">
@@ -481,6 +482,12 @@
         }</button>
         <button type="button" class="check-btn${skipAsk ? " is-on" : ""}" data-act="toggle-skip-save">${
           skipAsk ? "Do not ask again on" : "Do not ask again"
+        }</button>
+        <p class="muted mt">After a successful save in a group or channel, send you a private note with the save location. The song card in the chat stays the same.</p>
+        <button type="button" class="check-btn${notifySave ? " is-on" : ""}" data-act="toggle-group-save-note">${
+          notifySave
+            ? "Notify on successful group or channel save on"
+            : "Notify on successful group or channel save"
         }</button>
       </div>
       <div class="card">
@@ -1074,6 +1081,7 @@
         correct_telegram: Boolean(me && me.correct_telegram),
         skip_save_prompt: Boolean(me && me.skip_save_prompt),
         delete_original: Boolean(me && me.delete_original),
+        notify_group_save: !(me && me.notify_group_save === false),
       },
       extra || {},
     );
@@ -1087,6 +1095,7 @@
       me.correct_telegram = data.correct_telegram;
       me.skip_save_prompt = data.skip_save_prompt;
       me.delete_original = data.delete_original;
+      me.notify_group_save = data.notify_group_save;
       return data;
     } catch (err) {
       haptic("error");
@@ -1126,6 +1135,20 @@
     }
     haptic("light");
     await saveSavePrefs({ skip_save_prompt: me.skip_save_prompt });
+  }
+
+  async function toggleGroupSaveNote() {
+    if (!me) return;
+    me.notify_group_save = me.notify_group_save === false;
+    const btn = mainEl.querySelector("[data-act=toggle-group-save-note]");
+    if (btn) {
+      btn.classList.toggle("is-on", me.notify_group_save);
+      btn.textContent = me.notify_group_save
+        ? "Notify on successful group or channel save on"
+        : "Notify on successful group or channel save";
+    }
+    haptic("light");
+    await saveSavePrefs({ notify_group_save: me.notify_group_save });
   }
 
   async function toggleDeleteOriginal() {
@@ -1249,6 +1272,7 @@
     else if (kind === "toggle-correct-tg") toggleCorrectTelegram();
     else if (kind === "toggle-delete-orig") toggleDeleteOriginal();
     else if (kind === "toggle-skip-save") toggleSkipSave();
+    else if (kind === "toggle-group-save-note") toggleGroupSaveNote();
     else if (kind === "save-tags") reviewAction(act.dataset.id, "tags", act);
     else if (kind === "library" || kind === "cancel") reviewAction(act.dataset.id, kind, act);
   });

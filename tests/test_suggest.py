@@ -819,9 +819,9 @@ class RankTests(unittest.TestCase):
         self.assertEqual([item.title for item in only_out], ["Out"])
 
     def test_suggest_count_and_knobs(self) -> None:
-        self.assertEqual(clamp_suggest_count(None), 100)
+        self.assertEqual(clamp_suggest_count(None), 10)
         self.assertEqual(clamp_suggest_count("20"), 20)
-        self.assertEqual(clamp_suggest_count(7), 100)
+        self.assertEqual(clamp_suggest_count(7), 10)
         knobs = suggest_knobs(0.5, "out")
         self.assertAlmostEqual(float(knobs["variety"]), 0.5)
         self.assertEqual(knobs["library_filter"], "out")
