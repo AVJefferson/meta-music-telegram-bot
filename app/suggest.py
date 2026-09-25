@@ -597,7 +597,7 @@ def pick_by_variety(hits: list[Hit], *, variety: float, limit: int) -> list[Hit]
     if limit <= 0 or not hits:
         return []
     spread = _match_float(variety, 0.5)
-    cluster_n = int(round(limit * (1.0 - spread)))
+    cluster_n = round(limit * (1.0 - spread))
     spread_n = limit - cluster_n
     remaining = list(hits)
     picked: list[Hit] = []

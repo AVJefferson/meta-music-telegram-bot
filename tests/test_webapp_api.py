@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from typing import ClassVar
 from unittest.mock import AsyncMock, patch
 
 from aiohttp.test_utils import TestClient, TestServer
@@ -423,7 +424,7 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
         class _Resp:
             status_code = 200
             content = b"\xff\xd8\xff"
-            headers = {"content-type": "image/jpeg"}
+            headers: ClassVar[dict[str, str]] = {"content-type": "image/jpeg"}
 
         class _Http:
             async def get(self, url, **kwargs):
