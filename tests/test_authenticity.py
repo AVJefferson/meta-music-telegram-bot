@@ -133,11 +133,12 @@ class StampAndPreviewTests(unittest.TestCase):
         self.assertEqual(report["authenticity"]["verdict"], "FAKE_CERTAIN")
         self.assertEqual(authenticity_from(report, identity).verdict, "FAKE_CERTAIN")
         preview = tag_preview(TagSet(title="Stay"), AudioMetrics(172, 16, 44100, 987), authenticity=result)
-        self.assertIn("Authenticity: FAKE_CERTAIN", preview)
+        self.assertNotIn("Authenticity:", preview)
         self.assertIn("Format: FLAC", preview)
         self.assertIn("<b>Stay</b>", preview)
         queued = _preview(TagSet(title="Stay"), identity, report=report)
-        self.assertIn("Authenticity: FAKE_CERTAIN", queued)
+        self.assertNotIn("Authenticity:", queued)
+        self.assertIn("<b>Stay</b>", queued)
 
     def test_songlog_has_authenticity_block(self) -> None:
         text = render_songlog(

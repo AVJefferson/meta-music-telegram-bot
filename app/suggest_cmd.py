@@ -36,18 +36,30 @@ log = logging.getLogger(__name__)
 LYRICS_LIMIT = 3500
 
 
-def suggest_label(item: Suggestion) -> str:
-    mark = "✓ " if item.in_library else ""
+def _library_mark(chat_id: int | None) -> bool:
+    """Private chats keep the in-library mark. Group and channel lists drop it."""
+    return chat_id is None or chat_id > 0
+
+
+def suggest_label(item: Suggestion, *, chat_id: int | None = None) -> str:
+    mark = "✓ " if item.in_library and _library_mark(chat_id) else ""
     text = f"{mark}{item.artist} — {item.title}"
     return text[:64]
 
 
-def suggest_list_keyboard(session_id: int, items: list[Suggestion], page: int) -> InlineKeyboardMarkup:
+def suggest_list_keyboard(
+    session_id: int, items: list[Suggestion], page: int, *, chat_id: int | None = None
+) -> InlineKeyboardMarkup:
     pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, pages - 1))
     start = page * PAGE_SIZE
     rows = [
-        [InlineKeyboardButton(text=suggest_label(item), callback_data=f"sgt:{session_id}:{start + offset}")]
+        [
+            InlineKeyboardButton(
+                text=suggest_label(item, chat_id=chat_id),
+                callback_data=f"sgt:{session_id}:{start + offset}",
+            )
+        ]
         for offset, item in enumerate(items[start : start + PAGE_SIZE])
     ]
     nav: list[InlineKeyboardButton] = []
@@ -60,10 +72,10 @@ def suggest_list_keyboard(session_id: int, items: list[Suggestion], page: int) -
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def format_suggest_card(item: Suggestion) -> str:
+def format_suggest_card(item: Suggestion, *, chat_id: int | None = None) -> str:
     title = html_esc(item.title)
     artist = html_esc(item.artist)
-    owned = "\nIn library" if item.in_library else ""
+    owned = "\nIn library" if item.in_library and _library_mark(chat_id) else ""
     why = f"\n{html_esc(item.why)}" if item.why else ""
     href = safe_link(item.url)
     lastfm = f'\nLast.fm: <a href="{href}">open</a>' if href else ""
@@ -147,10 +159,13 @@ def _page_items(items: list[Suggestion], page: int) -> tuple[int, list[Suggestio
     return page, items[start : start + PAGE_SIZE]
 
 
-def _list_text(page: int, pages: int, language: str | None, query: str) -> str:
+def _list_text(
+    page: int, pages: int, language: str | None, query: str, *, chat_id: int | None = None
+) -> str:
     scope = html_esc(language) if language else "all languages"
     extra = f" · {html_esc(query)}" if query else ""
-    return f"<b>Suggestions</b> — {scope}{extra}\npage {page + 1}/{pages}\n✓ = in library. Pick a row."
+    legend = "\n✓ = in library. Pick a row." if _library_mark(chat_id) else "\nPick a row."
+    return f"<b>Suggestions</b> — {scope}{extra}\npage {page + 1}/{pages}{legend}"
 
 
 def _mark_page(ctx: Ctx, user_id: int, items: list[Suggestion], page: int) -> None:
@@ -174,10 +189,11 @@ async def _show_session(
     pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, pages - 1))
     _mark_page(ctx, user_id, items, page)
+    chat_id = message.chat.id
     await _deliver(
         message,
-        _list_text(page, pages, language, query),
-        suggest_list_keyboard(session_id, items, page),
+        _list_text(page, pages, language, query, chat_id=chat_id),
+        suggest_list_keyboard(session_id, items, page, chat_id=chat_id),
         edit=edit,
     )
 
@@ -316,8 +332,8 @@ def _lyrics_filename(item: Suggestion) -> str:
     return f"{stem[:80]}.lrc"
 
 
-def format_lyrics_text(item: Suggestion, lyrics: str) -> str:
-    header = format_suggest_card(item)
+def format_lyrics_text(item: Suggestion, lyrics: str, *, chat_id: int | None = None) -> str:
+    header = format_suggest_card(item, chat_id=chat_id)
     if not lyrics.strip():
         return f"{header}\n\nNo lyrics found."
     kind = "Synced lyrics" if is_synced_lrc(lyrics) else "Lyrics"
@@ -395,11 +411,11 @@ async def _send_lyrics_payload(
         kwargs["message_thread_id"] = thread_id
     if reply_to:
         kwargs["reply_to_message_id"] = reply_to
-    body = format_lyrics_text(item, lyrics)
+    body = format_lyrics_text(item, lyrics, chat_id=chat_id)
     too_long = bool(lyrics) and len(body) >= LYRICS_LIMIT - 20
     want_file = bool(lyrics) and (as_file or too_long or (is_synced_lrc(lyrics) and len(lyrics) > 1200))
     if want_file:
-        caption = clip_html(format_suggest_card(item), 900)
+        caption = clip_html(format_suggest_card(item, chat_id=chat_id), 900)
         try:
             await ctx.bot.send_document(
                 chat_id,
@@ -443,7 +459,7 @@ async def _deliver_suggestion(callback: CallbackQuery, ctx: Ctx, item: Suggestio
         await _send_lyrics_payload(ctx, current.chat.id, item, lyrics, as_file=True)
         return
     await current.answer(
-        format_suggest_card(item),
+        format_suggest_card(item, chat_id=current.chat.id),
         parse_mode="HTML",
         disable_web_page_preview=True,
     )

@@ -386,8 +386,6 @@ def _card_hint(row: PendingReview, field: str | None) -> str:
 
 
 def _tech_for_row(row: PendingReview) -> str:
-    from app.authenticity import authenticity_from
-    from app.authenticity import format_line as format_authenticity_line
     from app.tags import AudioMetrics, read_audio_metrics
 
     raw = _loads(row.identity_json, {}) or {}
@@ -424,9 +422,6 @@ def _tech_for_row(row: PendingReview) -> str:
                 bitrate_kbps=bitrate_kbps or None,
             )
         )
-    line = format_authenticity_line(authenticity_from(report, ident_report))
-    if line:
-        return f"{audio}\n{html_esc(line)}"
     return audio
 
 
@@ -469,7 +464,7 @@ async def show_saved_card(ctx: Ctx, row: PendingReview, *, prefix: str = "", fal
     if track is None:
         await edit_status(ctx, _job_from_pending(row), prefix or "Done.", fallback_send=fallback_send)
         return
-    text = format_song_card(track)
+    text = format_song_card(track, chat_id=row.chat_id)
     if prefix:
         text = f"{prefix}\n\n{text}"
     await edit_status(ctx, _job_from_pending(row), text, fallback_send=fallback_send)

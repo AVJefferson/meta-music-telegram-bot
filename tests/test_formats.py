@@ -13,6 +13,7 @@ from app.formats import (
     mime_for_path,
     normalize_allowed,
     normalize_save_dest,
+    notify_group_save_enabled,
     save_prefs_from_settings,
     stored_download_name,
     suffix_for,
@@ -66,6 +67,10 @@ class FormatRegistryTests(unittest.TestCase):
         self.assertEqual(user_save_prefs(None), SavePrefs())
         user = SimpleNamespace(settings_json="{not json")
         self.assertEqual(user_save_prefs(user), SavePrefs())
+        self.assertTrue(notify_group_save_enabled({}))
+        self.assertTrue(notify_group_save_enabled({"notify_group_save": True}))
+        self.assertFalse(notify_group_save_enabled({"notify_group_save": False}))
+        self.assertFalse(notify_group_save_enabled({"notify_group_save": "off"}))
 
     def test_message_allowlist(self) -> None:
         mp3 = SimpleNamespace(

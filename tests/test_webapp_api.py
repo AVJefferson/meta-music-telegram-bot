@@ -216,9 +216,9 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
                     resp_bad = await client.get("/api/suggest?n=7", headers=_headers())
                     self.assertEqual(resp_20.status, 200)
                     self.assertEqual(resp_bad.status, 200)
-            self.assertEqual(sug.await_args_list[0].kwargs["limit"], 100)
+            self.assertEqual(sug.await_args_list[0].kwargs["limit"], 10)
             self.assertEqual(sug.await_args_list[1].kwargs["limit"], 20)
-            self.assertEqual(sug.await_args_list[2].kwargs["limit"], 100)
+            self.assertEqual(sug.await_args_list[2].kwargs["limit"], 10)
             self.assertTrue(data["ok"])
             self.assertFalse(data["lastfm"])
             self.assertIs(data["results"][0]["in_library"], True)
@@ -284,6 +284,7 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(data["correct_telegram"])
             self.assertFalse(data["skip_save_prompt"])
             self.assertFalse(data["delete_original"])
+            self.assertTrue(data["notify_group_save"])
 
     async def test_draft_rejected_and_tags_action(self) -> None:
         directory, catalog = temp_catalog()
@@ -370,6 +371,32 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(stored["correct_telegram"])
             self.assertTrue(stored["skip_save_prompt"])
             self.assertTrue(stored["delete_original"])
+
+    async def test_settings_group_save_note_defaults_on(self) -> None:
+        directory, catalog = temp_catalog()
+        with directory:
+            catalog.ensure_user(11)
+            catalog.update_user(11, settings_json=json.dumps({"default_dest": "library"}))
+            ctx = make_ctx(catalog)
+            app = create_http_app(ctx)
+            async with TestClient(TestServer(app)) as client:
+                me = await client.get("/api/me", headers=_headers())
+                me_data = await me.json()
+                saved = await client.post(
+                    "/api/settings",
+                    headers=_headers(**{"Content-Type": "application/json"}),
+                    data=json.dumps({"notify_group_save": False}),
+                )
+                saved_data = await saved.json()
+                again = await client.get("/api/me", headers=_headers())
+                again_data = await again.json()
+            self.assertTrue(me_data["notify_group_save"])
+            self.assertFalse(saved_data["notify_group_save"])
+            self.assertEqual(saved_data["default_dest"], "library")
+            self.assertFalse(again_data["notify_group_save"])
+            stored = json.loads(catalog.get_user(11).settings_json)
+            self.assertFalse(stored["notify_group_save"])
+            self.assertEqual(stored["default_dest"], "library")
 
     async def test_suggest_art_returns_urls(self) -> None:
         from dataclasses import replace
