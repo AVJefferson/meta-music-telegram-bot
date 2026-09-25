@@ -35,6 +35,7 @@
     suggest: "Suggest",
     settings: "Settings",
     login: "Connect Drive",
+    admin: "Admin",
   };
 
   let me = null;
@@ -48,9 +49,11 @@
   let polling = false;
   let autoLoginDone = false;
   let mainHandler = null;
+  const SUGGEST_COUNTS = [10, 20, 50, 100];
   let suggestQuery = new URLSearchParams(location.search).get("q") || "";
+  let suggestCount = 100;
   let reviewCache = { tracks: null, fetchedAt: 0 };
-  let suggestCache = { q: null, data: null };
+  let suggestCache = { q: null, n: null, data: null };
   let detailRow = null;
 
   function esc(value) {
@@ -65,7 +68,7 @@
     const parts = location.pathname.replace(/\/+$/, "").split("/");
     const last = parts.pop() || "home";
     if (last === "app" || last === "home" || last === "") return "home";
-    if (["login", "settings", "review", "suggest"].includes(last)) return last;
+    if (["login", "settings", "review", "suggest", "admin"].includes(last)) return last;
     return "home";
   }
 
@@ -127,7 +130,7 @@
 
   function showTabs() {
     tabs.hidden = false;
-    const active = page === "login" ? "settings" : page;
+    const active = page === "login" || page === "admin" ? "settings" : page;
     tabs.querySelectorAll("button").forEach((btn) => {
       btn.classList.toggle("is-on", btn.dataset.page === active);
     });
@@ -150,6 +153,23 @@
 
   function skeletons(n) {
     return Array.from({ length: n }, () => '<div class="skel"></div>').join("");
+  }
+
+  function formatBytes(value) {
+    const n = Number(value) || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / (1024 * 1024)).toFixed(1) + " MB";
+  }
+
+  function formatUptime(seconds) {
+    const s = Math.max(0, Math.floor(Number(seconds) || 0));
+    const d = Math.floor(s / 86400);
+    const h = Math.floor((s % 86400) / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    if (d) return d + "d " + h + "h";
+    if (h) return h + "h " + m + "m";
+    return m + "m";
   }
 
   function formatSince(iso) {
@@ -335,6 +355,33 @@
     return Math.min(1, Math.max(0, n));
   }
 
+  function libraryFilter() {
+    const raw = me && me.suggest_library;
+    if (raw === "in" || raw === "out" || raw === "any") return raw;
+    return "any";
+  }
+
+  function librarySeg(current) {
+    const opts = [
+      ["in", "In library"],
+      ["any", "Any"],
+      ["out", "Not in library"],
+    ];
+    return `<div class="seg library" role="radiogroup" aria-label="Which songs to suggest">
+      ${opts
+        .map(
+          ([id, label]) =>
+            `<button type="button" class="seg-btn${current === id ? " is-on" : ""}" data-library="${id}">${label}</button>`,
+        )
+        .join("")}
+    </div>`;
+  }
+
+  function suggestCountValue(raw) {
+    const n = Number(raw);
+    return SUGGEST_COUNTS.includes(n) ? n : 100;
+  }
+
   function patchHomeMetrics() {
     if (page !== "home" || !me) return;
     const map = [
@@ -389,11 +436,19 @@
     const email = (me && me.google_email) || "Drive on";
     const months = me && me.inactive_months != null ? me.inactive_months : 3;
     const sim = Math.round(similarityValue() * 100);
-    const allow = Boolean(me && me.suggest_allow_dissimilar);
+    const library = libraryFilter();
     const correct = Boolean(me && me.correct_telegram);
     const skipAsk = Boolean(me && me.skip_save_prompt);
     const deleteOrig = Boolean(me && me.delete_original);
-    return `
+    const adminCard =
+      me && me.admin
+        ? `<div class="card">
+        <h2>Admin</h2>
+        <p class="muted">Users, groups, channels, activity, and this server.</p>
+        <button type="button" class="btn btn-primary mt" data-go="admin">Open admin</button>
+      </div>`
+        : "";
+    return adminCard + `
       <div class="card">
         <div class="row-between">
           <h2>Google Drive</h2>
@@ -408,12 +463,11 @@
       </div>
       <div class="card">
         <h2>Suggestions</h2>
-        <p class="muted">How close results should stay to songs you already know.</p>
-        <input class="slider" id="sim-slider" type="range" min="0" max="100" value="${sim}" aria-label="Familiarity">
-        <div class="slider-row"><span>Explorer</span><span>Familiar</span></div>
-        <button type="button" class="check-btn${allow ? " is-on" : ""}" data-act="toggle-dissimilar">${
-          allow ? "Unlike-library songs on" : "Allow songs unlike your library"
-        }</button>
+        <p class="muted">How varied the suggestions are from each other. Left clusters them together. Middle is about half similar and half spread out. Right spreads them apart.</p>
+        <input class="slider" id="sim-slider" type="range" min="0" max="100" value="${sim}" aria-label="How varied suggestions are from each other">
+        <div class="slider-row"><span>Similar</span><span>Half and half</span><span>Spread out</span></div>
+        <p class="muted mt">Which songs can show up.</p>
+        ${librarySeg(library)}
       </div>
       <div class="card">
         <h2>Default save</h2>
@@ -441,6 +495,111 @@
     hideMainButton();
     setWaiting(false);
     mainEl.innerHTML = settingsBody();
+  }
+
+  function barChart(items) {
+    const max = Math.max(1, ...items.map((item) => Number(item.value) || 0));
+    const cols = items
+      .map((item) => {
+        const h = Math.round(((Number(item.value) || 0) / max) * 100);
+        return `<div class="bar-col"><div class="bar" style="--h:${h}%" title="${esc(item.label)}: ${esc(item.value)}"></div></div>`;
+      })
+      .join("");
+    const marks = [items[0], items[Math.floor(items.length / 2)], items[items.length - 1]].filter(Boolean);
+    return `<div class="bars">${cols}</div><div class="bar-scale">${marks
+      .map((item) => `<span>${esc(item.axis || item.label)}</span>`)
+      .join("")}</div>`;
+  }
+
+  function adminPerson(row) {
+    const bits = [`<code>${esc(row.id)}</code>`];
+    if (row.username) bits.push("@" + esc(String(row.username).replace(/^@/, "")));
+    if (row.name) bits.push(esc(row.name));
+    return `<li><div>${bits.join(" ")}</div><p class="muted">${esc(formatSince(row.last_active))} · ${esc(row.songs_edited || 0)} edited</p></li>`;
+  }
+
+  function adminChat(row) {
+    const handle = row.username ? "@" + String(row.username).replace(/^@/, "") : "";
+    const label = [row.title || "", handle].filter(Boolean).join(" ");
+    const blocked = row.blocked ? ` <span class="pill">blocked</span>` : "";
+    const text = label ? esc(label) : esc(row.id);
+    return `<li><div><code>${esc(row.id)}</code> ${text}${blocked}</div><p class="muted">${esc(row.type || "chat")} · ${esc(formatSince(row.last_active))}</p></li>`;
+  }
+
+  function adminList(title, rows, renderRow, empty) {
+    const body = rows && rows.length ? `<ul class="admin-list">${rows.map(renderRow).join("")}</ul>` : `<p class="muted">${esc(empty)}</p>`;
+    return `<div class="card"><h2>${esc(title)}</h2>${body}</div>`;
+  }
+
+  function paintAdmin(data) {
+    const counts = data.counts || {};
+    const activity = data.activity || {};
+    const usage = data.usage || {};
+    const server = data.server || {};
+    const hours = Array.isArray(activity.hours) ? activity.hours : [];
+    const hourItems = Array.from({ length: 24 }, (_, hour) => ({
+      value: hours[hour] || 0,
+      label: String(hour).padStart(2, "0"),
+      axis: hour % 6 === 0 ? String(hour) : "",
+    }));
+    const days = Array.isArray(usage.days) ? usage.days : [];
+    const dayItems = days.map((day) => ({
+      value: day.count || 0,
+      label: day.date || "",
+      axis: (day.date || "").slice(5),
+    }));
+    mainEl.innerHTML = `
+      <div class="metrics">
+        <div class="metric"><strong>${esc(counts.users || 0)}</strong><span>Users</span></div>
+        <div class="metric"><strong>${esc(counts.groups || 0)}</strong><span>Groups</span></div>
+        <div class="metric"><strong>${esc(counts.channels || 0)}</strong><span>Channels</span></div>
+        <div class="metric"><strong>${esc(counts.blacklisted || 0)}</strong><span>Blacklisted</span></div>
+        <div class="metric"><strong>${esc(activity.active_24h || 0)}</strong><span>Active 24h</span></div>
+        <div class="metric"><strong>${esc(activity.active_7d || 0)}</strong><span>Active 7d</span></div>
+      </div>
+      ${adminList("Users", data.users, adminPerson, "No users yet.")}
+      ${adminList("Groups", data.groups, adminChat, "No groups yet.")}
+      ${adminList("Channels", data.channels, adminChat, "No channels yet.")}
+      <div class="card">
+        <h2>Saves by hour</h2>
+        <p class="muted">UTC hour from track saves.</p>
+        ${barChart(hourItems)}
+      </div>
+      <div class="card">
+        <h2>Saves per day</h2>
+        <p class="muted">Last 14 days.</p>
+        ${dayItems.length ? barChart(dayItems) : `<p class="muted">No saves yet.</p>`}
+      </div>
+      <div class="metrics">
+        <div class="metric"><strong>${esc(formatBytes(server.rss_bytes))}</strong><span>Memory</span></div>
+        <div class="metric"><strong>${esc(formatBytes(server.sqlite_bytes))}</strong><span>Database</span></div>
+        <div class="metric"><strong>${esc(formatUptime(server.uptime_seconds))}</strong><span>Uptime</span></div>
+      </div>`;
+  }
+
+  async function renderAdmin(gen, signal) {
+    hideMainButton();
+    setWaiting(false);
+    if (!me || !me.admin) {
+      page = "settings";
+      history.replaceState({ page: "settings" }, "", "/app/settings");
+      heading.textContent = TITLES.settings;
+      renderSettings();
+      showTabs();
+      return;
+    }
+    showTabs();
+    mainEl.innerHTML = skeletons(4);
+    let data;
+    try {
+      data = await api("/api/admin/overview", { signal });
+    } catch (err) {
+      if (err && err.aborted) return;
+      if (!stillOn(gen, "admin")) return;
+      throw err;
+    }
+    if (!stillOn(gen, "admin")) return;
+    paintAdmin(data);
   }
 
   function renderLoginIdle() {
@@ -619,10 +778,17 @@
   }
 
   function suggestFormHtml() {
+    const options = SUGGEST_COUNTS.map(
+      (n) => `<option value="${n}"${n === suggestCount ? " selected" : ""}>${n}</option>`,
+    ).join("");
     return `<form class="search" id="suggest-form">
       <input type="search" name="q" value="${esc(suggestQuery)}" placeholder="Artist, mood, or leave blank" enterkeyhint="search">
       <button class="btn btn-primary" type="submit">Go</button>
-    </form><div id="suggest-results"></div>`;
+    </form>
+    <label class="count-field">How many
+      <select id="suggest-count" name="n" aria-label="How many songs">${options}</select>
+    </label>
+    <div id="suggest-results"></div>`;
   }
 
   function ensureSuggestShell() {
@@ -677,18 +843,22 @@
     ensureSuggestShell();
     const input = mainEl.querySelector("#suggest-form [name=q]");
     if (input && document.activeElement !== input) input.value = suggestQuery;
-    const cached = suggestCache.data && suggestCache.q === suggestQuery;
+    const count = suggestCountValue(
+      (document.getElementById("suggest-count") && document.getElementById("suggest-count").value) || suggestCount,
+    );
+    const cached = suggestCache.data && suggestCache.q === suggestQuery && suggestCache.n === count;
     if (cached && !force) {
       paintSuggestResults(suggestCache.data);
       return;
     }
     const box = document.getElementById("suggest-results");
     if (box) box.innerHTML = skeletons(3);
-    const data = await api("/api/suggest?q=" + encodeURIComponent(suggestQuery), {
-      signal: pageAbort && pageAbort.signal,
-    });
+    const data = await api(
+      "/api/suggest?q=" + encodeURIComponent(suggestQuery) + "&n=" + encodeURIComponent(count),
+      { signal: pageAbort && pageAbort.signal },
+    );
     if (!still()) return;
-    suggestCache = { q: suggestQuery, data };
+    suggestCache = { q: suggestQuery, n: count, data };
     paintSuggestResults(data);
   }
 
@@ -699,6 +869,12 @@
     }
   }
 
+  function coverSrc(url) {
+    const params = new URLSearchParams({ u: url });
+    if (tg && tg.initData) params.set("initData", tg.initData);
+    return "/api/suggest/cover?" + params.toString();
+  }
+
   function paintCarousel(urls) {
     const el = document.getElementById("art-carousel");
     if (!el) return;
@@ -707,7 +883,10 @@
       return;
     }
     el.innerHTML = urls
-      .map((url) => `<img src="${esc(url)}" alt="" loading="lazy" decoding="async">`)
+      .map(
+        (url) =>
+          `<img src="${esc(coverSrc(url))}" alt="" referrerpolicy="no-referrer" decoding="async">`,
+      )
       .join("");
   }
 
@@ -820,6 +999,8 @@
       } else if (page === "suggest") {
         showTabs();
         await loadSuggest(suggestQuery, { gen, force: false });
+      } else if (page === "admin") {
+        await renderAdmin(gen, signal);
       }
     } catch (err) {
       if (err && err.aborted) return;
@@ -986,7 +1167,7 @@
     const body = Object.assign(
       {
         suggest_similarity: similarityValue(),
-        suggest_allow_dissimilar: Boolean(me && me.suggest_allow_dissimilar),
+        suggest_library: libraryFilter(),
       },
       extra || {},
     );
@@ -997,7 +1178,7 @@
         body: JSON.stringify(body),
       });
       me.suggest_similarity = data.suggest_similarity;
-      me.suggest_allow_dissimilar = data.suggest_allow_dissimilar;
+      me.suggest_library = data.suggest_library;
     } catch (err) {
       haptic("error");
       showBanner(err);
@@ -1011,18 +1192,15 @@
     simTimer = setTimeout(() => saveSuggestPrefs(), 280);
   }
 
-  async function toggleDissimilar() {
+  async function setLibraryFilter(value) {
     if (!me) return;
-    me.suggest_allow_dissimilar = !me.suggest_allow_dissimilar;
-    const btn = mainEl.querySelector("[data-act=toggle-dissimilar]");
-    if (btn) {
-      btn.classList.toggle("is-on", me.suggest_allow_dissimilar);
-      btn.textContent = me.suggest_allow_dissimilar
-        ? "Unlike-library songs on"
-        : "Allow songs unlike your library";
-    }
+    const next = value === "in" || value === "out" ? value : "any";
+    me.suggest_library = next;
+    mainEl.querySelectorAll("[data-library]").forEach((btn) => {
+      btn.classList.toggle("is-on", btn.dataset.library === next);
+    });
     haptic("light");
-    await saveSuggestPrefs({ suggest_allow_dissimilar: me.suggest_allow_dissimilar });
+    await saveSuggestPrefs({ suggest_library: next });
   }
 
   async function unlinkDrive() {
@@ -1068,7 +1246,6 @@
     else if (kind === "cancel-login") cancelConnect();
     else if (kind === "unlink") unlinkDrive();
     else if (kind === "suggest-back") closeSuggestDetail();
-    else if (kind === "toggle-dissimilar") toggleDissimilar();
     else if (kind === "toggle-correct-tg") toggleCorrectTelegram();
     else if (kind === "toggle-delete-orig") toggleDeleteOriginal();
     else if (kind === "toggle-skip-save") toggleSkipSave();
@@ -1081,10 +1258,23 @@
     if (dest) setDest(dest.dataset.dest);
     const fmt = event.target.closest("[data-format]");
     if (fmt) toggleFormat(fmt.dataset.format);
+    const library = event.target.closest("[data-library]");
+    if (library) setLibraryFilter(library.dataset.library);
   });
 
   mainEl.addEventListener("input", (event) => {
     if (event.target && event.target.id === "sim-slider") onSimInput(event.target.value);
+  });
+
+  mainEl.addEventListener("change", (event) => {
+    if (!event.target || event.target.id !== "suggest-count") return;
+    suggestCount = suggestCountValue(event.target.value);
+    suggestCache = { q: null, n: null, data: null };
+    loadSuggest(suggestQuery, { gen: renderGen, force: true }).catch((err) => {
+      if (err && err.aborted) return;
+      haptic("error");
+      showBanner(err);
+    });
   });
 
   mainEl.addEventListener("submit", (event) => {
@@ -1092,7 +1282,7 @@
     if (!form) return;
     event.preventDefault();
     const q = (form.q && form.q.value) || "";
-    suggestCache = { q: null, data: null };
+    suggestCache = { q: null, n: null, data: null };
     go("suggest", q);
   });
 

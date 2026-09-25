@@ -113,6 +113,7 @@ Unknown `/foo` is ignored (no help dump).
 | `/app/settings` | `POST /api/settings` | See [Settings](#5-settings). |
 | `/app/review` | `GET /api/review`, `POST /api/review/{id}/action` | `library` / `tags` relocate; `cancel` deletes **your** copy. |
 | `/app/suggest` | `GET /api/suggest`, `/api/suggest/art` | Same Last.fm path as `/suggest`. |
+| `/app/admin` | `GET /api/admin/overview` | Env admin only. Users, groups, channels (title and @username), activity, and server stats; list commands show those name fields too. |
 
 ---
 

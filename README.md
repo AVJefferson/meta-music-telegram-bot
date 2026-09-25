@@ -102,6 +102,8 @@ That profile mounts `/data/cache` only. Never sqlite, refresh tokens, or `hifi.s
 
 Admin (env admin only, private/ephemeral lists): `/listusers` `/listgroups` `/listchannels` `/blockuser` `/unblockuser`
 
+List lines include @username and display name when Telegram has sent them; Mini App Settings opens `/app/admin` for that env admin (users, groups, channels, activity, server).
+
 Everyone allowed: `/start` `/login` `/settings` `/review` `/suggest`  
 Search: **off** until a user Telethon session can talk to HiFiAudioBot (`SEARCH_ENABLED` in `app/user_cmd.py`). Send audio instead. `/get`, DM song names, and `@bot` search reply with that.
 

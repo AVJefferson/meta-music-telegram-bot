@@ -18,7 +18,7 @@ from aiogram.types import (
 
 from app.ephemeral import send_private
 from app.errors import AppError
-from app.membership import allow_user, check_search_rate, is_admin, touch, user_is_bot
+from app.membership import allow_user, check_search_rate, is_admin, profile_fields, touch, user_is_bot
 from app.models import Ctx
 from app.oauth import issue_login_ticket, public_base_url
 from app.util import html_esc
@@ -102,7 +102,7 @@ def build_user_command_router() -> Router:
             if message.chat.type == "private":
                 await message.reply("Private access requires membership in a known group.")
             return
-        user = ctx.catalog.touch_user(message.from_user.id)
+        user = ctx.catalog.touch_user(message.from_user.id, **profile_fields(message.from_user))
         months = int(getattr(ctx.settings, "user_inactive_months", 3) or 3)
         cmds = ["/start", "/login", "/settings", "/review", "/suggest"]
         if SEARCH_ENABLED:
@@ -137,7 +137,7 @@ def build_user_command_router() -> Router:
             return
         if not await allow_user(ctx, message.from_user.id, message.chat):
             return
-        touch(ctx, message.from_user.id)
+        touch(ctx, message.from_user.id, message.from_user)
         try:
             ticket_url = issue_login_ticket(ctx, message.from_user.id)
         except AppError as exc:
@@ -160,7 +160,7 @@ def build_user_command_router() -> Router:
             return
         if not await allow_user(ctx, message.from_user.id, message.chat):
             return
-        user = ctx.catalog.touch_user(message.from_user.id)
+        user = ctx.catalog.touch_user(message.from_user.id, **profile_fields(message.from_user))
         months = int(getattr(ctx.settings, "user_inactive_months", 3) or 3)
         kb = _web_or_url_keyboard(ctx, "settings", None, "Open settings")
         text = (
@@ -206,7 +206,7 @@ async def _start_search(ctx: Ctx, message: Message, query: str) -> None:
             ctx, chat_id=message.chat.id, user_id=user_id, text=SEARCH_DISABLED_TEXT
         )
         return
-    touch(ctx, user_id)
+    touch(ctx, user_id, message.from_user)
     try:
         check_search_rate(ctx, user_id)
     except AppError as exc:

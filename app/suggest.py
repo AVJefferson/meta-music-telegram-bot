@@ -11,7 +11,7 @@ from urllib.parse import quote
 
 import httpx
 
-from app.formats import clamp_suggest_similarity, detect_format, suggest_allow_dissimilar, user_settings_dict
+from app.formats import detect_format, normalize_suggest_library, user_settings_dict
 from app.genre import GenreMapper, genre_tokens
 from app.models import TagSet, TrackRecord
 from app.relocate import tags_from_track
@@ -28,6 +28,8 @@ SIMILAR_TRACK_LIMIT = 15
 TOP_TRACK_LIMIT = 10
 SIMILAR_ARTIST_TRACK_LIMIT = 8
 MAX_RESULTS = 40
+SUGGEST_COUNTS = (10, 20, 50, 100)
+DEFAULT_SUGGEST_COUNT = 100
 PER_ARTIST_CAP = 2
 MIN_SIMILAR_MATCH = 0.1
 CACHE_DAYS = 7
@@ -107,9 +109,9 @@ class Suggestion:
 
 
 class LastfmAPI(Protocol):
-    async def similar_artists(self, artist: str) -> list[SimilarArtist]: ...
+    async def similar_artists(self, artist: str, limit: int = SIMILAR_ARTIST_LIMIT) -> list[SimilarArtist]: ...
 
-    async def similar_tracks(self, artist: str, title: str) -> list[SimilarTrack]: ...
+    async def similar_tracks(self, artist: str, title: str, limit: int = SIMILAR_TRACK_LIMIT) -> list[SimilarTrack]: ...
 
     async def top_tracks(self, artist: str, limit: int = 10) -> list[SimilarTrack]: ...
 
@@ -150,13 +152,49 @@ def lastfm_track_url(artist: str, title: str) -> str:
     return f"https://www.last.fm/music/{artist_part}/_/{title_part}"
 
 
-def suggest_knobs(similarity: float = 0.5, allow_dissimilar: bool = False) -> dict[str, float | bool]:
-    sim = _match_float(similarity, 0.5)
-    min_match = 0.0 if allow_dissimilar else (0.15 + 0.45 * sim)
+def clamp_suggest_count(value: object, default: int = DEFAULT_SUGGEST_COUNT) -> int:
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        number = default
+    if number in SUGGEST_COUNTS:
+        return number
+    return default if default in SUGGEST_COUNTS else DEFAULT_SUGGEST_COUNT
+
+
+def suggest_knobs(similarity: float = 0.5, library: object = "any") -> dict[str, float | str]:
+    # Stored slider: 0 clusters suggestions together, 1 spreads them apart.
     return {
-        "min_match": min_match,
-        "seed_weight": 0.08 + 0.14 * sim,
-        "library_ratio": 0.25 + 0.5 * sim,
+        "variety": _match_float(similarity, 0.5),
+        "library_filter": normalize_suggest_library(library),
+    }
+
+
+def fetch_caps(limit: int) -> dict[str, int]:
+    count = max(1, int(limit))
+    if count <= MAX_RESULTS:
+        return {
+            "seed_artists": SEED_ARTIST_CAP,
+            "seed_tracks": SEED_TRACK_CAP,
+            "similar_artists": SIMILAR_ARTIST_CAP,
+            "similar_artist_fetch": SIMILAR_ARTIST_LIMIT,
+            "top_tracks": TOP_TRACK_LIMIT,
+            "similar_tracks": SIMILAR_TRACK_LIMIT,
+            "similar_artist_tracks": SIMILAR_ARTIST_TRACK_LIMIT,
+        }
+    scale = count / float(MAX_RESULTS)
+
+    def grow(base: int, cap: int) -> int:
+        return min(cap, max(base, round(base * scale)))
+
+    return {
+        "seed_artists": grow(SEED_ARTIST_CAP, 24),
+        "seed_tracks": grow(SEED_TRACK_CAP, 20),
+        "similar_artists": grow(SIMILAR_ARTIST_CAP, 24),
+        "similar_artist_fetch": grow(SIMILAR_ARTIST_LIMIT, 50),
+        "top_tracks": grow(TOP_TRACK_LIMIT, 25),
+        "similar_tracks": grow(SIMILAR_TRACK_LIMIT, 25),
+        "similar_artist_tracks": grow(SIMILAR_ARTIST_TRACK_LIMIT, 15),
     }
 
 
@@ -536,6 +574,71 @@ def score_hit(
     return score
 
 
+def hit_similarity(left: Hit, right: Hit) -> float:
+    if owned_key(left.artist, left.title) == owned_key(right.artist, right.title):
+        return 1.0
+    score = 0.0
+    if normalize_match_text(primary_artist(left.artist)) == normalize_match_text(primary_artist(right.artist)):
+        score += 0.7
+    left_tags = {item.casefold() for item in (*left.tags, *left.artist_tags, *left.seed_tokens) if item}
+    right_tags = {item.casefold() for item in (*right.tags, *right.artist_tags, *right.seed_tokens) if item}
+    if left_tags and right_tags:
+        score += 0.3 * (len(left_tags & right_tags) / len(left_tags | right_tags))
+    return min(1.0, score)
+
+
+def _similarity_to_picked(hit: Hit, picked: list[Hit]) -> float:
+    if not picked:
+        return 0.0
+    return sum(hit_similarity(hit, other) for other in picked) / len(picked)
+
+
+def pick_by_variety(hits: list[Hit], *, variety: float, limit: int) -> list[Hit]:
+    if limit <= 0 or not hits:
+        return []
+    spread = _match_float(variety, 0.5)
+    cluster_n = int(round(limit * (1.0 - spread)))
+    spread_n = limit - cluster_n
+    remaining = list(hits)
+    picked: list[Hit] = []
+
+    def usable(hit: Hit) -> bool:
+        return bool(hit.title) and owned_key(hit.artist, hit.title) != "|"
+
+    def take_first() -> Hit | None:
+        while remaining:
+            hit = remaining.pop(0)
+            if usable(hit):
+                return hit
+        return None
+
+    def take_scored(*, high: bool) -> Hit | None:
+        best_i: int | None = None
+        best = 0.0
+        for index, hit in enumerate(remaining):
+            if not usable(hit):
+                continue
+            value = _similarity_to_picked(hit, picked)
+            if best_i is None or (value > best if high else value < best):
+                best_i = index
+                best = value
+        if best_i is None:
+            return None
+        return remaining.pop(best_i)
+
+    while len(picked) < cluster_n:
+        hit = take_first() if not picked else take_scored(high=True)
+        if hit is None:
+            break
+        picked.append(hit)
+    while len(picked) < cluster_n + spread_n:
+        hit = take_first() if not picked else take_scored(high=False)
+        if hit is None:
+            break
+        picked.append(hit)
+    return picked
+
+
 def why_text(hit: Hit) -> str:
     vias = unique_fold(list(hit.vias))
     if not vias:
@@ -562,6 +665,8 @@ def rank_suggestions(
     min_match: float = 0.0,
     seed_weight: float = 0.15,
     library_ratio: float = LIBRARY_PAGE_RATIO,
+    variety: float | None = None,
+    library_filter: str = "any",
 ) -> list[Suggestion]:
     query_tokens = query_tokens or []
     seed_profile = seed_profile or []
@@ -590,11 +695,40 @@ def rank_suggestions(
     ranked = sorted(fresh, key=order, reverse=True) + sorted(repeats, key=order, reverse=True)
     in_hits = [hit for hit in ranked if owned_key(hit.artist, hit.title) in owned]
     out_hits = [hit for hit in ranked if owned_key(hit.artist, hit.title) not in owned]
-    picked = apply_diversity(in_hits, per_artist=per_artist, limit=limit) + apply_diversity(
-        out_hits, per_artist=per_artist, limit=limit
-    )
+    filt = normalize_suggest_library(library_filter)
+    if variety is None and filt == "any":
+        picked = apply_diversity(in_hits, per_artist=per_artist, limit=limit) + apply_diversity(
+            out_hits, per_artist=per_artist, limit=limit
+        )
+        return mix_library_pages(
+            _suggestions_from_hits(
+                picked,
+                owned=owned,
+                order=order,
+            ),
+            library_ratio=library_ratio,
+        )
+    if filt == "in":
+        pool = in_hits
+    elif filt == "out":
+        pool = out_hits
+    else:
+        pool = ranked
+    if variety is None:
+        chosen = apply_diversity(pool, per_artist=per_artist, limit=limit)
+    else:
+        chosen = pick_by_variety(pool, variety=variety, limit=limit)
+    return _suggestions_from_hits(chosen, owned=owned, order=order)
+
+
+def _suggestions_from_hits(
+    hits: list[Hit],
+    *,
+    owned: set[str],
+    order,
+) -> list[Suggestion]:
     out: list[Suggestion] = []
-    for hit in picked:
+    for hit in hits:
         url = hit.url or lastfm_track_url(hit.artist, hit.title)
         key = owned_key(hit.artist, hit.title)
         out.append(
@@ -609,7 +743,7 @@ def rank_suggestions(
                 in_library=key in owned,
             )
         )
-    return mix_library_pages(out, library_ratio=library_ratio)
+    return out
 
 
 def _weave(left: list[Suggestion], right: list[Suggestion]) -> list[Suggestion]:
@@ -718,16 +852,16 @@ class LastfmClient:
         self.api_key = api_key
         self.catalog = catalog
 
-    async def similar_artists(self, artist: str) -> list[SimilarArtist]:
-        payload = await self._call("artist.getsimilar", artist=artist, limit=str(SIMILAR_ARTIST_LIMIT))
+    async def similar_artists(self, artist: str, limit: int = SIMILAR_ARTIST_LIMIT) -> list[SimilarArtist]:
+        payload = await self._call("artist.getsimilar", artist=artist, limit=str(limit))
         return parse_similar_artists(payload)
 
-    async def similar_tracks(self, artist: str, title: str) -> list[SimilarTrack]:
+    async def similar_tracks(self, artist: str, title: str, limit: int = SIMILAR_TRACK_LIMIT) -> list[SimilarTrack]:
         payload = await self._call(
             "track.getsimilar",
             artist=artist,
             track=title,
-            limit=str(SIMILAR_TRACK_LIMIT),
+            limit=str(limit),
         )
         return parse_similar_tracks(payload)
 
@@ -794,10 +928,18 @@ async def resolve_leftover(client: LastfmAPI, leftover: str) -> SeedTrack | None
     return None
 
 
-async def collect_hits(client: LastfmAPI, seeds: list[SeedTrack], *, language: str | None, mapper: GenreMapper) -> list[Hit]:
-    seed_artists = top_seed_artists(seeds)
+async def collect_hits(
+    client: LastfmAPI,
+    seeds: list[SeedTrack],
+    *,
+    language: str | None,
+    mapper: GenreMapper,
+    caps: dict[str, int] | None = None,
+) -> list[Hit]:
+    caps = caps or fetch_caps(MAX_RESULTS)
+    seed_artists = top_seed_artists(seeds, cap=int(caps["seed_artists"]))
     seed_artist_keys = {normalize_match_text(name) for name in seed_artists}
-    track_seeds = seed_tracks_for_similar(seeds)
+    track_seeds = seed_tracks_for_similar(seeds, cap=int(caps["seed_tracks"]))
     hits: list[Hit] = []
     similar_scores: dict[str, tuple[float, str]] = {}
 
@@ -807,7 +949,7 @@ async def collect_hits(client: LastfmAPI, seeds: list[SeedTrack], *, language: s
             seed.boosted and normalize_match_text(primary_artist(seed.artist)) == normalize_match_text(artist)
             for seed in seeds
         )
-        for track in await client.top_tracks(artist, TOP_TRACK_LIMIT):
+        for track in await client.top_tracks(artist, int(caps["top_tracks"])):
             hits.append(
                 _hit_from_track(
                     track,
@@ -816,7 +958,7 @@ async def collect_hits(client: LastfmAPI, seeds: list[SeedTrack], *, language: s
                     boosted=boosted,
                 )
             )
-        for similar in await client.similar_artists(artist):
+        for similar in await client.similar_artists(artist, int(caps["similar_artist_fetch"])):
             if similar.match < MIN_SIMILAR_MATCH:
                 continue
             key = normalize_match_text(similar.name)
@@ -827,7 +969,7 @@ async def collect_hits(client: LastfmAPI, seeds: list[SeedTrack], *, language: s
 
     for seed in track_seeds:
         artist = primary_artist(seed.artist)
-        for track in await client.similar_tracks(artist, seed.title):
+        for track in await client.similar_tracks(artist, seed.title, int(caps["similar_tracks"])):
             if track.match < MIN_SIMILAR_MATCH:
                 continue
             hits.append(
@@ -839,7 +981,7 @@ async def collect_hits(client: LastfmAPI, seeds: list[SeedTrack], *, language: s
                 )
             )
 
-    ranked_similar = sorted(similar_scores.values(), key=lambda item: -item[0])[:SIMILAR_ARTIST_CAP]
+    ranked_similar = sorted(similar_scores.values(), key=lambda item: -item[0])[: int(caps["similar_artists"])]
     for score, name in ranked_similar:
         tags = await client.artist_tags(name) if language else []
         probe = Hit(artist=name, title="x", match=0, artist_tags=tuple(tags))
@@ -848,7 +990,7 @@ async def collect_hits(client: LastfmAPI, seeds: list[SeedTrack], *, language: s
         seed_tok, seed_name = _nearest_seed_tokens(seeds, name)
         via = f"similar to {seed_name}" if seed_name else f"similar artist {name}"
         track_match = max(MIN_SIMILAR_MATCH, min(0.85, score))
-        for track in await client.top_tracks(name, SIMILAR_ARTIST_TRACK_LIMIT):
+        for track in await client.top_tracks(name, int(caps["similar_artist_tracks"])):
             hits.append(
                 _hit_from_track(
                     track,
@@ -963,10 +1105,14 @@ async def suggest_tracks(
     min_match: float = 0.0,
     seed_weight: float = 0.15,
     library_ratio: float = LIBRARY_PAGE_RATIO,
+    limit: int = MAX_RESULTS,
+    variety: float | None = None,
+    library_filter: str = "any",
 ) -> list[Suggestion]:
     query_tokens = query_tokens or []
+    count = max(1, int(limit))
     seeds = narrow_seeds_for_query(seeds, query_tokens, mapper)
-    hits = await collect_hits(client, seeds, language=language, mapper=mapper)
+    hits = await collect_hits(client, seeds, language=language, mapper=mapper, caps=fetch_caps(count))
     if library:
         hits.extend(hits_from_library(library, seeds, mapper, language))
     exclude = {owned_key(seed.artist, seed.title) for seed in seeds if seed.title}
@@ -979,17 +1125,28 @@ async def suggest_tracks(
         query_tokens=query_tokens,
         seed_profile=seed_profile_tokens(seeds),
         exclude=exclude,
+        limit=count,
         min_match=min_match,
         seed_weight=seed_weight,
         library_ratio=library_ratio,
+        variety=variety,
+        library_filter=library_filter,
     )
     return attach_library_meta(items, library or [])
 
 
-async def suggest_for_user(ctx, user_id: int, query: str, *, language: str | None = None) -> list[dict]:
+async def suggest_for_user(
+    ctx,
+    user_id: int,
+    query: str,
+    *,
+    language: str | None = None,
+    limit: int = DEFAULT_SUGGEST_COUNT,
+) -> list[dict]:
     api_key = (getattr(ctx.settings, "lastfm_api_key", None) or "").strip()
     if not api_key:
         return []
+    count = clamp_suggest_count(limit)
     library = ctx.catalog.list_library_tracks(user_id)
     if not library:
         from app.library_index import entries_to_tracks, load_index_entries
@@ -1000,15 +1157,12 @@ async def suggest_for_user(ctx, user_id: int, query: str, *, language: str | Non
         library = entries_to_tracks(entries)
     seeds = select_library_seeds(library, ctx.genre, language=language)
     owned = owned_keys_from_tracks(library)
-    shown = ctx.catalog.list_suggest_shown(user_id)
+    shown = ctx.catalog.list_suggest_shown(user_id, limit=max(200, count))
     client = LastfmClient(ctx.http, api_key, ctx.catalog)
     tokens = [part for part in (query or "").replace(",", " ").split() if part]
     user = ctx.catalog.get_user(user_id)
     settings = user_settings_dict(user)
-    knobs = suggest_knobs(
-        clamp_suggest_similarity(settings.get("suggest_similarity", 0.5)),
-        suggest_allow_dissimilar(settings.get("suggest_allow_dissimilar")),
-    )
+    knobs = suggest_knobs(settings.get("suggest_similarity", 0.5), settings.get("suggest_library"))
     items = await suggest_tracks(
         client,
         seeds,
@@ -1018,10 +1172,11 @@ async def suggest_for_user(ctx, user_id: int, query: str, *, language: str | Non
         language=language,
         query_tokens=tokens,
         library=library,
-        min_match=float(knobs["min_match"]),
-        seed_weight=float(knobs["seed_weight"]),
-        library_ratio=float(knobs["library_ratio"]),
+        limit=count,
+        variety=float(knobs["variety"]),
+        library_filter=str(knobs["library_filter"]),
     )
+    items = items[:count]
     hifi = str(getattr(ctx.settings, "hifi_bot_username", None) or "HiFiAudioBot")
     return [
         {

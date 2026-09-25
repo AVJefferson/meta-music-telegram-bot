@@ -11,6 +11,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.enrich import fetch_lrclib
+from app.formats import user_settings_dict
 from app.library_index import entries_to_tracks, library_tracks_from_index, load_index_entries
 from app.membership import allow_from_callback, allow_user, user_is_bot
 from app.models import Ctx, Identity, TrackRecord
@@ -25,6 +26,7 @@ from app.suggest import (
     resolve_leftover,
     select_library_seeds,
     session_expires_at,
+    suggest_knobs,
     suggest_tracks,
 )
 from app.tags import read_tagset
@@ -262,6 +264,9 @@ async def _run_suggest(message: Message, ctx: Ctx, query: str) -> None:
     owned = owned_keys_from_tracks(library)
     shown = ctx.catalog.list_suggest_shown(message.from_user.id) if message.from_user else set()
     client = LastfmClient(ctx.http, api_key, ctx.catalog)
+    user = ctx.catalog.get_user(message.from_user.id) if message.from_user else None
+    settings = user_settings_dict(user)
+    knobs = suggest_knobs(settings.get("suggest_similarity", 0.5), settings.get("suggest_library"))
     try:
         items = await suggest_tracks(
             client,
@@ -272,6 +277,8 @@ async def _run_suggest(message: Message, ctx: Ctx, query: str) -> None:
             language=language,
             query_tokens=query_tokens,
             library=library,
+            variety=float(knobs["variety"]),
+            library_filter=str(knobs["library_filter"]),
         )
     except Exception:
         log.exception("suggest lookup failed")
@@ -455,7 +462,7 @@ def build_suggest_command_router() -> Router:
         from app.membership import touch
         from app.user_cmd import _web_or_url_keyboard
 
-        touch(ctx, message.from_user.id)
+        touch(ctx, message.from_user.id, message.from_user)
         query = parse_command_args(message, command)
         kb = _web_or_url_keyboard(ctx, "suggest", None, "Open suggestions", q=query or None)
         await send_private(

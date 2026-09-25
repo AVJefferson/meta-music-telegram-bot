@@ -340,6 +340,31 @@ body.waiting .tabs {
   margin: 0;
 }
 
+.count-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin: 0 0 0.85rem;
+  color: var(--hint);
+  font-size: 0.88rem;
+}
+
+.count-field select {
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 0.45rem 0.8rem;
+  font: inherit;
+  font-size: 0.95rem;
+}
+
+.seg.library .seg-btn {
+  font-size: 0.78rem;
+  padding: 0 0.3rem;
+}
+
 .track h2, .hit h2 {
   font-size: 1.02rem;
   margin: 0 0 0.2rem;
@@ -526,7 +551,9 @@ a.link {
 .carousel img, .carousel .art-ph {
   flex: 0 0 100%;
   width: 100%;
+  height: auto;
   aspect-ratio: 1;
+  min-height: 12rem;
   object-fit: cover;
   border-radius: 0.85rem;
   scroll-snap-align: start;
@@ -579,4 +606,57 @@ a.link {
 .check-btn.is-on {
   border-color: color-mix(in srgb, var(--ok) 50%, var(--line));
   background: color-mix(in srgb, var(--ok) 16%, transparent);
+}
+
+.admin-list {
+  list-style: none;
+  margin: 0.55rem 0 0;
+  padding: 0;
+}
+
+.admin-list li {
+  padding: 0.5rem 0;
+  border-top: 1px solid var(--line);
+}
+
+.admin-list li p {
+  margin: 0.15rem 0 0;
+  font-size: 0.82rem;
+}
+
+.admin-list code {
+  font-size: 0.82rem;
+}
+
+.bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 6.5rem;
+  margin-top: 0.75rem;
+}
+
+.bar-col {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+}
+
+.bar {
+  width: 100%;
+  height: var(--h, 0%);
+  min-height: 2px;
+  border-radius: 0.28rem 0.28rem 0.12rem 0.12rem;
+  background: color-mix(in srgb, var(--accent) 78%, var(--card));
+}
+
+.bar-scale {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.4rem;
+  margin-top: 0.3rem;
+  color: var(--hint);
+  font-size: 0.72rem;
 }

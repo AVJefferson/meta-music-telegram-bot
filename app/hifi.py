@@ -180,7 +180,7 @@ def build_hifi_router() -> Router:
         if not await allow_from_callback(ctx, callback):
             await callback.answer("Not allowed.", show_alert=True)
             return
-        touch(ctx, user_id)
+        touch(ctx, user_id, callback.from_user)
         pick_id = (callback.data or "")[3:]
         try:
             check_upload_rate(ctx, user_id)

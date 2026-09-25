@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import asdict, fields
 from pathlib import Path
 
@@ -13,12 +14,12 @@ from app.formats import (
     clamp_suggest_similarity,
     normalize_allowed,
     normalize_save_dest,
+    normalize_suggest_library,
     save_prefs_from_settings,
-    suggest_allow_dissimilar,
     truthy_setting,
     user_settings_dict,
 )
-from app.initdata import parse_init_data
+from app.initdata import parse_init_user
 from app.membership import check_api_rate, is_admin, user_is_blocked
 from app.models import Ctx, TagSet, tagset_from_dict
 from app.oauth import (
@@ -84,12 +85,14 @@ def create_http_app(ctx: Ctx) -> web.Application:
     app.router.add_get("/app", webapp_index)
     app.router.add_get("/app/{page}", webapp_index)
     app.router.add_get("/api/me", api_me)
+    app.router.add_get("/api/admin/overview", api_admin_overview)
     app.router.add_get("/api/login", api_login)
     app.router.add_post("/api/settings", api_settings)
     app.router.add_get("/api/review", api_review)
     app.router.add_post("/api/review/{track_id}/action", api_review_action)
     app.router.add_get("/api/suggest", api_suggest)
     app.router.add_get("/api/suggest/art", api_suggest_art)
+    app.router.add_get("/api/suggest/cover", api_suggest_cover)
     static_dir = WEBAPP_DIR / "static"
     if static_dir.is_dir():
         app.router.add_static("/app/static/", static_dir)
@@ -178,12 +181,72 @@ async def _api_user(request: web.Request) -> tuple[Ctx, int]:
     validate_origin(ctx.settings, request.headers.get("Origin"))
     init_data = request.headers.get("X-Telegram-Init-Data") or request.query.get("initData") or ""
     max_age = int(getattr(ctx.settings, "initdata_max_age_seconds", 300) or 300)
-    user_id = parse_init_data(ctx.settings.bot_token, init_data, max_age=max_age)
+    profile = parse_init_user(ctx.settings.bot_token, init_data, max_age=max_age)
+    user_id = int(profile["id"])
     if await user_is_blocked(ctx, user_id) and not is_admin(ctx, user_id):
         raise AppError("blacklisted")
     check_api_rate(ctx, user_id)
-    ctx.catalog.touch_user(user_id)
+    ctx.catalog.touch_user(
+        user_id,
+        username=profile.get("username"),
+        first_name=profile.get("first_name"),
+        last_name=profile.get("last_name"),
+    )
     return ctx, user_id
+
+
+def _read_proc_rss() -> int:
+    try:
+        text = Path("/proc/self/status").read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    for line in text.splitlines():
+        if line.startswith("VmRSS:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                return int(parts[1]) * 1024
+    return 0
+
+
+def _read_proc_uptime() -> float:
+    try:
+        stat = Path("/proc/self/stat").read_text(encoding="utf-8")
+        right = stat.rsplit(")", 1)[1].strip().split()
+        start_ticks = int(right[19])
+        clk = os.sysconf("SC_CLK_TCK")
+        boot = float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
+    except (OSError, IndexError, ValueError):
+        return 0.0
+    if not clk:
+        return 0.0
+    return max(0.0, boot - (start_ticks / clk))
+
+
+def _server_stats(ctx: Ctx) -> dict[str, float | int]:
+    path = getattr(ctx.catalog, "path", None)
+    size = 0
+    if path:
+        try:
+            size = int(Path(path).stat().st_size)
+        except OSError:
+            size = 0
+    return {
+        "rss_bytes": _read_proc_rss(),
+        "sqlite_bytes": size,
+        "uptime_seconds": round(_read_proc_uptime(), 1),
+    }
+
+
+async def api_admin_overview(request: web.Request) -> web.Response:
+    try:
+        ctx, user_id = await _api_user(request)
+    except AppError as exc:
+        return web.json_response(exc.as_json(), status=exc.http_status)
+    if not is_admin(ctx, user_id):
+        return web.json_response(AppError("forbidden").as_json(), status=403)
+    payload = ctx.catalog.admin_overview()
+    payload["server"] = _server_stats(ctx)
+    return _json_ok(payload)
 
 
 def _json_ok(data: dict, status: int = 200) -> web.Response:
@@ -210,10 +273,10 @@ def _count_library(ctx: Ctx, user_id: int) -> int:
     return sqlite_n
 
 
-def _suggest_prefs(settings: dict) -> tuple[float, bool]:
+def _suggest_prefs(settings: dict) -> tuple[float, str]:
     sim = clamp_suggest_similarity(settings.get("suggest_similarity", 0.5))
-    allow = suggest_allow_dissimilar(settings.get("suggest_allow_dissimilar"))
-    return sim, allow
+    library = normalize_suggest_library(settings.get("suggest_library"))
+    return sim, library
 
 
 def _save_prefs_payload(settings: dict) -> dict:
@@ -291,7 +354,7 @@ async def api_me(request: web.Request) -> web.Response:
     user = ctx.catalog.ensure_user(user_id)
     months = int(getattr(ctx.settings, "user_inactive_months", 3) or 3)
     settings = user_settings_dict(user)
-    sim, allow = _suggest_prefs(settings)
+    sim, library = _suggest_prefs(settings)
     library_count, review_count = await asyncio.gather(
         asyncio.to_thread(_count_library, ctx, user_id),
         asyncio.to_thread(ctx.catalog.count_review_tracks, user_id),
@@ -306,7 +369,7 @@ async def api_me(request: web.Request) -> web.Response:
             **_save_prefs_payload(settings),
             "allowed_formats": normalize_allowed(settings.get("allowed_formats")),
             "suggest_similarity": sim,
-            "suggest_allow_dissimilar": allow,
+            "suggest_library": library,
             "admin": is_admin(ctx, user_id),
             "library_count": library_count,
             "review_count": review_count,
@@ -341,8 +404,8 @@ async def api_settings(request: web.Request) -> web.Response:
         settings["allowed_formats"] = normalize_allowed(body.get("allowed_formats"))
     if "suggest_similarity" in body:
         settings["suggest_similarity"] = clamp_suggest_similarity(body.get("suggest_similarity"))
-    if "suggest_allow_dissimilar" in body:
-        settings["suggest_allow_dissimilar"] = suggest_allow_dissimilar(body.get("suggest_allow_dissimilar"))
+    if "suggest_library" in body:
+        settings["suggest_library"] = normalize_suggest_library(body.get("suggest_library"))
     if "correct_telegram" in body:
         settings["correct_telegram"] = truthy_setting(body.get("correct_telegram"))
     if "skip_save_prompt" in body:
@@ -353,20 +416,20 @@ async def api_settings(request: web.Request) -> web.Response:
         dest is None
         and "allowed_formats" not in body
         and "suggest_similarity" not in body
-        and "suggest_allow_dissimilar" not in body
+        and "suggest_library" not in body
         and "correct_telegram" not in body
         and "skip_save_prompt" not in body
         and "delete_original" not in body
     ):
         settings["default_dest"] = normalize_save_dest(body.get("default_dest"))
     ctx.catalog.update_user(user_id, settings_json=json.dumps(settings))
-    sim, allow = _suggest_prefs(settings)
+    sim, library = _suggest_prefs(settings)
     return _json_ok(
         {
             **_save_prefs_payload(settings),
             "allowed_formats": normalize_allowed(settings.get("allowed_formats")),
             "suggest_similarity": sim,
-            "suggest_allow_dissimilar": allow,
+            "suggest_library": library,
             "logged_in": user.logged_in,
             "google_email": user.google_email,
         }
@@ -432,19 +495,21 @@ async def api_suggest(request: web.Request) -> web.Response:
     except AppError as cop:
         return web.json_response(cop.as_json(), status=cop.http_status)
     query = str(request.query.get("q") or "").strip()
-    from app.suggest import owned_key, suggest_for_user
+    from app.suggest import clamp_suggest_count, owned_key, suggest_for_user
 
+    count = clamp_suggest_count(request.query.get("n"))
     lastfm = bool((getattr(ctx.settings, "lastfm_api_key", None) or "").strip())
     try:
-        rows = await suggest_for_user(ctx, user_id, query)
+        rows = await suggest_for_user(ctx, user_id, query, limit=count)
     except Exception as cop:
         err = to_app_error(cop)
         return web.json_response(err.as_json(), status=err.http_status)
     hifi = str(getattr(ctx.settings, "hifi_bot_username", None) or "HiFiAudioBot")
-    shown = [_decorate_suggest_row(row, hifi_user=hifi) for row in rows[:20]]
+    shown = [_decorate_suggest_row(row, hifi_user=hifi) for row in rows[:count]]
     ctx.catalog.mark_suggest_shown(
         user_id,
         [owned_key(str(row.get("artist") or ""), str(row.get("title") or "")) for row in shown],
+        keep=max(200, count),
     )
     return _json_ok({"results": shown, "lastfm": lastfm})
 
@@ -473,6 +538,34 @@ async def api_suggest_art(request: web.Request) -> web.Response:
     covers = data.get("covers") if isinstance(data, dict) else None
     apple = data.get("apple") if isinstance(data, dict) else ""
     return _json_ok({"covers": covers if isinstance(covers, list) else [], "apple": apple or ""})
+
+
+async def api_suggest_cover(request: web.Request) -> web.Response:
+    try:
+        ctx, _user_id = await _api_user(request)
+    except AppError as cop:
+        return web.json_response(cop.as_json(), status=cop.http_status)
+    from app.enrich import cover_url_allowed, fetch_proxied_cover
+
+    url = str(request.query.get("u") or "").strip()
+    if not cover_url_allowed(url):
+        return web.Response(status=400)
+    http = getattr(ctx, "http", None)
+    if http is None:
+        return web.Response(status=404)
+    try:
+        fetched = await fetch_proxied_cover(http, url)
+    except Exception:
+        log.debug("suggest cover proxy failed", exc_info=True)
+        return web.Response(status=404)
+    if not fetched:
+        return web.Response(status=404)
+    body, content_type = fetched
+    return web.Response(
+        body=body,
+        content_type=content_type,
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
 
 
 async def api_login(request: web.Request) -> web.Response:

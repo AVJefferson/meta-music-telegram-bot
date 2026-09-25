@@ -131,7 +131,7 @@ def build_reactions_router() -> Router:
             return
         if not await allow_user(ctx, user.id, event.chat):
             return
-        touch(ctx, user.id)
+        touch(ctx, user.id, user)
         added = added_emojis(event.old_reaction, event.new_reaction)
         removed = removed_emojis(event.old_reaction, event.new_reaction)
         if not added and not removed:

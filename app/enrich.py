@@ -5,6 +5,7 @@ import io
 import logging
 import re
 from dataclasses import dataclass
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 from PIL import Image
@@ -309,11 +310,108 @@ def _caa_image_url(image: dict) -> str:
     return str(image.get("image") or "")
 
 
+def _https_url(url: str) -> str:
+    text = (url or "").strip()
+    if text.startswith("http://"):
+        return "https://" + text[len("http://") :]
+    return text
+
+
+_COVER_HOSTS = ("mzstatic.com", "coverartarchive.org", "archive.org")
+
+
+def cover_url_allowed(url: str) -> bool:
+    raw = (url or "").strip()
+    if not raw or len(raw) > 2000:
+        return False
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if parsed.username or parsed.password:
+        return False
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if not host:
+        return False
+    return any(host == item or host.endswith("." + item) for item in _COVER_HOSTS)
+
+
+def release_ids_from_recording(payload: dict) -> tuple[str | None, str | None]:
+    releases = payload.get("releases") if isinstance(payload, dict) else None
+    best: dict | None = None
+    best_score = -1
+    for rel in releases or []:
+        if not isinstance(rel, dict) or not rel.get("id"):
+            continue
+        score = 0
+        if str(rel.get("status") or "").casefold() == "official":
+            score += 10
+        group = rel.get("release-group") if isinstance(rel.get("release-group"), dict) else {}
+        if str(group.get("primary-type") or "").casefold() == "album":
+            score += 5
+        if score > best_score:
+            best = rel
+            best_score = score
+    if best is None:
+        return None, None
+    group = best.get("release-group") if isinstance(best.get("release-group"), dict) else {}
+    release_id = str(best.get("id") or "").strip() or None
+    group_id = str(group.get("id") or "").strip() or None
+    return release_id, group_id
+
+
+async def _recording_release_ids(http: httpx.AsyncClient, mbid: str) -> tuple[str | None, str | None]:
+    mbid = (mbid or "").strip()
+    if not mbid:
+        return None, None
+    try:
+        response = await http.get(
+            f"https://musicbrainz.org/ws/2/recording/{quote(mbid)}",
+            params={"fmt": "json", "inc": "releases"},
+            timeout=20.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    return release_ids_from_recording(payload)
+
+
+async def fetch_proxied_cover(http: httpx.AsyncClient, url: str) -> tuple[bytes, str] | None:
+    current = _https_url(url)
+    for _hop in range(5):
+        if not cover_url_allowed(current):
+            return None
+        try:
+            response = await http.get(current, follow_redirects=False, timeout=20.0)
+        except httpx.HTTPError:
+            return None
+        status = int(getattr(response, "status_code", 0) or 0)
+        headers = getattr(response, "headers", {}) or {}
+        if status in {301, 302, 303, 307, 308}:
+            loc = str(headers.get("location") or "")
+            if not loc:
+                return None
+            current = urljoin(current, loc)
+            continue
+        if status != 200:
+            return None
+        data = getattr(response, "content", b"") or b""
+        if not data:
+            return None
+        content_type = str(headers.get("content-type") or "image/jpeg").split(";")[0].strip().lower()
+        if content_type not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+            return None
+        return data, content_type
+    return None
+
+
 def _dedupe_urls(urls: list[str], limit: int = 8) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for raw in urls:
-        url = (raw or "").strip()
+        url = _https_url(raw)
         if not url or url in seen:
             continue
         seen.add(url)
@@ -346,6 +444,10 @@ async def list_cover_urls(
     album: str = "",
     mbid: str | None = None,
 ) -> dict:
+    release_id = None
+    group_id = None
+    if mbid:
+        release_id, group_id = await _recording_release_ids(http, mbid)
     identity = Identity(
         confidence="low",
         title=title or "",
@@ -353,6 +455,8 @@ async def list_cover_urls(
         artists=[artist] if artist else [],
         album_artists=[artist] if artist else [],
         mb_recording_id=mbid or None,
+        mb_release_id=release_id,
+        mb_release_group_id=group_id,
     )
     extra_term = " ".join(part for part in [artist, title] if part)
     song_results, album_results, extra_albums = await asyncio.gather(

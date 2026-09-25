@@ -9,7 +9,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from app.ephemeral import send_private
 from app.membership import is_admin, touch
-from app.models import Ctx
+from app.models import Ctx, user_display_name
 from app.util import html_esc
 
 log = logging.getLogger(__name__)
@@ -18,6 +18,31 @@ log = logging.getLogger(__name__)
 def _since_iso(ctx: Ctx) -> str:
     months = int(getattr(ctx.settings, "user_inactive_months", 3) or 3)
     return (datetime.now(timezone.utc) - timedelta(days=30 * months)).isoformat(timespec="seconds")
+
+
+def _handle(value: object) -> str:
+    return str(value or "").strip().lstrip("@")
+
+
+def format_user_line(user) -> str:
+    bits = [f"<code>{user.telegram_user_id}</code>"]
+    username = _handle(getattr(user, "username", None))
+    if username:
+        bits.append(f"@{html_esc(username)}")
+    name = user_display_name(getattr(user, "first_name", None), getattr(user, "last_name", None))
+    if name:
+        bits.append(html_esc(name))
+    bits.append(f"since {html_esc(format_since_date(user.first_seen_at))}")
+    return " ".join(bits)
+
+
+def format_chat_label(chat) -> str:
+    title = html_esc(getattr(chat, "title", None) or "")
+    username = _handle(getattr(chat, "username", None))
+    if username:
+        handle = f"@{html_esc(username)}"
+        return f"{title} {handle}".strip()
+    return title
 
 
 def format_since_date(value: str) -> str:
@@ -72,13 +97,11 @@ def build_admin_router() -> Router:
     async def listusers(message: Message, ctx: Ctx) -> None:
         if not await _require_admin(message, ctx):
             return
-        touch(ctx, message.from_user.id)
+        touch(ctx, message.from_user.id, message.from_user)
         rows = ctx.catalog.list_active_users(_since_iso(ctx))
         lines = ["<b>Active users</b>"]
         for user in rows[:40]:
-            lines.append(
-                f"<code>{user.telegram_user_id}</code> since {html_esc(format_since_date(user.first_seen_at))}"
-            )
+            lines.append(format_user_line(user))
         await send_private(
             ctx,
             chat_id=message.chat.id,
@@ -92,7 +115,7 @@ def build_admin_router() -> Router:
     async def listgroups(message: Message, ctx: Ctx) -> None:
         if not await _require_admin(message, ctx):
             return
-        touch(ctx, message.from_user.id)
+        touch(ctx, message.from_user.id, message.from_user)
         chats = [
             c
             for c in ctx.catalog.list_chats()
@@ -112,7 +135,7 @@ def build_admin_router() -> Router:
     async def listchannels(message: Message, ctx: Ctx) -> None:
         if not await _require_admin(message, ctx):
             return
-        touch(ctx, message.from_user.id)
+        touch(ctx, message.from_user.id, message.from_user)
         chats = [c for c in ctx.catalog.list_chats() if c.type == "channel"]
         text = await _format_chats(ctx, chats, "Channels")
         await send_private(
@@ -221,9 +244,38 @@ def _target_user(message: Message, command: CommandObject) -> int | None:
     return None
 
 
+def _remote_type(remote) -> str:
+    raw = getattr(remote, "type", None)
+    return str(getattr(raw, "value", raw) or "")
+
+
+async def _refresh_blank_chat(ctx: Ctx, chat):
+    if (chat.title or "").strip() or (getattr(chat, "username", None) or "").strip():
+        return chat
+    try:
+        remote = await ctx.bot.get_chat(chat.chat_id)
+    except Exception:
+        log.debug("get_chat failed chat=%s", chat.chat_id, exc_info=True)
+        return chat
+    title = str(getattr(remote, "title", None) or getattr(remote, "full_name", None) or "")
+    username = str(getattr(remote, "username", None) or "")
+    chat_type = _remote_type(remote)
+    if not title and not username and not chat_type:
+        return chat
+    ctx.catalog.upsert_chat(
+        chat.chat_id,
+        type=chat_type or chat.type,
+        title=title,
+        username=username,
+        active=chat.active,
+    )
+    return ctx.catalog.get_chat(chat.chat_id) or chat
+
+
 async def _format_chats(ctx: Ctx, chats, heading: str) -> str:
     lines = [f"<b>{html_esc(heading)}</b>"]
-    for chat in chats[:40]:
+    shown = [await _refresh_blank_chat(ctx, chat) for chat in chats[:40]]
+    for chat in shown:
         admins = ""
         try:
             members = await ctx.bot.get_chat_administrators(chat.chat_id)
@@ -232,9 +284,9 @@ async def _format_chats(ctx: Ctx, chats, heading: str) -> str:
         except Exception:
             admins = "?"
         mark = " blocked" if ctx.catalog.is_chat_blacklisted(chat.chat_id) else ""
-        lines.append(
-            f"<code>{chat.chat_id}</code> {html_esc(chat.title or '')} admins={html_esc(admins)}{mark}"
-        )
+        label = format_chat_label(chat)
+        body = f" {label}" if label else ""
+        lines.append(f"<code>{chat.chat_id}</code>{body} admins={html_esc(admins)}{mark}")
     if len(lines) == 1:
         lines.append("None.")
     return "\n".join(lines)

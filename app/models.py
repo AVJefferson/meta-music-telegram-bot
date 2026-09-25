@@ -204,10 +204,22 @@ class UserRecord:
     gdrive_folder_id: str | None = None
     gdrive_review_folder_id: str | None = None
     settings_json: str = "{}"
+    username: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
 
     @property
     def logged_in(self) -> bool:
         return bool((self.google_refresh_token or "").strip())
+
+
+def user_display_name(first_name: str | None, last_name: str | None = None) -> str:
+    parts: list[str] = []
+    for value in (first_name, last_name):
+        text = str(value or "").strip()
+        if text:
+            parts.append(text)
+    return " ".join(parts)
 
 
 @dataclass
@@ -218,6 +230,7 @@ class ChatRecord:
     active: bool
     added_at: str
     last_active_at: str
+    username: str | None = None
 
 
 @dataclass

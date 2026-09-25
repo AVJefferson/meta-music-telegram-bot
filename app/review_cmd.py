@@ -184,7 +184,7 @@ def build_review_command_router() -> Router:
             if message.chat.type == "private":
                 await message.reply("Private access requires membership in a known group.")
             return
-        touch(ctx, message.from_user.id)
+        touch(ctx, message.from_user.id, message.from_user)
         from app.ephemeral import send_private
         from app.user_cmd import _web_or_url_keyboard
 

@@ -5,7 +5,14 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from app.models import ChatRecord, PendingReview, SuggestSession, TrackRecord, UserRecord
+from app.models import (
+    ChatRecord,
+    PendingReview,
+    SuggestSession,
+    TrackRecord,
+    UserRecord,
+    user_display_name,
+)
 
 GENERAL_TOPIC_THREAD_ID = 1
 GENERAL_TOPIC_NAME = "General"
@@ -27,6 +34,26 @@ def is_general_topic(
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+_UNSET = object()
+
+
+def _profile_text(value: object, *, username: bool = False) -> str | None:
+    if value is None or value is _UNSET:
+        return None
+    text = str(value).strip()
+    if username:
+        text = text.lstrip("@")
+    return text or None
+
+
+def chat_is_group(chat: ChatRecord) -> bool:
+    return chat.type in {"group", "supergroup"} or (chat.chat_id < 0 and chat.type != "channel")
+
+
+def chat_is_channel(chat: ChatRecord) -> bool:
+    return chat.type == "channel"
 
 
 def _row_get(row: sqlite3.Row, key: str, default=None):
@@ -128,6 +155,7 @@ def _row_to_suggest(row: sqlite3.Row) -> SuggestSession:
 class Catalog:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = Path(path)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -251,12 +279,16 @@ class Catalog:
                   google_email TEXT,
                   gdrive_folder_id TEXT,
                   gdrive_review_folder_id TEXT,
-                  settings_json TEXT NOT NULL DEFAULT '{}'
+                  settings_json TEXT NOT NULL DEFAULT '{}',
+                  username TEXT,
+                  first_name TEXT,
+                  last_name TEXT
                 );
                 CREATE TABLE IF NOT EXISTS chats (
                   chat_id INTEGER PRIMARY KEY,
                   type TEXT NOT NULL DEFAULT '',
                   title TEXT NOT NULL DEFAULT '',
+                  username TEXT,
                   active INTEGER NOT NULL DEFAULT 1,
                   added_at TEXT NOT NULL,
                   last_active_at TEXT NOT NULL
@@ -349,6 +381,19 @@ class Catalog:
             for name in ("drive_file_id", "payload_sha"):
                 if name not in index_columns:
                     self._conn.execute(f"ALTER TABLE library_tag_index ADD COLUMN {name} TEXT")
+            user_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(users)").fetchall()
+            }
+            for name in ("username", "first_name", "last_name"):
+                if name not in user_columns:
+                    self._conn.execute(f"ALTER TABLE users ADD COLUMN {name} TEXT")
+            chat_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(chats)").fetchall()
+            }
+            if "username" not in chat_columns:
+                self._conn.execute("ALTER TABLE chats ADD COLUMN username TEXT")
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tracks_user ON tracks(user_id, kind, status)"
             )
@@ -1194,6 +1239,9 @@ class Catalog:
             gdrive_folder_id=row["gdrive_folder_id"],
             gdrive_review_folder_id=row["gdrive_review_folder_id"],
             settings_json=str(row["settings_json"] or "{}"),
+            username=_row_get(row, "username"),
+            first_name=_row_get(row, "first_name"),
+            last_name=_row_get(row, "last_name"),
         )
 
     def ensure_user(self, telegram_user_id: int) -> UserRecord:
@@ -1217,13 +1265,39 @@ class Catalog:
             ).fetchone()
         return self._row_to_user(row) if row else None
 
-    def touch_user(self, telegram_user_id: int) -> UserRecord:
+    def touch_user(
+        self,
+        telegram_user_id: int,
+        *,
+        username: object = _UNSET,
+        first_name: object = _UNSET,
+        last_name: object = _UNSET,
+    ) -> UserRecord:
         user = self.ensure_user(telegram_user_id)
         now = _utc_now()
+        sets = ["last_active_at=?"]
+        values: list[object] = [now]
+        stored = {
+            "username": user.username,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+        }
+        for key, value in (
+            ("username", username),
+            ("first_name", first_name),
+            ("last_name", last_name),
+        ):
+            if value is _UNSET:
+                continue
+            clean = _profile_text(value, username=(key == "username"))
+            sets.append(f"{key}=?")
+            values.append(clean)
+            stored[key] = clean
+        values.append(telegram_user_id)
         with self._lock:
             self._conn.execute(
-                "UPDATE users SET last_active_at=? WHERE telegram_user_id=?",
-                (now, telegram_user_id),
+                f"UPDATE users SET {', '.join(sets)} WHERE telegram_user_id=?",
+                values,
             )
             self._conn.commit()
         return UserRecord(
@@ -1236,6 +1310,9 @@ class Catalog:
             gdrive_folder_id=user.gdrive_folder_id,
             gdrive_review_folder_id=user.gdrive_review_folder_id,
             settings_json=user.settings_json,
+            username=stored["username"],
+            first_name=stored["first_name"],
+            last_name=stored["last_name"],
         )
 
     def increment_songs_edited(self, telegram_user_id: int) -> None:
@@ -1257,12 +1334,17 @@ class Catalog:
             "settings_json",
             "songs_edited",
             "last_active_at",
+            "username",
+            "first_name",
+            "last_name",
         }
         cols = []
         values = []
         for key, value in fields.items():
             if key not in allowed:
                 raise ValueError(f"unknown user field {key}")
+            if key in {"username", "first_name", "last_name"}:
+                value = _profile_text(value, username=(key == "username"))
             cols.append(f"{key}=?")
             values.append(value)
         if not cols:
@@ -1290,6 +1372,13 @@ class Catalog:
             rows = self._conn.execute(
                 "SELECT * FROM users WHERE last_active_at>=? ORDER BY last_active_at DESC",
                 (since_iso,),
+            ).fetchall()
+        return [self._row_to_user(row) for row in rows]
+
+    def list_users(self) -> list[UserRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM users ORDER BY last_active_at DESC"
             ).fetchall()
         return [self._row_to_user(row) for row in rows]
 
@@ -1367,20 +1456,34 @@ class Catalog:
         *,
         type: str = "",
         title: str = "",
+        username: str = "",
         active: bool = True,
     ) -> None:
         now = _utc_now()
+        handle = _profile_text(username, username=True) or ""
         with self._lock:
             self._conn.execute(
-                "INSERT INTO chats(chat_id, type, title, active, added_at, last_active_at) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
+                "INSERT INTO chats(chat_id, type, title, username, active, added_at, last_active_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(chat_id) DO UPDATE SET "
                 "type=CASE WHEN excluded.type='' THEN chats.type ELSE excluded.type END, "
                 "title=CASE WHEN excluded.title='' THEN chats.title ELSE excluded.title END, "
+                "username=CASE WHEN excluded.username='' THEN chats.username ELSE excluded.username END, "
                 "active=excluded.active, last_active_at=excluded.last_active_at",
-                (chat_id, type, title, 1 if active else 0, now, now),
+                (chat_id, type, title, handle, 1 if active else 0, now, now),
             )
             self._conn.commit()
+
+    def _row_to_chat(self, row: sqlite3.Row) -> ChatRecord:
+        return ChatRecord(
+            chat_id=int(row["chat_id"]),
+            type=str(row["type"] or ""),
+            title=str(row["title"] or ""),
+            active=bool(row["active"]),
+            added_at=str(row["added_at"]),
+            last_active_at=str(row["last_active_at"]),
+            username=_row_get(row, "username"),
+        )
 
     def get_chat(self, chat_id: int) -> ChatRecord | None:
         with self._lock:
@@ -1389,14 +1492,7 @@ class Catalog:
             ).fetchone()
         if not row:
             return None
-        return ChatRecord(
-            chat_id=int(row["chat_id"]),
-            type=str(row["type"] or ""),
-            title=str(row["title"] or ""),
-            active=bool(row["active"]),
-            added_at=str(row["added_at"]),
-            last_active_at=str(row["last_active_at"]),
-        )
+        return self._row_to_chat(row)
 
     def list_chats(self, types: tuple[str, ...] | None = None) -> list[ChatRecord]:
         with self._lock:
@@ -1408,17 +1504,85 @@ class Catalog:
                 ).fetchall()
             else:
                 rows = self._conn.execute("SELECT * FROM chats ORDER BY title").fetchall()
-        return [
-            ChatRecord(
-                chat_id=int(row["chat_id"]),
-                type=str(row["type"] or ""),
-                title=str(row["title"] or ""),
-                active=bool(row["active"]),
-                added_at=str(row["added_at"]),
-                last_active_at=str(row["last_active_at"]),
-            )
-            for row in rows
-        ]
+        return [self._row_to_chat(row) for row in rows]
+
+    def admin_overview(self) -> dict[str, object]:
+        users = self.list_users()
+        chats = self.list_chats()
+        now = datetime.now(timezone.utc)
+        since_24h = (now - timedelta(hours=24)).isoformat(timespec="seconds")
+        since_7d = (now - timedelta(days=7)).isoformat(timespec="seconds")
+        start_day = (now.date() - timedelta(days=13)).isoformat()
+        with self._lock:
+            black_users = self._conn.execute("SELECT COUNT(*) AS n FROM blacklist_users").fetchone()["n"]
+            black_chats = self._conn.execute("SELECT COUNT(*) AS n FROM blacklist_chats").fetchone()["n"]
+            blocked_chat_ids = {
+                int(row["chat_id"])
+                for row in self._conn.execute("SELECT chat_id FROM blacklist_chats").fetchall()
+            }
+            hour_rows = self._conn.execute(
+                "SELECT substr(created_at, 12, 2) AS hour, COUNT(*) AS n FROM tracks "
+                "WHERE created_at IS NOT NULL AND length(created_at) >= 13 GROUP BY hour"
+            ).fetchall()
+            day_rows = self._conn.execute(
+                "SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS n FROM tracks "
+                "WHERE substr(created_at, 1, 10) >= ? GROUP BY day",
+                (start_day,),
+            ).fetchall()
+        hours = [0] * 24
+        for row in hour_rows:
+            try:
+                hour = int(row["hour"])
+            except (TypeError, ValueError):
+                continue
+            if 0 <= hour <= 23:
+                hours[hour] = int(row["n"])
+        by_day = {str(row["day"]): int(row["n"]) for row in day_rows}
+        days = []
+        for offset in range(13, -1, -1):
+            day = (now.date() - timedelta(days=offset)).isoformat()
+            days.append({"date": day, "count": by_day.get(day, 0)})
+        groups = [chat for chat in chats if chat_is_group(chat)]
+        channels = [chat for chat in chats if chat_is_channel(chat)]
+        groups.sort(key=lambda chat: chat.last_active_at, reverse=True)
+        channels.sort(key=lambda chat: chat.last_active_at, reverse=True)
+
+        def chat_row(chat: ChatRecord) -> dict[str, object]:
+            return {
+                "id": chat.chat_id,
+                "title": chat.title or "",
+                "username": chat.username,
+                "type": chat.type or "",
+                "last_active": chat.last_active_at,
+                "blocked": chat.chat_id in blocked_chat_ids,
+            }
+
+        return {
+            "counts": {
+                "users": len(users),
+                "groups": len(groups),
+                "channels": len(channels),
+                "blacklisted": int(black_users or 0) + int(black_chats or 0),
+            },
+            "users": [
+                {
+                    "id": user.telegram_user_id,
+                    "username": user.username,
+                    "name": user_display_name(user.first_name, user.last_name),
+                    "last_active": user.last_active_at,
+                    "songs_edited": int(user.songs_edited or 0),
+                }
+                for user in users
+            ],
+            "groups": [chat_row(chat) for chat in groups],
+            "channels": [chat_row(chat) for chat in channels],
+            "activity": {
+                "hours": hours,
+                "active_24h": sum(1 for user in users if user.last_active_at >= since_24h),
+                "active_7d": sum(1 for user in users if user.last_active_at >= since_7d),
+            },
+            "usage": {"days": days},
+        }
 
     def list_known_chat_ids(self) -> list[int]:
         with self._lock:

@@ -229,6 +229,31 @@ def suggest_allow_dissimilar(value: object) -> bool:
     return truthy_setting(value)
 
 
+SUGGEST_LIBRARY_FILTERS = ("in", "any", "out")
+
+
+def normalize_suggest_library(value: object, default: str = "any") -> str:
+    text = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "in": "in",
+        "library": "in",
+        "in_library": "in",
+        "only_library": "in",
+        "any": "any",
+        "all": "any",
+        "both": "any",
+        "out": "out",
+        "new": "out",
+        "not": "out",
+        "not_in_library": "out",
+        "outside": "out",
+    }
+    found = aliases.get(text)
+    if found in SUGGEST_LIBRARY_FILTERS:
+        return found
+    return default if default in SUGGEST_LIBRARY_FILTERS else "any"
+
+
 def user_allowed_formats(ctx: object, user_id: int) -> list[str]:
     catalog = getattr(ctx, "catalog", None) if ctx is not None else None
     user = None

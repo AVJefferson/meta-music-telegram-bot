@@ -208,10 +208,17 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
                     "mbid": "rec-1",
                 }
             ]
-            with patch("app.suggest.suggest_for_user", AsyncMock(return_value=rows)):
+            with patch("app.suggest.suggest_for_user", AsyncMock(return_value=rows)) as sug:
                 async with TestClient(TestServer(app)) as client:
                     resp = await client.get("/api/suggest", headers=_headers())
                     data = await resp.json()
+                    resp_20 = await client.get("/api/suggest?n=20", headers=_headers())
+                    resp_bad = await client.get("/api/suggest?n=7", headers=_headers())
+                    self.assertEqual(resp_20.status, 200)
+                    self.assertEqual(resp_bad.status, 200)
+            self.assertEqual(sug.await_args_list[0].kwargs["limit"], 100)
+            self.assertEqual(sug.await_args_list[1].kwargs["limit"], 20)
+            self.assertEqual(sug.await_args_list[2].kwargs["limit"], 100)
             self.assertTrue(data["ok"])
             self.assertFalse(data["lastfm"])
             self.assertIs(data["results"][0]["in_library"], True)
@@ -273,7 +280,7 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
                     data = await resp.json()
             self.assertEqual(data["library_count"], 3)
             self.assertEqual(data["suggest_similarity"], 0.5)
-            self.assertFalse(data["suggest_allow_dissimilar"])
+            self.assertEqual(data["suggest_library"], "any")
             self.assertFalse(data["correct_telegram"])
             self.assertFalse(data["skip_save_prompt"])
             self.assertFalse(data["delete_original"])
@@ -319,18 +326,18 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
                 saved = await client.post(
                     "/api/settings",
                     headers=_headers(**{"Content-Type": "application/json"}),
-                    data=json.dumps({"suggest_similarity": 0.8, "suggest_allow_dissimilar": True}),
+                    data=json.dumps({"suggest_similarity": 0.8, "suggest_library": "out"}),
                 )
                 me = await client.get("/api/me", headers=_headers())
                 saved_data = await saved.json()
                 me_data = await me.json()
             self.assertAlmostEqual(saved_data["suggest_similarity"], 0.8)
-            self.assertTrue(saved_data["suggest_allow_dissimilar"])
+            self.assertEqual(saved_data["suggest_library"], "out")
             self.assertAlmostEqual(me_data["suggest_similarity"], 0.8)
-            self.assertTrue(me_data["suggest_allow_dissimilar"])
+            self.assertEqual(me_data["suggest_library"], "out")
             stored = json.loads(catalog.get_user(11).settings_json)
             self.assertEqual(stored["suggest_similarity"], 0.8)
-            self.assertTrue(stored["suggest_allow_dissimilar"])
+            self.assertEqual(stored["suggest_library"], "out")
 
     async def test_settings_save_prompt_prefs(self) -> None:
         directory, catalog = temp_catalog()
@@ -382,3 +389,64 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(data["ok"])
             self.assertEqual(data["covers"], ["https://example/a.jpg"])
             self.assertEqual(data["apple"], "https://music.apple.com/x")
+
+    async def test_suggest_cover_proxies_allowlisted_image(self) -> None:
+        from dataclasses import replace
+
+        class _Resp:
+            status_code = 200
+            content = b"\xff\xd8\xff"
+            headers = {"content-type": "image/jpeg"}
+
+        class _Http:
+            async def get(self, url, **kwargs):
+                self.url = url
+                self.kwargs = kwargs
+                return _Resp()
+
+        directory, catalog = temp_catalog()
+        with directory:
+            http = _Http()
+            ctx = replace(make_ctx(catalog), http=http)
+            app = create_http_app(ctx)
+            async with TestClient(TestServer(app)) as client:
+                blocked = await client.get(
+                    "/api/suggest/cover",
+                    params={"u": "https://evil.example/a.jpg"},
+                    headers=_headers(),
+                )
+                ok = await client.get(
+                    "/api/suggest/cover",
+                    params={"u": "https://is1-ssl.mzstatic.com/image/thumb/a/100x100bb.jpg", "initData": make_init_data("bot-token", 11)},
+                    headers=_headers(),
+                )
+                body = await ok.read()
+            self.assertEqual(blocked.status, 400)
+            self.assertEqual(ok.status, 200)
+            self.assertEqual(ok.headers.get("Content-Type"), "image/jpeg")
+            self.assertEqual(body, b"\xff\xd8\xff")
+            self.assertIn("mzstatic.com", http.url)
+            self.assertFalse(http.kwargs.get("follow_redirects"))
+
+
+class CoverHelperTests(unittest.TestCase):
+    def test_recording_mbid_picks_official_release(self) -> None:
+        from app.enrich import cover_url_allowed, release_ids_from_recording
+
+        release_id, group_id = release_ids_from_recording(
+            {
+                "releases": [
+                    {"id": "boot", "status": "Bootleg"},
+                    {
+                        "id": "rel",
+                        "status": "Official",
+                        "release-group": {"id": "rg", "primary-type": "Album"},
+                    },
+                ]
+            }
+        )
+        self.assertEqual(release_id, "rel")
+        self.assertEqual(group_id, "rg")
+        self.assertTrue(cover_url_allowed("http://coverartarchive.org/release/rel/front-500"))
+        self.assertFalse(cover_url_allowed("https://evil.example/a.jpg"))
+        self.assertFalse(cover_url_allowed("https://user:pass@is1-ssl.mzstatic.com/a.jpg"))

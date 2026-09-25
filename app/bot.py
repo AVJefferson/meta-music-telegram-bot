@@ -176,6 +176,7 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
             chat.id,
             type=chat.type or "",
             title=chat.title or getattr(chat, "full_name", None) or "",
+            username=getattr(chat, "username", None) or "",
             active=active,
         )
 
@@ -205,7 +206,7 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
             return
         if not is_allowed_audio_message(message, user_allowed_formats(ctx, message.from_user.id)):
             return
-        touch(ctx, message.from_user.id)
+        touch(ctx, message.from_user.id, message.from_user)
         file_id, file_name = file_info(message)
         thread_id, _topic_name = resolve_topic(message, ctx)
         from app.botapi import discard_download

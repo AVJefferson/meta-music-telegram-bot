@@ -37,6 +37,7 @@ from app.suggest import (
     SimilarTrack,
     Suggestion,
     attach_library_meta,
+    clamp_suggest_count,
     leftover_matches_seed,
     mix_library_pages,
     owned_key,
@@ -49,6 +50,7 @@ from app.suggest import (
     rank_suggestions,
     seed_from_track,
     select_library_seeds,
+    suggest_knobs,
     suggest_tracks,
     track_from_library_item,
     track_matches_language,
@@ -114,11 +116,11 @@ class FakeLastfm:
         self.artist_hits: dict[str, str] = {}
         self.track_hits: dict[str, tuple[str, str]] = {}
 
-    async def similar_artists(self, artist: str) -> list[SimilarArtist]:
-        return list(self.similar_artist_map.get(artist, []))
+    async def similar_artists(self, artist: str, limit: int = 20) -> list[SimilarArtist]:
+        return list(self.similar_artist_map.get(artist, []))[:limit]
 
-    async def similar_tracks(self, artist: str, title: str) -> list[SimilarTrack]:
-        return list(self.similar_track_map.get((artist, title), []))
+    async def similar_tracks(self, artist: str, title: str, limit: int = 15) -> list[SimilarTrack]:
+        return list(self.similar_track_map.get((artist, title), []))[:limit]
 
     async def top_tracks(self, artist: str, limit: int = 10) -> list[SimilarTrack]:
         return list(self.top_map.get(artist, []))[:limit]
@@ -774,6 +776,56 @@ class RankTests(unittest.TestCase):
         self.assertNotIn("Far", titles)
         self.assertIn("Near", titles)
         self.assertIn("Mine", titles)
+
+    def test_low_variety_clusters_same_artist(self) -> None:
+        hits = [Hit(artist="Muse", title="Top", match=1.0, tags=("rock",))]
+        hits.extend(Hit(artist="Muse", title=f"M{index}", match=0.9, tags=("rock",)) for index in range(6))
+        hits.extend(Hit(artist=f"Band{index}", title=f"B{index}", match=0.4, tags=(f"tag{index}",)) for index in range(6))
+        ranked = rank_suggestions(hits, owned=set(), shown=set(), mapper=mapper(), variety=0.0, limit=6)
+        self.assertEqual(len(ranked), 6)
+        self.assertTrue(all(item.artist == "Muse" for item in ranked))
+
+    def test_high_variety_spreads_artists(self) -> None:
+        hits = [Hit(artist="Muse", title="Top", match=1.0, tags=("rock",))]
+        hits.extend(Hit(artist="Muse", title=f"M{index}", match=0.9, tags=("rock",)) for index in range(6))
+        hits.extend(Hit(artist=f"Band{index}", title=f"B{index}", match=0.4, tags=(f"tag{index}",)) for index in range(6))
+        ranked = rank_suggestions(hits, owned=set(), shown=set(), mapper=mapper(), variety=1.0, limit=6)
+        self.assertEqual(len(ranked), 6)
+        self.assertEqual(ranked[0].artist, "Muse")
+        self.assertGreater(len({item.artist for item in ranked}), 4)
+
+    def test_middle_variety_is_half_cluster_half_spread(self) -> None:
+        hits = [Hit(artist="Muse", title="Top", match=1.0, tags=("rock",))]
+        hits.extend(Hit(artist="Muse", title=f"M{index}", match=0.9, tags=("rock",)) for index in range(6))
+        hits.extend(Hit(artist=f"Band{index}", title=f"B{index}", match=0.4, tags=(f"tag{index}",)) for index in range(6))
+        ranked = rank_suggestions(hits, owned=set(), shown=set(), mapper=mapper(), variety=0.5, limit=10)
+        self.assertEqual(len(ranked), 10)
+        self.assertTrue(all(item.artist == "Muse" for item in ranked[:5]))
+        self.assertTrue(all(item.artist != "Muse" for item in ranked[5:]))
+
+    def test_library_filter_keeps_one_side(self) -> None:
+        hits = [
+            Hit(artist="A", title="In", match=0.9, vias=("in your library",)),
+            Hit(artist="B", title="Out", match=0.8, vias=("similar to A",)),
+        ]
+        owned = {owned_key("A", "In")}
+        only_in = rank_suggestions(
+            hits, owned=owned, shown=set(), mapper=mapper(), variety=0.5, library_filter="in", limit=10
+        )
+        only_out = rank_suggestions(
+            hits, owned=owned, shown=set(), mapper=mapper(), variety=0.5, library_filter="out", limit=10
+        )
+        self.assertEqual([item.title for item in only_in], ["In"])
+        self.assertEqual([item.title for item in only_out], ["Out"])
+
+    def test_suggest_count_and_knobs(self) -> None:
+        self.assertEqual(clamp_suggest_count(None), 100)
+        self.assertEqual(clamp_suggest_count("20"), 20)
+        self.assertEqual(clamp_suggest_count(7), 100)
+        knobs = suggest_knobs(0.5, "out")
+        self.assertAlmostEqual(float(knobs["variety"]), 0.5)
+        self.assertEqual(knobs["library_filter"], "out")
+        self.assertEqual(suggest_knobs(0, "in")["library_filter"], "in")
 
 
 class LastfmParseTests(unittest.TestCase):

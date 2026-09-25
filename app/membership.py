@@ -40,6 +40,17 @@ def is_admin(ctx: Any, user_id: int | None) -> bool:
     return bool(admin_id) and int(user_id) == admin_id
 
 
+def profile_fields(user: Any | None) -> dict[str, Any]:
+    """Telegram profile fields when a user object is present. Empty if there is none."""
+    if user is None:
+        return {}
+    return {
+        "username": getattr(user, "username", None),
+        "first_name": getattr(user, "first_name", None),
+        "last_name": getattr(user, "last_name", None),
+    }
+
+
 def _same_id(left: Any, right: Any) -> bool:
     try:
         return int(left) == int(right)
@@ -178,7 +189,10 @@ async def allow_user(ctx: Any, user_id: int | None, chat: Any | None = None) -> 
             return False
         if not chat_is_known(ctx, chat_id):
             title = str(getattr(chat, "title", None) or getattr(chat, "full_name", None) or "")
-            ctx.catalog.upsert_chat(chat_id, type=chat_type, title=title, active=True)
+            username = str(getattr(chat, "username", None) or "")
+            ctx.catalog.upsert_chat(
+                chat_id, type=chat_type, title=title, username=username, active=True
+            )
         return True
     # Private DM, or no chat on the event (callbacks / membership alias).
     if chat is None or chat_type == "private" or chat_id > 0:
@@ -199,9 +213,11 @@ async def require_user(ctx: Any, user_id: int | None, chat: Any | None = None) -
     return int(user_id or 0)
 
 
-def touch(ctx: Any, user_id: int | None) -> None:
+def touch(ctx: Any, user_id: int | None, user: Any | None = None) -> None:
+    if not user_id and user is not None:
+        user_id = getattr(user, "id", None)
     if user_id:
-        ctx.catalog.touch_user(int(user_id))
+        ctx.catalog.touch_user(int(user_id), **profile_fields(user))
 
 
 def check_search_rate(ctx: Any, user_id: int) -> None:
