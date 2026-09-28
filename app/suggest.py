@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta, timezone
@@ -15,7 +16,7 @@ from app.formats import detect_format, normalize_suggest_library, user_settings_
 from app.genre import GenreMapper, genre_tokens
 from app.models import TagSet, TrackRecord
 from app.relocate import tags_from_track
-from app.util import artist_name_set, normalize_match_text, split_artist_field
+from app.util import normalize_match_text, split_artist_field
 
 log = logging.getLogger(__name__)
 
@@ -126,8 +127,44 @@ def owned_key(artist: str, title: str) -> str:
     return f"{normalize_match_text(artist)}|{normalize_match_text(title)}"
 
 
-def artists_overlap(left: str, right: str) -> bool:
-    return bool(artist_name_set(left) & artist_name_set(right))
+# feat / ft / featuring, "&", "and", and commas. Credit order does not matter for equality.
+_CREDIT_SPLIT = re.compile(
+    r"\s*,\s*|\s+&\s+|\s+\band\b\s+|\s+(?:featuring|feat|ft)\.?\s+",
+    re.IGNORECASE,
+)
+_LEADING_THE = re.compile(r"^the\s+")
+
+
+def credit_acts(artist: str) -> list[str]:
+    acts: list[str] = []
+    seen: set[str] = set()
+    for part in _CREDIT_SPLIT.split(artist or ""):
+        name = _LEADING_THE.sub("", normalize_match_text(part)).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        acts.append(name)
+    return acts
+
+
+def same_recording(artist: str, title: str, other_artist: str, other_title: str) -> bool:
+    """Same song: normalized titles match, and the acts are the same.
+
+    Title alone is not enough. Credit sets match ignoring order and a leading
+    "The", or both credits share the same primary act (Artist feat. Guest
+    matches Artist). A cover by a different act stays a different recording.
+    """
+    left_title = normalize_match_text(title)
+    right_title = normalize_match_text(other_title)
+    if not left_title or left_title != right_title:
+        return False
+    left = credit_acts(artist)
+    right = credit_acts(other_artist)
+    if not left or not right:
+        return False
+    if set(left) == set(right):
+        return True
+    return left[0] == right[0]
 
 
 def library_artists_by_title(tracks: list[TrackRecord]) -> dict[str, list[str]]:
@@ -145,20 +182,20 @@ def library_artists_by_title(tracks: list[TrackRecord]) -> dict[str, list[str]]:
     return grouped
 
 
-def credit_overlaps_library(artist: str, title: str, by_title: dict[str, list[str]]) -> bool:
+def recording_in_library(artist: str, title: str, by_title: dict[str, list[str]]) -> bool:
     title_key = normalize_match_text(title)
     if not title_key:
         return False
-    return any(artists_overlap(artist, library_artist) for library_artist in by_title.get(title_key, []))
+    return any(same_recording(artist, title, library_artist, title) for library_artist in by_title.get(title_key, []))
 
 
-def overlap_hit_keys(hits: list[Hit], by_title: dict[str, list[str]]) -> set[str]:
+def same_recording_keys(hits: list[Hit], by_title: dict[str, list[str]]) -> set[str]:
     keys: set[str] = set()
     for hit in hits:
         key = owned_key(hit.artist, hit.title)
         if key == "|" or not hit.title:
             continue
-        if credit_overlaps_library(hit.artist, hit.title, by_title):
+        if recording_in_library(hit.artist, hit.title, by_title):
             keys.add(key)
     return keys
 
@@ -1178,10 +1215,10 @@ async def suggest_tracks(
         # Seeds are the library. Keep those keys so "in" is not an empty pool.
         rank_owned = owned_keys_from_tracks(matching_rows) if library_rows else set(owned)
         exclude = (seed_keys | library_keys) - rank_owned
-        rank_owned |= overlap_hit_keys(hits, library_artists_by_title(matching_rows))
+        rank_owned |= same_recording_keys(hits, library_artists_by_title(matching_rows))
     elif filt == "out":
-        # Same song with a different Last.fm credit still counts as owned.
-        exclude = seed_keys | library_keys | overlap_hit_keys(hits, by_title)
+        # Same act and title counts as owned. A cover by a different act does not.
+        exclude = seed_keys | library_keys | same_recording_keys(hits, by_title)
     else:
         exclude = seed_keys
     items = rank_suggestions(

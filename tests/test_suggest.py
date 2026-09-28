@@ -48,6 +48,7 @@ from app.suggest import (
     parse_similar_artists,
     parse_similar_tracks,
     parse_top_tracks,
+    primary_artist,
     rank_suggestions,
     seed_from_track,
     select_library_seeds,
@@ -1126,7 +1127,7 @@ class SuggestPipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(("Radiohead", "Karma Police"), _pairs(queried))
 
-    async def test_library_filter_out_drops_overlapping_credit(self) -> None:
+    async def test_library_filter_out_keeps_different_primary_act(self) -> None:
         library = [
             _library_track("Karma Police", "Radiohead", track_id=1),
             _library_track("Paranoid Android", "Radiohead", track_id=2),
@@ -1151,11 +1152,53 @@ class SuggestPipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         pairs = _pairs(items)
         self.assertNotIn(("Radiohead", "Karma Police"), pairs)
-        self.assertNotIn(("Thom Yorke & Radiohead", "Karma Police"), pairs)
+        self.assertIn(("Thom Yorke & Radiohead", "Karma Police"), pairs)
         self.assertNotIn(("Radiohead", "Paranoid Android"), pairs)
         self.assertIn(("Muse", "Starlight"), pairs)
-        self.assertTrue(pairs)
+        cover = next(item for item in items if item.artist == "Thom Yorke & Radiohead")
+        self.assertFalse(cover.in_library)
         self.assertTrue(all(not item.in_library for item in items))
+
+    async def test_library_filter_out_matches_same_act_not_covers(self) -> None:
+        async def listed(library_artist: str, hits: list[SimilarTrack]) -> list:
+            library = [_library_track("Yesterday", library_artist)]
+            seeds = [seed_from_track(track) for track in library]
+            client = FakeLastfm()
+            client.top_map[primary_artist(seeds[0].artist)] = hits
+            return await suggest_tracks(
+                client,
+                seeds,
+                owned=owned_keys_from_tracks(library),
+                shown=set(),
+                mapper=mapper(),
+                library=library,
+                library_filter="out",
+                variety=0.5,
+            )
+
+        beatles = await listed(
+            "Beatles",
+            [SimilarTrack("The Beatles", "Yesterday", 0.9), SimilarTrack("Muse", "Starlight", 0.4)],
+        )
+        self.assertNotIn(("The Beatles", "Yesterday"), _pairs(beatles))
+        self.assertIn(("Muse", "Starlight"), _pairs(beatles))
+
+        featured = await listed(
+            "The Beatles feat. someone",
+            [SimilarTrack("The Beatles", "Yesterday", 0.9), SimilarTrack("Muse", "Starlight", 0.4)],
+        )
+        self.assertNotIn(("The Beatles", "Yesterday"), _pairs(featured))
+        self.assertIn(("Muse", "Starlight"), _pairs(featured))
+
+        cover = await listed(
+            "The Beatles",
+            [SimilarTrack("Ray Charles", "Yesterday", 0.95), SimilarTrack("Muse", "Starlight", 0.4)],
+        )
+        pairs = _pairs(cover)
+        self.assertIn(("Ray Charles", "Yesterday"), pairs)
+        self.assertNotIn(("The Beatles", "Yesterday"), pairs)
+        kept = next(item for item in cover if item.artist == "Ray Charles")
+        self.assertFalse(kept.in_library)
 
     async def test_library_filter_any_keeps_mix(self) -> None:
         library = [
