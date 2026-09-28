@@ -109,6 +109,27 @@ class Suggestion:
         return cls(**{key: value for key, value in data.items() if key in allowed})
 
 
+@dataclass(frozen=True)
+class SuggestQuery:
+    """Facets parsed from a suggest search box or /suggest text.
+
+    Absent facets are empty and must not filter. ``tokens`` are the canonical
+    language, mood, genre, and instrument labels, in that match order.
+    """
+
+    language: str | None = None
+    artist: str = ""
+    title: str = ""
+    moods: tuple[str, ...] = ()
+    genres: tuple[str, ...] = ()
+    instruments: tuple[str, ...] = ()
+    tokens: tuple[str, ...] = ()
+
+    @property
+    def active(self) -> bool:
+        return bool(self.language or self.artist or self.title or self.tokens)
+
+
 class LastfmAPI(Protocol):
     async def similar_artists(self, artist: str, limit: int = SIMILAR_ARTIST_LIMIT) -> list[SimilarArtist]: ...
 
@@ -203,6 +224,30 @@ def same_recording_keys(hits: list[Hit], by_title: dict[str, list[str]]) -> set[
 def primary_artist(artist: str) -> str:
     names = split_artist_field(artist)
     return names[0] if names else (artist or "").strip()
+
+
+def artist_named(artist: str, query_artist: str) -> bool:
+    """Case-insensitive artist match. Title text is not an artist name.
+
+    Multi-word names match as a whole credit (or the primary act), so a cover
+    that reuses the title is a different artist.
+    """
+    want = normalize_match_text(query_artist)
+    if not want:
+        return False
+    if normalize_match_text(artist) == want:
+        return True
+    if want in credit_acts(artist):
+        return True
+    return normalize_match_text(primary_artist(artist)) == want
+
+
+def title_has_words(title: str, query_title: str) -> bool:
+    want = normalize_match_text(query_title).split()
+    if not want:
+        return True
+    have = set(normalize_match_text(title).split())
+    return all(word in have for word in want)
 
 
 def unique_fold(values: list[str]) -> list[str]:
@@ -429,6 +474,107 @@ def leftover_matches_seed(seed: SeedTrack, leftover: str) -> bool:
     return all(word in hay for word in query.split())
 
 
+def _artist_phrases(names: list[str] | tuple[str, ...]) -> list[tuple[str, ...]]:
+    seen: set[str] = set()
+    phrases: list[tuple[str, ...]] = []
+    for name in names:
+        candidates = [
+            normalize_match_text(name),
+            normalize_match_text(primary_artist(name)),
+            *credit_acts(name),
+        ]
+        for phrase in candidates:
+            words = tuple(phrase.split())
+            if not words or phrase in seen:
+                continue
+            seen.add(phrase)
+            phrases.append(words)
+    phrases.sort(key=len, reverse=True)
+    return phrases
+
+
+def _split_leftover(
+    leftover: str,
+    artists: list[str] | tuple[str, ...],
+    titles: list[str] | tuple[str, ...],
+) -> tuple[str, str]:
+    text = " ".join((leftover or "").split())
+    if not text:
+        return "", ""
+    if " - " in text:
+        artist, title = text.split(" - ", 1)
+        return artist.strip(), title.strip()
+    raw_words = text.split()
+    norm_words = [normalize_match_text(word) for word in raw_words]
+    for words in _artist_phrases(artists):
+        size = len(words)
+        if size > len(norm_words):
+            continue
+        for index in range(len(norm_words) - size + 1):
+            if tuple(norm_words[index : index + size]) != words:
+                continue
+            artist = " ".join(raw_words[index : index + size])
+            rest = raw_words[:index] + raw_words[index + size :]
+            return artist, " ".join(rest)
+    known_titles = {normalize_match_text(title) for title in titles}
+    known_titles.discard("")
+    if normalize_match_text(text) in known_titles:
+        return "", text
+    return text, ""
+
+
+def parse_suggest_query(
+    text: str,
+    mapper: GenreMapper,
+    *,
+    artists: list[str] | tuple[str, ...] | None = None,
+    titles: list[str] | tuple[str, ...] | None = None,
+) -> SuggestQuery:
+    """Split a search into language, mood, genre, artist, and leftover title words.
+
+    Vocabulary comes from the genre map (so sad/happy/chill map onto those tags).
+    Matching is case-insensitive. Words that are not a facet stay a multi-word
+    artist name, unless they are a known title or follow ``Artist - Title``.
+    """
+    found, leftover = mapper.extract_query_tokens(text or "")
+    language: str | None = None
+    moods: list[str] = []
+    genres: list[str] = []
+    instruments: list[str] = []
+    tokens: list[str] = []
+    for token in found:
+        label = mapper.canonical_label(token) or token
+        bucket = mapper.token_bucket(token)
+        if bucket == "languages":
+            if language is None:
+                language = label
+        elif bucket == "moods":
+            moods.append(label)
+        elif bucket == "genres":
+            genres.append(label)
+        elif bucket == "instruments":
+            instruments.append(label)
+        tokens.append(label)
+    artist, title = _split_leftover(leftover, artists or (), titles or ())
+    return SuggestQuery(
+        language=language,
+        artist=artist,
+        title=title,
+        moods=tuple(moods),
+        genres=tuple(genres),
+        instruments=tuple(instruments),
+        tokens=tuple(tokens),
+    )
+
+
+def seed_facet_tags(seed: SeedTrack, mapper: GenreMapper) -> list[str]:
+    tags = list(seed.tokens)
+    lang = mapper.language_from_topic(seed.topic_name)
+    if lang:
+        tags.append(lang)
+    return unique_fold(tags)
+
+
 def track_matches_language(seed: SeedTrack, language: str, mapper: GenreMapper) -> bool:
     want = language.casefold()
     if (seed.topic_name or "").casefold() == want:
@@ -624,11 +770,22 @@ def other_language(hit: Hit, language: str | None, mapper: GenreMapper) -> bool:
 
 
 def query_tokens_ok(hit: Hit, query_tokens: list[str], mapper: GenreMapper) -> bool:
+    """Every parsed facet token must be on the hit itself.
+
+    Seed tokens are the parent track's tags copied onto similar songs, so they
+    do not count. One overlapping token is not enough: "english pop" needs both.
+    """
     if not query_tokens:
         return True
-    want = { (mapper.canonical_label(item) or item).casefold() for item in query_tokens }
-    have = { (mapper.canonical_label(item) or item).casefold() for item in (*hit.tags, *hit.seed_tokens, *hit.artist_tags) }
-    return bool(want & have)
+    want = {(mapper.canonical_label(item) or item).casefold() for item in query_tokens if item}
+    if not want:
+        return True
+    have = {
+        (mapper.canonical_label(item) or item).casefold()
+        for item in (*hit.tags, *hit.artist_tags)
+        if item
+    }
+    return want <= have
 
 
 def score_hit(
@@ -732,6 +889,7 @@ def rank_suggestions(
     mapper: GenreMapper,
     language: str | None = None,
     query_tokens: list[str] | None = None,
+    facets: SuggestQuery | None = None,
     seed_profile: list[str] | None = None,
     exclude: set[str] | None = None,
     per_artist: int = PER_ARTIST_CAP,
@@ -743,6 +901,9 @@ def rank_suggestions(
     library_filter: str = "any",
 ) -> list[Suggestion]:
     query_tokens = query_tokens or []
+    facets = facets or SuggestQuery()
+    if facets.tokens:
+        query_tokens = list(facets.tokens)
     seed_profile = seed_profile or []
     skip = exclude or set()
     merged = merge_hits(hits)
@@ -755,6 +916,10 @@ def rank_suggestions(
         if other_language(hit, language, mapper):
             continue
         if not query_tokens_ok(hit, query_tokens, mapper):
+            continue
+        if facets.artist and not artist_named(hit.artist, facets.artist):
+            continue
+        if facets.title and not title_has_words(hit.title, facets.title):
             continue
         if key not in owned and hit.match < min_match:
             continue
@@ -911,6 +1076,60 @@ def narrow_seeds_for_query(seeds: list[SeedTrack], query_tokens: list[str], mapp
     keys = {owned_key(seed.artist, seed.title) for seed in tagged}
     extra = [seed for seed in seeds if seed.boosted and owned_key(seed.artist, seed.title) not in keys]
     return tagged + extra
+
+
+def focus_seeds(seeds: list[SeedTrack], facets: SuggestQuery, mapper: GenreMapper) -> list[SeedTrack]:
+    """Keep seeds that fit every present facet. No match means no unrelated seeds."""
+    if not facets.active:
+        return seeds
+    picked: list[SeedTrack] = []
+    for seed in seeds:
+        probe = Hit(
+            artist=seed.artist,
+            title=seed.title or "track",
+            match=0,
+            tags=tuple(seed_facet_tags(seed, mapper)),
+        )
+        if not query_tokens_ok(probe, list(facets.tokens), mapper):
+            continue
+        if facets.artist and not artist_named(seed.artist, facets.artist):
+            continue
+        if facets.title and not title_has_words(seed.title, facets.title):
+            continue
+        picked.append(seed)
+    return picked
+
+
+async def seeds_for_query(
+    seeds: list[SeedTrack],
+    facets: SuggestQuery,
+    client: LastfmAPI | None,
+) -> list[SeedTrack]:
+    """Boost library seeds that fit the parsed name. Resolve the rest on Last.fm."""
+    if not facets.artist and not facets.title:
+        return seeds
+    if facets.artist:
+        named = [seed for seed in seeds if artist_named(seed.artist, facets.artist)]
+        matched = [seed for seed in named if not facets.title or title_has_words(seed.title, facets.title)]
+        for seed in matched:
+            seed.boosted = True
+        if matched or client is None:
+            return seeds
+        text = f"{facets.artist} - {facets.title}" if facets.title else facets.artist
+    else:
+        matched = [seed for seed in seeds if title_has_words(seed.title, facets.title)]
+        for seed in matched:
+            seed.boosted = True
+        if matched or client is None:
+            return seeds
+        text = facets.title
+    resolved = await resolve_leftover(client, text)
+    if resolved is None:
+        return seeds
+    resolved_key = owned_key(resolved.artist, resolved.title)
+    if any(owned_key(seed.artist, seed.title) == resolved_key for seed in seeds):
+        return seeds
+    return [*seeds, resolved]
 
 
 def seed_profile_tokens(seeds: list[SeedTrack]) -> list[str]:
@@ -1144,6 +1363,7 @@ def hits_from_library(
                 title=seed.title,
                 match=match,
                 vias=(via,),
+                tags=tuple(seed_facet_tags(seed, mapper)),
                 seed_tokens=tuple(seed.tokens),
             )
         )
@@ -1177,6 +1397,7 @@ async def suggest_tracks(
     mapper: GenreMapper,
     language: str | None = None,
     query_tokens: list[str] | None = None,
+    facets: SuggestQuery | None = None,
     library: list[TrackRecord] | None = None,
     min_match: float = 0.0,
     seed_weight: float = 0.15,
@@ -1185,14 +1406,23 @@ async def suggest_tracks(
     variety: float | None = None,
     library_filter: str = "any",
 ) -> list[Suggestion]:
-    query_tokens = query_tokens or []
+    query_tokens = list(query_tokens or [])
+    facets = facets or SuggestQuery()
+    if facets.language and not language:
+        language = facets.language
+    if facets.tokens:
+        query_tokens = list(facets.tokens)
     count = max(1, int(limit))
     filt = normalize_suggest_library(library_filter)
-    seeds = narrow_seeds_for_query(seeds, query_tokens, mapper)
+    if facets.active:
+        seeds = focus_seeds(seeds, facets, mapper)
+    else:
+        seeds = narrow_seeds_for_query(seeds, query_tokens, mapper)
     hits = await collect_hits(client, seeds, language=language, mapper=mapper, caps=fetch_caps(count))
     library_rows = list(library or [])
     by_title = library_artists_by_title(library_rows)
     # "out" stays Last.fm-only. Library rows would reintroduce songs the user already has.
+    # A search still keeps matching library rows, including the seeds themselves.
     if library_rows and filt != "out":
         hits.extend(
             hits_from_library(
@@ -1200,7 +1430,7 @@ async def suggest_tracks(
                 seeds,
                 mapper,
                 language,
-                include_seeds=filt == "in",
+                include_seeds=filt == "in" or facets.active,
             )
         )
     seed_keys = {owned_key(seed.artist, seed.title) for seed in seeds if seed.title}
@@ -1219,6 +1449,8 @@ async def suggest_tracks(
     elif filt == "out":
         # Same act and title counts as owned. A cover by a different act does not.
         exclude = seed_keys | library_keys | same_recording_keys(hits, by_title)
+    elif facets.active:
+        exclude = set()
     else:
         exclude = seed_keys
     items = rank_suggestions(
@@ -1228,6 +1460,7 @@ async def suggest_tracks(
         mapper=mapper,
         language=language,
         query_tokens=query_tokens,
+        facets=facets,
         seed_profile=seed_profile_tokens(seeds),
         exclude=exclude,
         limit=count,
@@ -1262,11 +1495,19 @@ async def suggest_for_user(
         bound = ctx_for_user(ctx, user_id)
         entries = load_index_entries(bound) or []
         library = entries_to_tracks(entries)
+    parsed = parse_suggest_query(
+        query,
+        ctx.genre,
+        artists=[track.artist or "" for track in library],
+        titles=[track.title or "" for track in library],
+    )
+    if parsed.language:
+        language = parsed.language
     seeds = select_library_seeds(library, ctx.genre, language=language)
     owned = owned_keys_from_tracks(library)
     shown = ctx.catalog.list_suggest_shown(user_id, limit=max(200, count))
     client = LastfmClient(ctx.http, api_key, ctx.catalog)
-    tokens = [part for part in (query or "").replace(",", " ").split() if part]
+    seeds = await seeds_for_query(seeds, parsed, client)
     user = ctx.catalog.get_user(user_id)
     settings = user_settings_dict(user)
     knobs = suggest_knobs(settings.get("suggest_similarity", 0.5), settings.get("suggest_library"))
@@ -1277,7 +1518,8 @@ async def suggest_for_user(
         shown=shown,
         mapper=ctx.genre,
         language=language,
-        query_tokens=tokens,
+        query_tokens=list(parsed.tokens),
+        facets=parsed,
         library=library,
         limit=count,
         variety=float(knobs["variety"]),

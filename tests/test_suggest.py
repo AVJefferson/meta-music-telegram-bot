@@ -37,6 +37,7 @@ from app.suggest import (
     SimilarArtist,
     SimilarTrack,
     Suggestion,
+    artist_named,
     attach_library_meta,
     clamp_suggest_count,
     leftover_matches_seed,
@@ -47,6 +48,7 @@ from app.suggest import (
     parse_library_relative,
     parse_similar_artists,
     parse_similar_tracks,
+    parse_suggest_query,
     parse_top_tracks,
     primary_artist,
     rank_suggestions,
@@ -164,6 +166,28 @@ class QueryParseTests(unittest.TestCase):
         self.assertIn("malayalam", labels)
         self.assertIn("jazz", labels)
         self.assertFalse(leftover)
+
+    def test_english_pop_parses_language_and_genre(self) -> None:
+        parsed = parse_suggest_query("ENGLISH pop", mapper())
+        self.assertEqual(parsed.language, "English")
+        self.assertEqual([item.casefold() for item in parsed.genres], ["pop"])
+        self.assertFalse(parsed.moods)
+        self.assertFalse(parsed.artist)
+        self.assertFalse(parsed.title)
+        self.assertEqual([item.casefold() for item in parsed.tokens], ["english", "pop"])
+
+    def test_sad_ed_sheeran_parses_mood_and_artist(self) -> None:
+        parsed = parse_suggest_query("Sad Ed Sheeran", mapper(), artists=["Ed Sheeran", "Passenger"])
+        self.assertEqual([item.casefold() for item in parsed.moods], ["sad"])
+        self.assertEqual(parsed.artist.casefold(), "ed sheeran")
+        self.assertFalse(parsed.title)
+        self.assertIsNone(parsed.language)
+        bare = parse_suggest_query("sad ed sheeran", mapper())
+        self.assertEqual(bare.artist.casefold(), "ed sheeran")
+        self.assertTrue(artist_named("Ed Sheeran", parsed.artist))
+        self.assertTrue(artist_named("Ed Sheeran feat. Someone", "ed sheeran"))
+        self.assertFalse(artist_named("Passenger", "Ed Sheeran"))
+        self.assertFalse(artist_named("Cover Band", "Ed Sheeran"))
 
 
 class DrivePathTests(unittest.TestCase):
@@ -1311,6 +1335,83 @@ class SuggestPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Other Song", titles_11)
         self.assertLess(titles_11.index("New Song"), titles_11.index("Other Song"))
         self.assertTrue(all(not row["in_library"] for row in rows_11))
+
+    async def test_query_shortlists_english_pop_and_sad_ed_sheeran(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = Catalog(Path(directory) / "state.sqlite")
+
+            def add(user_id: int, title: str, artist: str, genre: str, topic: str, path: str) -> None:
+                _track(
+                    catalog,
+                    user_id=user_id,
+                    title=title,
+                    artist=artist,
+                    album="Album",
+                    relative_path=path,
+                    file_name=path,
+                    topic_name=topic,
+                    tags_json=json.dumps(
+                        {
+                            "title": title,
+                            "artist": artist,
+                            "album": "Album",
+                            "albumartist": artist,
+                            "composer": "",
+                            "genre": genre,
+                            "date": "2017",
+                            "tracknumber": "1",
+                            "discnumber": "1",
+                            "lyrics": "",
+                        }
+                    ),
+                )
+
+            add(10, "Hello", "Adele", "pop | English", "English", "hello.flac")
+            add(10, "Karma Police", "Radiohead", "alternative rock | English", "English", "karma.flac")
+            add(10, "Tum Hi Ho", "Arijit Singh", "pop | Hindi", "Hindi", "tum.flac")
+            add(10, "Payaliya", "K. S. Harisankar", "pop | Malayalam", "Malayalam", "payaliya.flac")
+            add(10, "Shape of You", "Ed Sheeran", "pop | sad | English", "English", "shape.flac")
+            add(10, "Shape of You", "Passenger", "pop | sad | English", "English", "shape-pass.flac")
+            add(10, "Castle on the Hill", "Ed Sheeran", "pop | happy | English", "English", "castle.flac")
+            add(10, "Ed Sheeran", "Cover Band", "pop | sad | English", "English", "cover.flac")
+            add(99, "Secret", "Ed Sheeran", "pop | sad | English", "English", "secret.flac")
+            client = FakeLastfm()
+            client.top_map["Ed Sheeran"] = [
+                SimilarTrack("Muse", "Unrelated", 0.99),
+                SimilarTrack("Passenger", "Shape of You", 0.95),
+            ]
+            client.top_map["Adele"] = [SimilarTrack("Muse", "Unrelated", 0.99)]
+            client.top_map["Radiohead"] = [SimilarTrack("Muse", "Unrelated", 0.99)]
+            client.top_map["Passenger"] = [SimilarTrack("Muse", "Unrelated", 0.99)]
+            ctx = Ctx(
+                settings=settings(lastfm_api_key="k"),
+                catalog=catalog,
+                drive=SimpleNamespace(),
+                http=None,
+                genre=mapper(),
+                bot=SimpleNamespace(),
+                mb=None,
+                jobs=None,
+            )
+            with patch("app.suggest.LastfmClient", return_value=client):
+                pop = await suggest_for_user(ctx, 10, "english pop", limit=20)
+                sad = await suggest_for_user(ctx, 10, "SAD ed SHEERAN", limit=20)
+        pop_pairs = {(row["artist"], row["title"]) for row in pop}
+        self.assertIn(("Adele", "Hello"), pop_pairs)
+        self.assertIn(("Ed Sheeran", "Shape of You"), pop_pairs)
+        self.assertIn(("Passenger", "Shape of You"), pop_pairs)
+        self.assertIn(("Ed Sheeran", "Castle on the Hill"), pop_pairs)
+        self.assertNotIn(("Radiohead", "Karma Police"), pop_pairs)
+        self.assertNotIn(("Arijit Singh", "Tum Hi Ho"), pop_pairs)
+        self.assertNotIn(("K. S. Harisankar", "Payaliya"), pop_pairs)
+        self.assertNotIn(("Muse", "Unrelated"), pop_pairs)
+        self.assertNotIn(("Ed Sheeran", "Secret"), pop_pairs)
+        self.assertTrue(pop_pairs)
+        sad_pairs = {(row["artist"], row["title"]) for row in sad}
+        self.assertEqual(sad_pairs, {("Ed Sheeran", "Shape of You")})
+        self.assertNotIn(("Passenger", "Shape of You"), sad_pairs)
+        self.assertNotIn(("Cover Band", "Ed Sheeran"), sad_pairs)
+        self.assertTrue(all(row["artist"] == "Ed Sheeran" for row in sad))
 
 
 def _library_track(

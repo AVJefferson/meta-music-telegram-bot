@@ -20,10 +20,10 @@ from app.suggest import (
     PAGE_SIZE,
     LastfmClient,
     Suggestion,
-    leftover_matches_seed,
     owned_key,
     owned_keys_from_tracks,
-    resolve_leftover,
+    parse_suggest_query,
+    seeds_for_query,
     select_library_seeds,
     session_expires_at,
     suggest_knobs,
@@ -229,15 +229,6 @@ async def _run_suggest(message: Message, ctx: Ctx, query: str) -> None:
         await _deliver(message, "Suggestions need LASTFM_API_KEY (Last.fm API account).")
         return
     mapper = ctx.genre
-    query_tokens, leftover = mapper.extract_query_tokens(query)
-    language = next(
-        (
-            mapper.canonical_label(token) or token
-            for token in query_tokens
-            if mapper.token_bucket(token) == "languages"
-        ),
-        None,
-    )
     reply_track: TrackRecord | None = None
     reply = message.reply_to_message
     if reply:
@@ -252,6 +243,13 @@ async def _run_suggest(message: Message, ctx: Ctx, query: str) -> None:
             topic=None,
             notify=lambda text: _deliver(message, text),
         )
+    known_artists = [track.artist or "" for track in library]
+    known_titles = [track.title or "" for track in library]
+    if reply_track is not None:
+        known_artists.append(reply_track.artist or "")
+        known_titles.append(reply_track.title or "")
+    parsed = parse_suggest_query(query, mapper, artists=known_artists, titles=known_titles)
+    language = parsed.language
     if not library and reply_track is None:
         await _deliver(message, "Library is empty. Upload audio first.")
         return
@@ -259,14 +257,10 @@ async def _run_suggest(message: Message, ctx: Ctx, query: str) -> None:
         library,
         mapper,
         language=language,
-        leftover=leftover,
         boosted=reply_track,
     )
-    leftover_matched = bool(leftover) and any(leftover_matches_seed(seed, leftover) for seed in seeds)
-    if leftover and not leftover_matched:
-        resolved = await resolve_leftover(LastfmClient(ctx.http, api_key, ctx.catalog), leftover)
-        if resolved:
-            seeds.append(resolved)
+    client = LastfmClient(ctx.http, api_key, ctx.catalog)
+    seeds = await seeds_for_query(seeds, parsed, client)
     if language and not seeds:
         await _deliver(
             message,
@@ -278,7 +272,6 @@ async def _run_suggest(message: Message, ctx: Ctx, query: str) -> None:
         return
     owned = owned_keys_from_tracks(library)
     shown = ctx.catalog.list_suggest_shown(message.from_user.id) if message.from_user else set()
-    client = LastfmClient(ctx.http, api_key, ctx.catalog)
     user = ctx.catalog.get_user(message.from_user.id) if message.from_user else None
     settings = user_settings_dict(user)
     knobs = suggest_knobs(settings.get("suggest_similarity", 0.5), settings.get("suggest_library"))
@@ -290,7 +283,8 @@ async def _run_suggest(message: Message, ctx: Ctx, query: str) -> None:
             shown=shown,
             mapper=mapper,
             language=language,
-            query_tokens=query_tokens,
+            query_tokens=list(parsed.tokens),
+            facets=parsed,
             library=library,
             variety=float(knobs["variety"]),
             library_filter=str(knobs["library_filter"]),
