@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from mutagen.id3 import ID3, TIT2, TPE1
 
@@ -29,7 +30,7 @@ from app.library_index import (
     upsert_entries,
     upsert_library_index,
 )
-from app.models import TagSet
+from app.models import Ctx, TagSet, TrackRecord
 from app.suggest import (
     Hit,
     SeedTrack,
@@ -50,6 +51,7 @@ from app.suggest import (
     rank_suggestions,
     seed_from_track,
     select_library_seeds,
+    suggest_for_user,
     suggest_knobs,
     suggest_tracks,
     track_from_library_item,
@@ -64,6 +66,7 @@ from app.suggest_cmd import (
     pick_lyrics,
     suggest_label,
 )
+from tests.support import settings
 
 MAP = Path(__file__).resolve().parent.parent / "genre_map.yaml"
 
@@ -1072,3 +1075,240 @@ class SuggestPipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(tracks), 1)
             self.assertEqual(tracks[0].title, "Payaliya")
             self.assertIsNotNone(catalog.get_library_tag_index())
+
+    async def test_library_filter_in_includes_seeds(self) -> None:
+        library = [
+            _library_track("Karma Police", "Radiohead", track_id=1),
+            _library_track("Paranoid Android", "Radiohead", track_id=2),
+            _library_track(
+                "Payaliya",
+                "K. S. Harisankar",
+                track_id=3,
+                genre="filmi | Malayalam",
+                topic="Malayalam",
+            ),
+        ]
+        seeds = [seed_from_track(track) for track in library]
+        client = FakeLastfm()
+        client.top_map["Radiohead"] = [
+            SimilarTrack("Radiohead", "Karma Police", 0.8),
+            SimilarTrack("Muse", "Starlight", 0.9),
+        ]
+        client.top_map["K. S. Harisankar"] = [SimilarTrack("K. S. Harisankar", "Payaliya", 0.8)]
+        items = await suggest_tracks(
+            client,
+            seeds,
+            owned=owned_keys_from_tracks(library),
+            shown=set(),
+            mapper=mapper(),
+            language="English",
+            library=library,
+            library_filter="in",
+            variety=0.5,
+        )
+        pairs = _pairs(items)
+        self.assertIn(("Radiohead", "Karma Police"), pairs)
+        self.assertIn(("Radiohead", "Paranoid Android"), pairs)
+        self.assertNotIn(("Muse", "Starlight"), pairs)
+        self.assertNotIn(("K. S. Harisankar", "Payaliya"), pairs)
+        self.assertTrue(all(item.in_library for item in items))
+        queried = await suggest_tracks(
+            client,
+            seeds,
+            owned=owned_keys_from_tracks(library),
+            shown=set(),
+            mapper=mapper(),
+            language="English",
+            query_tokens=["jazz"],
+            library=library,
+            library_filter="in",
+            variety=0.5,
+        )
+        self.assertNotIn(("Radiohead", "Karma Police"), _pairs(queried))
+
+    async def test_library_filter_out_drops_overlapping_credit(self) -> None:
+        library = [
+            _library_track("Karma Police", "Radiohead", track_id=1),
+            _library_track("Paranoid Android", "Radiohead", track_id=2),
+        ]
+        seeds = [seed_from_track(track) for track in library]
+        client = FakeLastfm()
+        client.top_map["Radiohead"] = [
+            SimilarTrack("Radiohead", "Karma Police", 0.8),
+            SimilarTrack("Thom Yorke & Radiohead", "Karma Police", 0.95),
+            SimilarTrack("Radiohead", "Paranoid Android", 0.85),
+            SimilarTrack("Muse", "Starlight", 0.7),
+        ]
+        items = await suggest_tracks(
+            client,
+            seeds,
+            owned=owned_keys_from_tracks(library),
+            shown=set(),
+            mapper=mapper(),
+            library=library,
+            library_filter="out",
+            variety=0.5,
+        )
+        pairs = _pairs(items)
+        self.assertNotIn(("Radiohead", "Karma Police"), pairs)
+        self.assertNotIn(("Thom Yorke & Radiohead", "Karma Police"), pairs)
+        self.assertNotIn(("Radiohead", "Paranoid Android"), pairs)
+        self.assertIn(("Muse", "Starlight"), pairs)
+        self.assertTrue(pairs)
+        self.assertTrue(all(not item.in_library for item in items))
+
+    async def test_library_filter_any_keeps_mix(self) -> None:
+        library = [
+            _library_track("Karma Police", "Radiohead", track_id=1),
+            _library_track("Paranoid Android", "Radiohead", track_id=2),
+        ]
+        seeds = [seed_from_track(library[0])]
+        client = FakeLastfm()
+        client.top_map["Radiohead"] = [
+            SimilarTrack("Radiohead", "Karma Police", 0.9),
+            SimilarTrack("Radiohead", "Paranoid Android", 0.8),
+            SimilarTrack("Muse", "Starlight", 0.7),
+        ]
+        owned = owned_keys_from_tracks(library)
+        common = dict(owned=owned, shown=set(), mapper=mapper(), library=library, variety=0.5)
+        mixed = await suggest_tracks(client, seeds, library_filter="any", **common)
+        only_in = await suggest_tracks(client, [seed_from_track(track) for track in library], library_filter="in", **common)
+        only_out = await suggest_tracks(client, [seed_from_track(track) for track in library], library_filter="out", **common)
+        pairs = _pairs(mixed)
+        self.assertNotIn(("Radiohead", "Karma Police"), pairs)
+        self.assertIn(("Radiohead", "Paranoid Android"), pairs)
+        self.assertIn(("Muse", "Starlight"), pairs)
+        self.assertTrue(any(item.in_library for item in mixed))
+        self.assertTrue(any(not item.in_library for item in mixed))
+        self.assertIn(("Radiohead", "Karma Police"), _pairs(only_in))
+        self.assertNotIn(("Muse", "Starlight"), _pairs(only_in))
+        self.assertIn(("Muse", "Starlight"), _pairs(only_out))
+        self.assertNotIn(("Radiohead", "Karma Police"), _pairs(only_out))
+        self.assertNotIn(("Radiohead", "Paranoid Android"), _pairs(only_out))
+
+    async def test_two_users_do_not_share_suggestions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = Catalog(Path(directory) / "state.sqlite")
+            _track(
+                catalog,
+                user_id=10,
+                title="Karma Police",
+                artist="Radiohead",
+                relative_path="a-10.flac",
+                file_name="karma.flac",
+            )
+            _track(
+                catalog,
+                user_id=11,
+                title="Starlight",
+                artist="Muse",
+                album="Black Holes",
+                relative_path="b-11.flac",
+                file_name="starlight.flac",
+                topic_name="English",
+                tags_json=json.dumps(
+                    {
+                        "title": "Starlight",
+                        "artist": "Muse",
+                        "album": "Black Holes",
+                        "albumartist": "Muse",
+                        "composer": "",
+                        "genre": "alternative rock | English",
+                        "date": "2006",
+                        "tracknumber": "1",
+                        "discnumber": "1",
+                        "lyrics": "",
+                    }
+                ),
+            )
+            catalog.ensure_user(10)
+            catalog.update_user(
+                10,
+                settings_json=json.dumps({"suggest_library": "in", "suggest_similarity": 0.5}),
+            )
+            catalog.ensure_user(11)
+            catalog.update_user(
+                11,
+                settings_json=json.dumps({"suggest_library": "out", "suggest_similarity": 0.2}),
+            )
+            catalog.mark_suggest_shown(10, [owned_key("Outsider", "New Song")])
+            client = FakeLastfm()
+            client.top_map["Radiohead"] = [
+                SimilarTrack("Muse", "Starlight", 0.9),
+                SimilarTrack("Outsider", "New Song", 0.8),
+                SimilarTrack("Other", "Other Song", 0.4),
+            ]
+            client.top_map["Muse"] = [
+                SimilarTrack("Muse feat. Guy", "Starlight", 0.99),
+                SimilarTrack("Outsider", "New Song", 0.8),
+                SimilarTrack("Other", "Other Song", 0.4),
+            ]
+            ctx = Ctx(
+                settings=settings(lastfm_api_key="k"),
+                catalog=catalog,
+                drive=SimpleNamespace(),
+                http=None,
+                genre=mapper(),
+                bot=SimpleNamespace(),
+                mb=None,
+                jobs=None,
+            )
+            with patch("app.suggest.LastfmClient", return_value=client):
+                rows_10 = await suggest_for_user(ctx, 10, "", limit=10)
+                rows_11 = await suggest_for_user(ctx, 11, "", limit=10)
+        titles_10 = [row["title"] for row in rows_10]
+        titles_11 = [row["title"] for row in rows_11]
+        self.assertIn("Karma Police", titles_10)
+        self.assertNotIn("Starlight", titles_10)
+        self.assertNotIn("New Song", titles_10)
+        self.assertTrue(all(row["in_library"] for row in rows_10))
+        self.assertNotIn("Starlight", titles_11)
+        self.assertNotIn("Karma Police", titles_11)
+        self.assertIn("New Song", titles_11)
+        self.assertIn("Other Song", titles_11)
+        self.assertLess(titles_11.index("New Song"), titles_11.index("Other Song"))
+        self.assertTrue(all(not row["in_library"] for row in rows_11))
+
+
+def _library_track(
+    title: str,
+    artist: str,
+    *,
+    track_id: int = 1,
+    genre: str = "alternative rock | English",
+    topic: str = "English",
+) -> TrackRecord:
+    tags = {
+        "title": title,
+        "artist": artist,
+        "album": "Album",
+        "albumartist": artist,
+        "genre": genre,
+    }
+    return TrackRecord(
+        id=track_id,
+        mb_recording_id=None,
+        acoustid=None,
+        kind="library",
+        local_path=None,
+        sidecar_path=None,
+        drive_file_id=None,
+        drive_url=None,
+        relative_path=f"{title}.flac",
+        status="uploaded",
+        bit_depth=16,
+        sample_rate=44100,
+        title=title,
+        artist=artist,
+        album="Album",
+        error=None,
+        created_at="",
+        uploaded_at=None,
+        tags_json=json.dumps(tags),
+        topic_name=topic,
+        file_name=f"{title}.flac",
+    )
+
+
+def _pairs(items) -> set[tuple[str, str]]:
+    return {(item.artist, item.title) for item in items}

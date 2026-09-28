@@ -53,7 +53,7 @@
   let suggestQuery = new URLSearchParams(location.search).get("q") || "";
   let suggestCount = 10;
   let reviewCache = { tracks: null, fetchedAt: 0 };
-  let suggestCache = { q: null, n: null, data: null };
+  let suggestCache = { q: null, n: null, library: null, user: null, data: null };
   let detailRow = null;
 
   function esc(value) {
@@ -359,6 +359,16 @@
     const raw = me && me.suggest_library;
     if (raw === "in" || raw === "out" || raw === "any") return raw;
     return "any";
+  }
+
+  function suggestUserId() {
+    const user = tg && tg.initDataUnsafe && tg.initDataUnsafe.user;
+    if (!user || user.id == null) return "";
+    return String(user.id);
+  }
+
+  function emptySuggestCache() {
+    return { q: null, n: null, library: null, user: null, data: null };
   }
 
   function librarySeg(current) {
@@ -853,7 +863,14 @@
     const count = suggestCountValue(
       (document.getElementById("suggest-count") && document.getElementById("suggest-count").value) || suggestCount,
     );
-    const cached = suggestCache.data && suggestCache.q === suggestQuery && suggestCache.n === count;
+    const library = libraryFilter();
+    const user = suggestUserId();
+    const cached =
+      suggestCache.data &&
+      suggestCache.q === suggestQuery &&
+      suggestCache.n === count &&
+      suggestCache.library === library &&
+      suggestCache.user === user;
     if (cached && !force) {
       paintSuggestResults(suggestCache.data);
       return;
@@ -865,7 +882,7 @@
       { signal: pageAbort && pageAbort.signal },
     );
     if (!still()) return;
-    suggestCache = { q: suggestQuery, n: count, data };
+    suggestCache = { q: suggestQuery, n: count, library, user, data };
     paintSuggestResults(data);
   }
 
@@ -1202,9 +1219,11 @@
       });
       me.suggest_similarity = data.suggest_similarity;
       me.suggest_library = data.suggest_library;
+      return true;
     } catch (err) {
       haptic("error");
       showBanner(err);
+      return false;
     }
   }
 
@@ -1218,12 +1237,23 @@
   async function setLibraryFilter(value) {
     if (!me) return;
     const next = value === "in" || value === "out" ? value : "any";
+    if (libraryFilter() === next) return;
     me.suggest_library = next;
     mainEl.querySelectorAll("[data-library]").forEach((btn) => {
       btn.classList.toggle("is-on", btn.dataset.library === next);
     });
     haptic("light");
-    await saveSuggestPrefs({ suggest_library: next });
+    const saved = await saveSuggestPrefs({ suggest_library: next });
+    if (!saved) return;
+    suggestCache = emptySuggestCache();
+    if (page !== "suggest") return;
+    try {
+      await loadSuggest(suggestQuery, { gen: renderGen, force: true });
+    } catch (err) {
+      if (err && err.aborted) return;
+      haptic("error");
+      showBanner(err);
+    }
   }
 
   async function unlinkDrive() {
@@ -1293,7 +1323,7 @@
   mainEl.addEventListener("change", (event) => {
     if (!event.target || event.target.id !== "suggest-count") return;
     suggestCount = suggestCountValue(event.target.value);
-    suggestCache = { q: null, n: null, data: null };
+    suggestCache = emptySuggestCache();
     loadSuggest(suggestQuery, { gen: renderGen, force: true }).catch((err) => {
       if (err && err.aborted) return;
       haptic("error");
@@ -1306,7 +1336,7 @@
     if (!form) return;
     event.preventDefault();
     const q = (form.q && form.q.value) || "";
-    suggestCache = { q: null, n: null, data: null };
+    suggestCache = emptySuggestCache();
     go("suggest", q);
   });
 
