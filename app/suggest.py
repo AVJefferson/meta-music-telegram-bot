@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta, timezone
@@ -124,6 +125,79 @@ class LastfmAPI(Protocol):
 
 def owned_key(artist: str, title: str) -> str:
     return f"{normalize_match_text(artist)}|{normalize_match_text(title)}"
+
+
+# feat / ft / featuring, "&", "and", and commas. Credit order does not matter for equality.
+_CREDIT_SPLIT = re.compile(
+    r"\s*,\s*|\s+&\s+|\s+\band\b\s+|\s+(?:featuring|feat|ft)\.?\s+",
+    re.IGNORECASE,
+)
+_LEADING_THE = re.compile(r"^the\s+")
+
+
+def credit_acts(artist: str) -> list[str]:
+    acts: list[str] = []
+    seen: set[str] = set()
+    for part in _CREDIT_SPLIT.split(artist or ""):
+        name = _LEADING_THE.sub("", normalize_match_text(part)).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        acts.append(name)
+    return acts
+
+
+def same_recording(artist: str, title: str, other_artist: str, other_title: str) -> bool:
+    """Same song: normalized titles match, and the acts are the same.
+
+    Title alone is not enough. Credit sets match ignoring order and a leading
+    "The", or both credits share the same primary act (Artist feat. Guest
+    matches Artist). A cover by a different act stays a different recording.
+    """
+    left_title = normalize_match_text(title)
+    right_title = normalize_match_text(other_title)
+    if not left_title or left_title != right_title:
+        return False
+    left = credit_acts(artist)
+    right = credit_acts(other_artist)
+    if not left or not right:
+        return False
+    if set(left) == set(right):
+        return True
+    return left[0] == right[0]
+
+
+def library_artists_by_title(tracks: list[TrackRecord]) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for track in tracks:
+        seed = seed_from_track(track)
+        pairs = [(seed.artist, seed.title), (track.artist or "", track.title or "")]
+        for artist, title in pairs:
+            title_key = normalize_match_text(title)
+            if not title_key or not (artist or "").strip():
+                continue
+            bucket = grouped[title_key]
+            if artist not in bucket:
+                bucket.append(artist)
+    return grouped
+
+
+def recording_in_library(artist: str, title: str, by_title: dict[str, list[str]]) -> bool:
+    title_key = normalize_match_text(title)
+    if not title_key:
+        return False
+    return any(same_recording(artist, title, library_artist, title) for library_artist in by_title.get(title_key, []))
+
+
+def same_recording_keys(hits: list[Hit], by_title: dict[str, list[str]]) -> set[str]:
+    keys: set[str] = set()
+    for hit in hits:
+        key = owned_key(hit.artist, hit.title)
+        if key == "|" or not hit.title:
+            continue
+        if recording_in_library(hit.artist, hit.title, by_title):
+            keys.add(key)
+    return keys
 
 
 def primary_artist(artist: str) -> str:
@@ -1046,6 +1120,8 @@ def hits_from_library(
     seeds: list[SeedTrack],
     mapper: GenreMapper,
     language: str | None,
+    *,
+    include_seeds: bool = False,
 ) -> list[Hit]:
     seed_keys = {owned_key(seed.artist, seed.title) for seed in seeds if seed.title}
     seed_artists = {normalize_match_text(primary_artist(seed.artist)) for seed in seeds}
@@ -1054,7 +1130,7 @@ def hits_from_library(
     for track in library:
         seed = seed_from_track(track)
         key = owned_key(seed.artist, seed.title)
-        if not seed.title or key in seed_keys:
+        if not seed.title or (key in seed_keys and not include_seeds):
             continue
         if language and not track_matches_language(seed, language, mapper):
             continue
@@ -1111,14 +1187,43 @@ async def suggest_tracks(
 ) -> list[Suggestion]:
     query_tokens = query_tokens or []
     count = max(1, int(limit))
+    filt = normalize_suggest_library(library_filter)
     seeds = narrow_seeds_for_query(seeds, query_tokens, mapper)
     hits = await collect_hits(client, seeds, language=language, mapper=mapper, caps=fetch_caps(count))
-    if library:
-        hits.extend(hits_from_library(library, seeds, mapper, language))
-    exclude = {owned_key(seed.artist, seed.title) for seed in seeds if seed.title}
+    library_rows = list(library or [])
+    by_title = library_artists_by_title(library_rows)
+    # "out" stays Last.fm-only. Library rows would reintroduce songs the user already has.
+    if library_rows and filt != "out":
+        hits.extend(
+            hits_from_library(
+                library_rows,
+                seeds,
+                mapper,
+                language,
+                include_seeds=filt == "in",
+            )
+        )
+    seed_keys = {owned_key(seed.artist, seed.title) for seed in seeds if seed.title}
+    library_keys = set(owned) | owned_keys_from_tracks(library_rows)
+    rank_owned = set(owned)
+    if filt == "in":
+        matching_rows = [
+            track
+            for track in library_rows
+            if not language or track_matches_language(seed_from_track(track), language, mapper)
+        ]
+        # Seeds are the library. Keep those keys so "in" is not an empty pool.
+        rank_owned = owned_keys_from_tracks(matching_rows) if library_rows else set(owned)
+        exclude = (seed_keys | library_keys) - rank_owned
+        rank_owned |= same_recording_keys(hits, library_artists_by_title(matching_rows))
+    elif filt == "out":
+        # Same act and title counts as owned. A cover by a different act does not.
+        exclude = seed_keys | library_keys | same_recording_keys(hits, by_title)
+    else:
+        exclude = seed_keys
     items = rank_suggestions(
         hits,
-        owned=owned,
+        owned=rank_owned,
         shown=shown,
         mapper=mapper,
         language=language,
@@ -1130,9 +1235,9 @@ async def suggest_tracks(
         seed_weight=seed_weight,
         library_ratio=library_ratio,
         variety=variety,
-        library_filter=library_filter,
+        library_filter=filt,
     )
-    return attach_library_meta(items, library or [])
+    return attach_library_meta(items, library_rows)
 
 
 async def suggest_for_user(
@@ -1147,6 +1252,8 @@ async def suggest_for_user(
     if not api_key:
         return []
     count = clamp_suggest_count(limit)
+    if not user_id:
+        return []
     library = ctx.catalog.list_library_tracks(user_id)
     if not library:
         from app.library_index import entries_to_tracks, load_index_entries

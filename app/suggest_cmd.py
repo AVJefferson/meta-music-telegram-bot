@@ -242,14 +242,13 @@ async def _run_suggest(message: Message, ctx: Ctx, query: str) -> None:
     reply = message.reply_to_message
     if reply:
         reply_track = ctx.catalog.get_track_by_message(message.chat.id, reply.message_id)
-    library = ctx.catalog.list_library_tracks(message.from_user.id if message.from_user else None)
-    if not library:
+    uid = message.from_user.id if message.from_user else 0
+    library = ctx.catalog.list_library_tracks(uid) if uid else []
+    if not library and uid:
         from app.relocate import ctx_for_user
 
-        uid = message.from_user.id if message.from_user else 0
-        bound = ctx_for_user(ctx, uid) if uid else ctx
         library = await load_drive_library(
-            bound,
+            ctx_for_user(ctx, uid),
             topic=None,
             notify=lambda text: _deliver(message, text),
         )
