@@ -53,7 +53,7 @@
   let suggestQuery = new URLSearchParams(location.search).get("q") || "";
   let suggestCount = 10;
   let reviewCache = { tracks: null, fetchedAt: 0 };
-  let suggestCache = { q: null, n: null, library: null, user: null, data: null };
+  let suggestCache = { key: "", q: null, n: null, library: null, user: null, data: null };
   let detailRow = null;
 
   function esc(value) {
@@ -367,8 +367,12 @@
     return String(user.id);
   }
 
+  function suggestCacheKey(query, count, library, user) {
+    return JSON.stringify([String(query || ""), String(count), String(library || ""), String(user || "")]);
+  }
+
   function emptySuggestCache() {
-    return { q: null, n: null, library: null, user: null, data: null };
+    return { key: "", q: null, n: null, library: null, user: null, data: null };
   }
 
   function librarySeg(current) {
@@ -865,12 +869,8 @@
     );
     const library = libraryFilter();
     const user = suggestUserId();
-    const cached =
-      suggestCache.data &&
-      suggestCache.q === suggestQuery &&
-      suggestCache.n === count &&
-      suggestCache.library === library &&
-      suggestCache.user === user;
+    const key = suggestCacheKey(suggestQuery, count, library, user);
+    const cached = suggestCache.data && suggestCache.key === key;
     if (cached && !force) {
       paintSuggestResults(suggestCache.data);
       return;
@@ -882,7 +882,7 @@
       { signal: pageAbort && pageAbort.signal },
     );
     if (!still()) return;
-    suggestCache = { q: suggestQuery, n: count, library, user, data };
+    suggestCache = { key, q: suggestQuery, n: count, library, user, data };
     paintSuggestResults(data);
   }
 
