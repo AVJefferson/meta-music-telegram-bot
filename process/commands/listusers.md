@@ -49,5 +49,6 @@ Buttons: Pagination buttons
 4. buttons have return_type as "callback_data" and return_data as "user_id" for the user. So pagination will not work after long time, but user buttons will still work.
 5. admin user (set in environment variable) is not listed.
 6. recent users are listed in the order of most recent first. max Y are listed. (Y is set in environment variable as "MAX_RECENT_USERS_TO_REMEMBER").
+7. app remembers all active users but only recent Y are listed in text. Rest are paginated buttons only.
 
 ## No Notifications

@@ -1,478 +1,741 @@
-# Process flows
+# MetaMusic Bot — System Process Specifications
 
-How MetaMusic handles Telegram updates, Mini App HTTP, and Google Drive. Source of truth is the code; this maps the paths a user actually hits.
+Comprehensive operational and process flow specification for MetaMusic. This document defines the exact routing order, execution contracts, guard conditions, state machines, decision matrices, and edge-case caveats across all Telegram events, HTTP endpoints, background workers, and schedulers.
 
-Private UI (commands, confirms, tag editor, dest/language prompts) is **ephemeral in groups/channels**, else a DM. If ephemeral fails, the bot asks the user to `/start` in private first.
+---
 
-## Entry
+## 1. System Architecture & Dispatch Topology
 
-```text
-Telegram update
-  ├─ ignore if it came from this bot (media echo / bot-to-bot)
-  ├─ membership / blacklist gate (allow_user)
-  └─ first matching router, in this order:
-       admin commands → user commands → HiFi picks → private DM
-       → /review → /suggest → tag editor → reactions
-       → search text / inline → group-channel audio → pending-review buttons
+```mermaid
+flowchart TD
+    subgraph Clients ["Clients & External Triggers"]
+        TG_USER["Telegram User / Group / Channel"]
+        TG_API["Telegram Bot API (Local / Cloud)"]
+        WEB_USER["Telegram Mini App (Browser / WebView)"]
+        TIMER["APScheduler (UTC Cron & Interval)"]
+    end
+
+    subgraph ServiceContainer ["bot Container (:8080)"]
+        subgraph IngressLayer ["Ingress & Middleware"]
+            MW["CtxMiddleware (Bot Filter & Ctx Inject)"]
+            ERR["dp.errors (handle_update_error)"]
+            ROUTERS["aiogram Dispatcher (11 Routers in Priority Order)"]
+            HTTP_SRV["aiohttp Server (Mini App / API / OAuth)"]
+        end
+
+        subgraph CoreQueue ["Asynchronous Job Pipeline"]
+            JOB_QUEUE[("asyncio.Queue[Job]")]
+            WORKER_TASK[["Worker Task (worker / process_job)"]]
+        end
+
+        subgraph Persistence ["Persistence & Cache (/data)"]
+            SQLITE[("SQLite (Catalog / state.db)")]
+            PENDING_DIR["/data/pending (Staging & Working dirs)"]
+            TMP_DIR["/data/tmp (Processing scratchpads)"]
+            COVERS_DIR["/data/covers (Artwork cache)"]
+            CACHE_DIR["/data/cache (Audio fingerprint cache)"]
+        end
+
+        subgraph Daemons ["Background Daemons"]
+            BOOT_REC[["Boot Recovery (recover_interrupted)"]]
+            INDEX_WARM[["Library Index Warmup (ensure_library_index)"]]
+            CRON_EXPIRE[["Expire Pending (15-min Interval)"]]
+            CRON_CLEANUP[["Daily Cleanup (03:00 UTC Cron)"]]
+        end
+    end
+
+    subgraph ExternalServices ["External APIs & Integrations"]
+        GOOGLE["Google Drive API (v3 OAuth / Files)"]
+        MB["MusicBrainz API (Recordings / Releases / Artists)"]
+        ACOUSTID["AcoustID API (fpcalc Audio Fingerprints)"]
+        LASTFM["Last.fm API (Tags / Similar Songs)"]
+        LRCLIB["LRCLIB API (Synced Lyrics .lrc)"]
+        HIFI["HiFiAudioBot (Telethon User Session)"]
+    end
+
+    %% Client Ingress
+    TG_USER -->|Updates| TG_API
+    TG_API -->|Long Polling| MW
+    MW --> ROUTERS
+    MW -.->|Exceptions| ERR
+    WEB_USER -->|HTTPS :8080| HTTP_SRV
+    TIMER --> CRON_EXPIRE
+    TIMER --> CRON_CLEANUP
+
+    %% Internal Routing & Queues
+    ROUTERS -->|Audio / HiFi Pick / Pray| JOB_QUEUE
+    ROUTERS -->|Commands / Reactions| SQLITE
+    JOB_QUEUE --> WORKER_TASK
+
+    %% Worker Execution
+    WORKER_TASK --> PENDING_DIR
+    WORKER_TASK --> TMP_DIR
+    WORKER_TASK --> SQLITE
+    WORKER_TASK --> GOOGLE
+    WORKER_TASK --> MB
+    WORKER_TASK --> ACOUSTID
+    WORKER_TASK --> LASTFM
+    WORKER_TASK --> LRCLIB
+    WORKER_TASK --> TG_API
+
+    %% HTTP & OAuth
+    HTTP_SRV --> SQLITE
+    HTTP_SRV --> GOOGLE
+
+    %% Maintenance & Background
+    BOOT_REC --> SQLITE
+    BOOT_REC --> JOB_QUEUE
+    INDEX_WARM --> SQLITE
+    INDEX_WARM --> GOOGLE
+    CRON_EXPIRE --> SQLITE
+    CRON_EXPIRE --> PENDING_DIR
+    CRON_CLEANUP --> SQLITE
+    CRON_CLEANUP --> PENDING_DIR
+    CRON_CLEANUP --> TMP_DIR
+    CRON_CLEANUP --> COVERS_DIR
+    CRON_CLEANUP --> CACHE_DIR
+    CRON_CLEANUP --> GOOGLE
 ```
 
-HTTP (`PUBLIC_BASE_URL`, port 8080): Mini App `/app/*`, JSON `/api/*` (Telegram `initData` HMAC), Google OAuth `/oauth/start` + `/oauth/callback`.
 
-Identify / tag / cover / Drive never run on the Telegram handler thread. Same OS/`bot` container; **different triggers → different process flows** below ([scheduled and background](#7-scheduled-and-background-processes)).
 
----
 
-## Shared gates
 
-### Who may talk to the bot
+### Ingress Middleware & Error Handling
 
-| Context | Allowed if |
-| --- | --- |
-| Group / channel (`chat_id < 0`) | User not blacklisted; chat not blacklisted. Unknown chats are registered when the bot sees them. |
-| Private DM | Env admin **or** member of a known, non-blacklisted group/channel (`DM_REQUIRES_KNOWN_CHAT=true`, default). Deny text: `Private access requires membership in a known group.` |
-| Mini App `/api` | Valid `initData`, not blacklisted, API rate limit. |
-
-Env admin (`ADMIN_TELEGRAM_USER_ID`) bypasses blacklist and DM membership.
-
-Bots, including this bot, are ignored on messages / reactions / callbacks (except `my_chat_member`).
-
-### Formats
-
-Default listen-for: **FLAC + MP3**. User can add M4A, OGG, Opus, WAV in Mini App settings. Unknown audio is ignored. Allowed-but-off formats are ignored (no error). Audio is never re-encoded.
-
-### Rate limits
-
-Upload (audio + HiFi pick), search, Mini App API — per-user sliding windows. Over limit → short user error, no stack traces.
+1. `CtxMiddleware(ctx)` **(**`app/bot.py:81`**):**
+  - Wraps all incoming updates before any router handler executes.
+  - Injects `data["ctx"] = self.ctx` into workflow data.
+  - Calls `ignore_bot_update(event, ctx.bot)`: Silently drops any update originated by this bot or another bot account (except `my_chat_member`).
+2. `handle_update_error(event, ctx)` **(**`app/bot.py:93`**):**
+  - Registered on `dp.errors`. Catches unhandled exceptions during handler execution.
+  - Extracts `user_id` and `chat_id` from `update.message` or `update.callback_query`.
+  - Dispatches sanitized error notification via `notify_error(ctx, user_id, exc, chat_id)`.
 
 ---
 
-## 1. Sending text
 
-Plain text is **not** tagged. It is search, an in-progress editor, or ignored.
 
-```text
-text message
-  ├─ starts with /  → command routers (section 2)
-  ├─ private chat
-  │    ├─ not a member of a known chat → membership error
-  │    ├─ waiting cover editor → treat as image URL, or “send a photo…”
-  │    ├─ waiting field editor → write that tag field
-  │    └─ else → consumed; no search (private text handler runs first)
-  ├─ group / channel
-  │    ├─ @mention this bot → song search (currently off)
-  │    ├─ forum topic created/edited → remember topic name
-  │    └─ else → ignore
-  └─ inline @bot query → search results (currently empty; search is off)
+### Global Access Control (`allow_user`)
+
+Evaluated at the start of individual handlers via `app/membership.py`:
+
+
+| Caller Context                   | Evaluation Guard                                                                | Deny Action                                                                                   |
+| -------------------------------- | ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| **Env Admin**                    | `user_id == ADMIN_TELEGRAM_USER_ID`                                             | Always allowed (bypasses blacklists and DM membership checks).                                |
+| **Bot Accounts**                 | `user.is_bot == True`                                                           | Dropped silently via `CtxMiddleware` or `user_is_bot()`.                                      |
+| **Group / Supergroup / Channel** | `user_id NOT IN blacklist` **AND** `chat_id NOT IN blacklist`                   | Dropped silently. Unknown chats auto-registered into SQLite `chats`.                          |
+| **Private DM**                   | User belongs to ≥1 known, non-blacklisted group (`DM_REQUIRES_KNOWN_CHAT=True`) | Deny text: `Private access requires membership in a known group.` (Cached 60s, 5m API grace). |
+| **Mini App API** (`/api/`*)      | Valid Telegram `initData` HMAC **AND** `user_id NOT IN blacklist`               | HTTP 401 Unauthorized / HTTP 403 Forbidden.                                                   |
+
+
+---
+
+
+
+## 2. Telegram Update Ingress & Router Pipeline
+
+```mermaid
+flowchart TD
+    %% Entry
+    TG_IN["Telegram Bot API Update"] --> MW{"CtxMiddleware: ignore_bot_update()<br/>Is sender a bot?"}
+    MW -->|Yes| DROP_BOT(["Silent Drop"])
+    MW -->|No| R1{"1. build_admin_router<br/>Command or ad:* callback?"}
+
+    %% 1. Admin Router
+    R1 -->|Yes| G_ADM{"is_admin(user_id)?"}
+    G_ADM -->|No| ADM_DROP(["Silent No-op"])
+    G_ADM -->|Yes| H_ADM["Execute: listusers, listgroups, listchannels,<br/>blockuser, unblockuser, admin_cb"]
+
+    %% 2. User Commands
+    R1 -->|No| R2{"2. build_user_command_router<br/>/start, /login, /settings, /get?"}
+    R2 -->|Yes| G_UCMD{"allow_user(user_id, chat)?"}
+    G_UCMD -->|No| UCMD_DENY(["DM: 'Private access requires membership...'<br/>Group: Drop"])
+    G_UCMD -->|Yes| H_UCMD{"Command Match"}
+    H_UCMD -->|/start| H_START["start: Return user stats & commands"]
+    H_UCMD -->|/login| H_LOGIN["login: Issue 1-time OAuth ticket (10m TTL)"]
+    H_UCMD -->|/settings| H_SETTINGS["settings: Drive status + Mini App button"]
+    H_UCMD -->|/get <query>| H_GET{"SEARCH_ENABLED?"}
+    H_GET -->|False| H_GET_OFF["Reply: 'Song search is temporarily off...'"]
+    H_GET -->|True| H_GET_ON["Query HiFiAudioBot -> Send results"]
+
+    %% 3. HiFi Callbacks
+    R2 -->|No| R3{"3. build_hifi_router<br/>hf:*, hfmore:*, hfcancel:*?"}
+    R3 -->|Yes| H_HIFI{"Callback Prefix"}
+    H_HIFI -->|hf:<pick_id>| H_HFPICK["on_pick: Download song from HiFi bot<br/>-> ingest_local_audio"]
+    H_HIFI -->|hfmore:<session_id>| H_HFMORE["on_more: Request next result page"]
+    H_HIFI -->|hfcancel:<session_id>| H_HFCAN["on_cancel: Remove search keyboard"]
+
+    %% 4. Private UI
+    R3 -->|No| R4{"4. build_private_router<br/>Private DM event or d*:* callback?"}
+    R4 -->|Yes| PRIV_CHECK{"Check allow_user & chat.type == 'private'"}
+    PRIV_CHECK -->|Audio Message| H_PRAUDIO{"Active pending action in DM?"}
+    H_PRAUDIO -->|Yes| E_BUSY(["Reply: 'Finish or cancel current action first.'"])
+    H_PRAUDIO -->|No| H_PRDOWN["Download to /data/pending/<uuid>/<br/>-> ingest_local_audio"]
+    PRIV_CHECK -->|d<id>:* callback| H_PRCB["private_callback: back, cancel, confirm, topic:*, review:*"]
+    PRIV_CHECK -->|Photo / Document| H_PRCOV["private_cover: Save manual-cover.jpg"]
+    PRIV_CHECK -->|Non-command Text| H_PRTXT{"Field editor waiting cover?"}
+    H_PRTXT -->|Yes| PR_IMG_URL["Fetch URL -> save manual-cover.jpg"]
+    H_PRTXT -->|No| PR_TAG_IN["handle_edit_text: write field value"]
+
+    %% 5. Review Commands
+    R4 -->|No| R5{"5. build_review_command_router<br/>/review, /reviews or rvp:*, rvt:*?"}
+    R5 -->|Yes| H_REV{"Event Match"}
+    H_REV -->|/review| H_REVCMD["review_cmd: Sync Drive review folder -> list tracks"]
+    H_REV -->|rvp:* callback| H_REVPAGE["review_page: Paginate review list"]
+    H_REV -->|rvt:* callback| H_REVPICK["review_pick: Send song card with Drive links"]
+
+    %% 6. Suggest Commands
+    R5 -->|No| R6{"6. build_suggest_command_router<br/>/suggest or sg:*, sgt:*?"}
+    R6 -->|Yes| H_SUG{"Event Match"}
+    H_SUG -->|/suggest| H_SUGCMD["suggest_cmd: Query Last.fm similar tracks from library"]
+    H_SUG -->|sg:* callback| H_SUGPAGE["suggest_page: Paginate suggestion cards"]
+    H_SUG -->|sgt:* callback| H_SUGPICK["suggest_pick: Show suggestion card + LRCLIB lyrics"]
+
+    %% 7. Tag & Cover Editor
+    R6 -->|No| R7{"7. build_edit_router<br/>Callback e*:* or reply to edit card?"}
+    R7 -->|Yes| H_EDIT{"Event Match"}
+    H_EDIT -->|e<id>:* callback| H_EDCB["on_edit_callback: field select, suggestion click,<br/>cover pick, done, cancel, clear, lyrics_net"]
+    H_EDIT -->|Group reply text| H_EDTXT["on_edit_text: Write text to field in staged copy"]
+    H_EDIT -->|Group reply photo| H_EDCOV["on_edit_cover: Set candidate cover from photo"]
+
+    %% 8. Reactions
+    R7 -->|No| R8{"8. build_reactions_router<br/>message_reaction or r*:* callback?"}
+    R8 -->|Yes| H_REACT{"Event Match"}
+    H_REACT -->|message_reaction| H_REACTIONS{"Reaction Added / Removed"}
+    H_REACTIONS -->|👍 or 👎| R_THUMB["Plan copy/move to Library or Review Drive"]
+    H_REACTIONS -->|💩 or 🙉| R_DEL["Delete user copy from Library/Review"]
+    H_REACTIONS -->|🙏| R_PRAY["Force Telegram re-identify -> update group card"]
+    H_REACTIONS -->|✍️ Added| R_PEN_ADD["Stage copy in /data/tmp -> open private editor"]
+    H_REACTIONS -->|✍️ Removed| R_PEN_REM["Prompt 'Commit changes or cancel?'"]
+    H_REACT -->|r<id>:* callback| H_REACTCB["on_react_callback: Execute yes/no or commit/cancel"]
+
+    %% 9. Search Text & Mentions
+    R8 -->|No| R9{"9. build_search_text_router<br/>DM text fallback, @mention, inline_query?"}
+    R9 -->|Yes| H_SEARCH{"Event Match"}
+    H_SEARCH -->|Private text not in editor| H_DMTXT["dm_text: Dispatch song search"]
+    H_SEARCH -->|Group text @mention| H_MENTION["group_mention: Strip @bot and search"]
+    H_SEARCH -->|Inline @bot query| H_INLINE["on_inline: Return HiFi search articles"]
+
+    %% 10. Bot Router
+    R9 -->|No| R10{"10. build_router<br/>/chatid, chat_member, topic, audio/channel_post?"}
+    R10 -->|Yes| H_BOT{"Event Match"}
+    H_BOT -->|/chatid| H_CHATID["chatid: Reply chat_id and thread_id"]
+    H_BOT -->|my_chat_member| H_MEMBER["on_my_chat_member: Upsert chat title and active status"]
+    H_BOT -->|forum_topic_*| H_TOPIC["topic_created / topic_edited: Cache forum topic name"]
+    H_BOT -->|Group audio/doc| H_GRPAUDIO["on_media: Download group audio -> ingest_local_audio"]
+    H_BOT -->|Channel audio post| H_CHANAUDIO["on_channel_media: Download channel audio -> ingest_local_audio"]
+
+    %% 11. Review Dialogs
+    R10 -->|No| R11{"11. build_review_router<br/>Callback p*:*?"}
+    R11 -->|Yes| H_PENDCB["on_pending_callback: Handle intake review dialogs<br/>(ok, cancel, dr, dk, ds, cv, t:*, dl, dv, dn, dt, da, do, lg:*)"]
+    R11 -->|No| UNHANDLED(["Unhandled Update: Dropped Silently"])
 ```
 
-### Private, not in an editor
 
-The private-text handler matches all non-command DMs, so **typing a song name in DM does not start search**. Use `/get` (also off today) or send audio.
-
-### Group @mention / `/get` / inline (search)
-
-`SEARCH_ENABLED` in `app/user_cmd.py` is **False**. Every search path replies:
-
-> Song search is temporarily off. Send audio instead.
-
-When that flag is flipped True:
-
-1. Rate-limit search.
-2. Telethon user session talks to HiFiAudioBot.
-3. Private result keyboard (`hf:` opaque ids, never raw HiFi callbacks).
-4. Pick downloads audio → same ingest as sending a file (`ingest_local_audio`), still filtered by listen-for formats.
-5. No HiFi session → `Service unavailable`; env admin is DMed once.
-
-Inline with an empty query offers “Search in private chat”.
 
 ---
 
-## 2. `/commands`
 
-All of these (except admin) require `allow_user`. Replies are private (ephemeral or DM). Mini App buttons need `https://` `PUBLIC_BASE_URL`; localhost falls back to a normal URL.
 
-| Command | Who | What happens |
-| --- | --- | --- |
-| `/start` | anyone allowed | Stats: first seen, songs edited, Drive email or `not connected`, idle months. Lists commands. Does **not** start Google login. |
-| `/login` | anyone allowed | One-time ticket URL (`oauth_ticket_ttl_seconds`, default 10 min). Button: Mini App `/app/login` or the ticket. **Never paste the OAuth URL in a public group.** |
-| `/settings` | anyone allowed | Drive email + idle policy. Button: Mini App `/app/settings`. Formats / unlink / save prefs live there, not as Telegram commands. |
-| `/review` `/reviews` | anyone allowed | Mini App review button, plus Telegram list of **this user’s** review tracks (syncs Drive review folder if logged in). Pick a row → song card; react on that card. |
-| `/suggest` `[query]` | anyone allowed | Mini App suggest button, plus Last.fm similar tracks seeded from **this user’s** library (Drive index if sqlite is empty). Needs `LASTFM_API_KEY`. Empty library → `Library is empty. Upload audio first.` |
-| `/get <song>` | anyone allowed | Search (currently the “search is off” text). |
-| `/chatid` | anyone who can message | `chat_id` + `thread_id` (debug). |
-| `/listusers` `/listgroups` `/listchannels` `/blockuser` `/unblockuser` | env admin only | Private lists + block/unblock. Silent no-op for everyone else. |
+### Slash Commands Registry
 
-Unknown `/foo` is ignored (no help dump).
 
-### Mini App pages (same commands, HTTPS)
+| Command               | Owning Router                  | Handler Function          | Guard / Scope | Arguments       | Operational Flow & Side Effects                                                                              |
+| --------------------- | ------------------------------ | ------------------------- | ------------- | --------------- | ------------------------------------------------------------------------------------------------------------ |
+| `/start`              | `build_user_command_router`    | `user_cmd.start`          | `allow_user`  | None            | Touches user; displays first seen date, songs edited, Drive status, commands list. Does **not** start OAuth. |
+| `/login`              | `build_user_command_router`    | `user_cmd.login`          | `allow_user`  | None            | Generates single-use OAuth ticket URL (10 min TTL) with button to connect Drive.                             |
+| `/settings`           | `build_user_command_router`    | `user_cmd.settings_cmd`   | `allow_user`  | None            | Displays current Drive connection & retention window; button to Mini App `/app/settings`.                    |
+| `/get`                | `build_user_command_router`    | `user_cmd.get_cmd`        | `allow_user`  | `<query>`       | Song search. If `SEARCH_ENABLED=False`: replies with temporary off text. If `True`: queries HiFi bot.        |
+| `/review`, `/reviews` | `build_review_command_router`  | `review_cmd.review_cmd`   | `allow_user`  | None            | Syncs remote Drive review folder; displays inline paginated song cards for user review tracks.               |
+| `/suggest`            | `build_suggest_command_router` | `suggest_cmd.suggest_cmd` | `allow_user`  | `[query]`       | Seeds Last.fm query from user library index or query argument; returns interactive recommendation cards.     |
+| `/chatid`             | `build_router`                 | `bot.chatid`              | Public        | None            | Diagnostic command. Returns HTML-formatted `chat_id` and `thread_id`.                                        |
+| `/listusers`          | `build_admin_router`           | `admin_cmd.listusers`     | `is_admin`    | None            | Env admin only. Lists active users with first seen dates and inline block/unblock buttons.                   |
+| `/listgroups`         | `build_admin_router`           | `admin_cmd.listgroups`    | `is_admin`    | None            | Env admin only. Lists all registered groups/supergroups with admin IDs and block toggles.                    |
+| `/listchannels`       | `build_admin_router`           | `admin_cmd.listchannels`  | `is_admin`    | None            | Env admin only. Lists all registered broadcast channels with block toggles.                                  |
+| `/blockuser`          | `build_admin_router`           | `admin_cmd.blockuser`     | `is_admin`    | `@user` or `ID` | Env admin only. Adds target user ID to SQLite `blacklist`. Cannot block self.                                |
+| `/unblockuser`        | `build_admin_router`           | `admin_cmd.unblockuser`   | `is_admin`    | `@user` or `ID` | Env admin only. Removes target user ID from SQLite `blacklist`.                                              |
 
-| Page | API | Notes |
-| --- | --- | --- |
-| `/app` home | `GET /api/me` | Drive on/off, library/review counts, tiles. |
-| `/app/login` | `GET /api/login` → ticket | Opens Google in the browser; polls `/api/me` until `logged_in`. Already logged in → redirects to settings. |
-| `/app/settings` | `POST /api/settings` | See [Settings](#5-settings). |
-| `/app/review` | `GET /api/review`, `POST /api/review/{id}/action` | `library` / `tags` relocate; `cancel` deletes **your** copy. |
-| `/app/suggest` | `GET /api/suggest`, `/api/suggest/art` | Same Last.fm path as `/suggest`. |
-| `/app/admin` | `GET /api/admin/overview` | Env admin only. Users, groups, channels (title and @username), activity, and server stats; list commands show those name fields too. |
+
+> [!NOTE]
+> `/start` is registered in both `build_user_command_router` (`start`) and `build_private_router` (`private_start`). Because `build_user_command_router` is included at priority position 2 and `build_private_router` is at position 4, `user_cmd.start` **always intercepts** `/start` **first**.
 
 ---
 
-## 3. Audio files
 
-Group, channel post, and private DM all funnel into `ingest_local_audio` after download.
 
-```text
-audio or document
-  ├─ not a known audio type → ignore
-  ├─ from this bot / anonymous → ignore
-  ├─ allow_user fail → ignore (DM: membership error)
-  ├─ format not in user’s listen-for list → ignore
-  ├─ private + another pending action in that DM → “Finish or cancel current action first.”
-  ├─ upload rate exceeded → user error
-  ├─ SHA already in this user’s library/review
-  │     → send public audio again, caption “already in library/review”; stop
-  └─ else
-        send public playable audio, caption “identifying…”
-        insert pending phase=intake, status=queued
-        enqueue Job → worker
+### Callback Query Dispatch Registry
+
+
+| Callback Prefix Pattern            | Target Router                  | Handler Function                | Purpose & Payload Schema                                                                                                                   |
+| ---------------------------------- | ------------------------------ | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ad:(bu|uu|bg|bc|ug|uc|noop):<id>` | `build_admin_router`           | `admin_cmd.admin_cb`            | Admin block/unblock for users (`bu`/`uu`), groups (`bg`/`ug`), channels (`bc`/`uc`).                                                       |
+| `hf:<pick_id>`                     | `build_hifi_router`            | `hifi.on_pick`                  | Selects search result song; triggers download and local ingest.                                                                            |
+| `hfmore:<session_id>`              | `build_hifi_router`            | `hifi.on_more`                  | Requests next page of HiFi search results.                                                                                                 |
+| `hfcancel:<session_id>`            | `build_hifi_router`            | `hifi.on_cancel`                | Cancels HiFi search session and clears keyboard.                                                                                           |
+| `^d\d+:<action>`                   | `build_private_router`         | `private_ui.private_callback`   | Private DM dialog navigation (`cancel`, `back`, `confirm`, `topic:<id>`, `review:<idx>`).                                                  |
+| `^rvp:\d+$`                        | `build_review_command_router`  | `review_cmd.review_page`        | Paginates through user review queue (`rvp:<page_number>`).                                                                                 |
+| `^rvt:\d+$`                        | `build_review_command_router`  | `review_cmd.review_pick`        | Selects track card to inspect from review list (`rvt:<track_id>`).                                                                         |
+| `^sg:\d+:\d+$`                     | `build_suggest_command_router` | `suggest_cmd.suggest_page`      | Paginates Last.fm suggestions (`sg:<session_id>:<page>`).                                                                                  |
+| `^sgt:\d+:\d+$`                    | `build_suggest_command_router` | `suggest_cmd.suggest_pick`      | Selects suggested song card and pulls synced lyrics (`sgt:<session_id>:<idx>`).                                                            |
+| `^e\d+:<action>`                   | `build_edit_router`            | `edit_ui.on_edit_callback`      | Interactive tag/cover editor actions (`f:<field>`, `s:<field>:<idx>`, `cv:<idx>`, `done`, `cancel`, `clear`, `lyrics_net`).                |
+| `^r\d+:(yes|no|cancel|commit)`     | `build_reactions_router`       | `reactions.on_react_callback`   | Reaction confirm/cancel (`yes`/`no`) or `✍️` tag editor exit (`commit`/`cancel`).                                                          |
+| `^p\d+:<action>`                   | `build_review_router`          | `review_ui.on_pending_callback` | Intake review callbacks (`ok`, `cancel`, `dr`, `dk`, `ds`, `cv<N>`, `c<N>`, `t:<field>`, `dl`, `dv`, `dn`, `dt`, `da`, `do`, `lg:<lang>`). |
+
+
+---
+
+
+
+### Non-Command Message & Event Handlers
+
+
+| Event Type / Filter                                           | Owning Router              | Handler Function           | Scope & Conditions                            | Execution Behavior                                                                                                        |
+| ------------------------------------------------------------- | -------------------------- | -------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `F.chat.type == "private" & AudioMessageFilter()`             | `build_private_router`     | `private_ui.private_media` | Private DM only                               | Rejects if user has active pending action. Downloads audio to `/data/pending/` and calls `ingest_local_audio`.            |
+| `(F.document | F.audio)`                                      | `build_router`             | `bot.on_media`             | Group / Supergroup (`chat.type != "private"`) | Filters known audio and `listen_for` formats. Downloads file and calls `ingest_local_audio`.                              |
+| `channel_post(F.document | F.audio)`                          | `build_router`             | `bot.on_channel_media`     | Broadcast Channel Posts                       | Ingests channel audio post via `ingest_local_audio`. Original post is preserved.                                          |
+| `F.chat.type == "private" & (F.photo | F.document)`           | `build_private_router`     | `private_ui.private_cover` | Private DM                                    | Active cover editor input. Ingests photo or image document (max 15MB) as `manual-cover.jpg`.                              |
+| `F.photo | F.document`                                        | `build_edit_router`        | `edit_ui.on_edit_cover`    | Group / Channel (Reply to Card)               | Reply with an image to an active edit card in a group sets candidate cover art.                                           |
+| `F.chat.type == "private" & F.text & ~F.text.startswith("/")` | `build_private_router`     | `private_ui.private_text`  | Private DM Non-Command                        | If editing cover: parses image URL. Else: passes text to `handle_edit_text`. Always consumes update (prevents DM search). |
+| `F.text & ~F.text.startswith("/")`                            | `build_edit_router`        | `edit_ui.on_edit_text`     | Group Reply to Card                           | Writes reply text directly into active tag field (`handle_edit_text`). Skips if unhandled.                                |
+| `F.chat.type == "private" & F.text`                           | `build_search_text_router` | `user_cmd.dm_text`         | Private DM (Fallback)                         | Reached only if no pending edit session exists. Dispatches song search via `_start_search`.                               |
+| `F.text` (mentions bot username)                              | `build_search_text_router` | `user_cmd.group_mention`   | Group / Supergroup                            | Extracts query by stripping `@botname` mention and calls `_start_search`.                                                 |
+| `router.inline_query()`                                       | `build_search_text_router` | `user_cmd.on_inline`       | Global Inline Queries                         | If `SEARCH_ENABLED=False`: returns empty cache. If `True`: provides search article preview.                               |
+| `router.my_chat_member()`                                     | `build_router`             | `bot.on_my_chat_member`    | Group / Channel membership updates            | Records chat ID, type, title, and active membership status in SQLite `chats`.                                             |
+| `F.forum_topic_created`                                       | `build_router`             | `bot.topic_created`        | Forum Supergroups                             | Caches `message_thread_id` and topic name in SQLite `topics`.                                                             |
+| `F.forum_topic_edited`                                        | `build_router`             | `bot.topic_edited`         | Forum Supergroups                             | Updates cached topic title in SQLite `topics`.                                                                            |
+
+
+---
+
+
+
+## 3. Audio Ingestion & Worker Pipeline
+
+All audio sources (Telegram group audio, channel posts, private DM audio, and HiFi search picks) funnel into `ingest_local_audio`.
+
+```mermaid
+flowchart TD
+    %% Ingress to Intake
+    SRC["Audio Ingest Source<br/>(Group / Channel / DM / HiFi Pick / Pray)"] --> G_MIME{"Valid Audio MIME / Extension?"}
+    G_MIME -->|No| DROP1(["Silent Drop"])
+    G_MIME -->|Yes| G_USER{"Valid Sender & Not Bot?"}
+    G_USER -->|No| DROP2(["Silent Drop"])
+    G_USER -->|Yes| G_AUTH{"allow_user Passed?"}
+    G_AUTH -->|No| DROP3(["DM Membership Error / Silent Drop"])
+    G_AUTH -->|Yes| G_FMT{"Format in user.listen_for?<br/>(Default: flac, mp3)"}
+    G_FMT -->|No| DROP4(["Silent Drop (Format Ignored)"])
+    G_FMT -->|Yes| G_RATE{"Upload Rate Limit Passed?"}
+    G_RATE -->|No| E_RATE(["Reply: Upload Rate Exceeded"])
+    G_RATE -->|Yes| G_SHA{"SHA-256 in user library/review?"}
+    G_SHA -->|Yes| DUP_SHA["Send Audio Card: 'already in library/review'<br/>Halt Ingestion"]
+    G_SHA -->|No| INTAKE["ingest_local_audio():<br/>1. Post public playable card 'identifying...'<br/>2. Insert pending_reviews (phase=intake, status=queued)<br/>3. Enqueue Job to asyncio.Queue"]
+
+    %% Worker Execution
+    subgraph WorkerExecution ["Tagger Worker: process_job() (app/queue.py)"]
+        INTAKE --> W_COPY["Download / Copy audio to /data/tmp/<uuid>/<br/>(Strictly NO transcoding or re-encoding)"]
+        W_COPY --> W_HINTS["Read embedded Mutagen tags & filename hints"]
+        W_HINTS --> W_FP["AcoustID Fingerprinting (fpcalc) -> MusicBrainz Query"]
+        W_FP --> W_ENRICH["Metadata Enrichment:<br/>1. Last.fm Genre / Mood tags<br/>2. LRCLIB Synced Lyrics (.lrc)<br/>3. iTunes / Cover Art Archive candidates"]
+        W_ENRICH --> W_AUTH{"authenticity_check Enabled?"}
+        W_AUTH -->|Yes| W_SPEC["analyze_flac(): Spectrum & Bit Depth Check"]
+        W_AUTH -->|No| W_CONF
+        W_SPEC --> W_CONF{"Identity Confidence >= Threshold?"}
+
+        %% Low Confidence Branch
+        W_CONF -->|Low Confidence| W_LOW["Human Tag Review Required:<br/>Group: Tag-diff keyboard (file vs rec)<br/>DM: Field-by-field interactive editor"]
+        W_LOW --> W_WAIT_TAGS[("status = 'waiting', phase = 'tags'<br/>(Expires after 24h)")]
+
+        %% High Confidence Branch
+        W_CONF -->|High Confidence| W_MBID_CHECK{"Same MBID in User Library?"}
+        W_MBID_CHECK -->|Yes & Incoming Quality <= Old| W_SKIP_MBID["Skip Drive Upload<br/>Caption: 'Duplicate — already in library'"]
+        W_MBID_CHECK -->|Yes & Incoming Quality > Old| W_UPGRADE["Quality Upgrade: Replace older copy in Drive"]
+        W_MBID_CHECK -->|No Duplicate| W_COMMIT["Standard Commit Pipeline"]
+
+        %% Commit Pipeline
+        W_UPGRADE --> W_LANG
+        W_COMMIT --> W_LANG{"Genre has >= 2 Languages?"}
+        W_LANG -->|Yes| W_LANG_PROMPT["Prompt Primary Language Selection<br/>(Folder name only; tags retain all)"]
+        W_LANG -->|No| W_COVER
+        W_LANG_PROMPT -->|User Selects Language| W_COVER{"Album Shareable & > 1 Cover Options?"}
+
+        W_COVER -->|Follower Track| W_COV_FOLLOWER["Wait for Album Leader Track Pick"]
+        W_COVER -->|Leader Track| W_COV_PICKER["Send Cover Gallery Picker Keyboard"]
+        W_COVER -->|1 Option / None| W_DEST
+        W_COV_PICKER -->|User Selects Cover| W_DEST{"Prompt Destination?<br/>(Drive Connected & Not Skipped)"}
+        W_COV_FOLLOWER -->|Leader Chosen| W_DEST
+
+        W_DEST -->|Prompt Needed| W_DEST_PROMPT["Send Destination Keyboard:<br/>Library / Review / No Drive Upload"]
+        W_DEST -->|Skipped / Logged Out| W_DEST_AUTO["Use Default User Destination"]
+        W_DEST_PROMPT -->|User Selects Dest| W_CONFLICT
+        W_DEST_AUTO --> W_CONFLICT{"Drive Name Conflict in Target Folder?"}
+
+        W_CONFLICT -->|Conflict Detected| W_CONF_PROMPT["Prompt Conflict Action:<br/>Replace / Keep both / Skip"]
+        W_CONFLICT -->|No Conflict| W_FINALIZE
+        W_CONF_PROMPT -->|User Commits| W_FINALIZE["1. Write Normalized Mutagen Tags to Disk<br/>2. Upload Audio (+ Cover & Sidecar) to Drive<br/>3. Update Public Card Caption & Media<br/>4. Optionally Delete User Original Upload"]
+        W_FINALIZE --> W_DONE[("status = 'done', mark completed")]
+    end
 ```
 
-Group/channel keeps the user’s original message. The bot’s **new** audio+caption is the public card later reactions bind to.
 
-### Worker (`process_job`)
 
-```text
-Job
-  copy/download into tmp (no re-encode)
-  read embedded tags (hints)
-  AcoustID fingerprint → MusicBrainz identity
-  enrich: Last.fm genre/mood, LRCLIB synced lyrics, Cover Art Archive / iTunes later
-  optional authenticity sample on FLAC
-  │
-  ├─ confidence low
-  │     group: tag-diff keyboard (file tags vs recommended)
-  │     private: field-by-field editor
-  │
-  ├─ confidence high + Drive dest + same MBID already in this user’s library
-  │     new quality ≤ old → skip, caption “Duplicate — already in library”
-  │     new quality > old → replace that copy (cover → dest → upload)
-  │
-  └─ else commit path:
-        1. language prompt if ≥2 languages on genre (folder name only; tags keep all)
-        2. cover picker if album is shareable and >1 candidate
-             (same-album followers wait on the leader pick)
-        3. dest prompt (Drive) — skipped when not logged in, or “do not ask again”
-        4. Drive name conflict → Replace / Keep both / Skip
-        5. write tags locally; upload if dest is library/review
-        6. update public caption; optionally replace Telegram media
-        7. optionally delete the user’s original message
+---
+
+
+
+### Pre-Ingest Gates (`ingest_local_audio`)
+
+Evaluated sequentially. Stop on first match:
+
+1. **Type Check:** Must be recognized audio MIME or extension. Non-audio is silently dropped.
+2. **Sender Origin:** Drop if anonymous, channel forward without user, or sent by bot.
+3. **Access Control:** User and chat must pass `allow_user`.
+4. **Format Filter:** File format must be in `user.settings.listen_for` (default: `['flac', 'mp3']`). Allowed-but-disabled formats (e.g. `m4a`, `ogg`, `opus`, `wav` when unselected) are ignored with **no error**.
+5. **DM Concurrency Gate:** If private DM, reject if user already has an active pending review (`status IN ('waiting', 'processing')`). Reply: `Finish or cancel current action first.`
+6. **Rate Limit:** Per-user sliding window. Exceeded → brief user warning.
+7. **SHA Deduplication:** Compute SHA-256. If matching hash exists in user's library/review:
+  - Re-send existing public card with caption: `Already in library/review`.
+  - Halt processing.
+8. **Enqueuing:**
+  - Post placeholder card: `identifying...`.
+  - Insert `pending_reviews(status='queued', phase='intake', expires_at=NOW() + 24h)`.
+  - Put `Job(chat_id, message_id, file_id)` on `asyncio.Queue`.
+
+---
+
+
+
+### Decision Matrix: Duplicate Identification vs Quality
+
+
+| Existing MBID in User Library | Incoming vs Existing Quality           | Ingestion Action                                | User / Public Notification                  |
+| ----------------------------- | -------------------------------------- | ----------------------------------------------- | ------------------------------------------- |
+| **No**                        | *N/A*                                  | Continue standard commit pipeline.              | Normal card updates.                        |
+| **Yes**                       | `incoming.bitrate <= existing.bitrate` | Abort ingestion; skip Drive upload.             | Caption: `Duplicate — already in library`.  |
+| **Yes**                       | `incoming.bitrate > existing.bitrate`  | Replace existing file in Drive & library index. | Caption: `Upgraded to higher quality file`. |
+
+
+---
+
+
+
+### Decision Matrix: Setting × Login Execution
+
+
+| Operation                 | Logged Out                                  | Logged In (`dest = 'none'`)                                        | Logged In (`dest = 'library'` / `'review'`)                        |
+| ------------------------- | ------------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| **Dest Prompt**           | **Skipped** (dest locked to `none`).        | Shown unless `skip_save_prompt = True`.                            | Shown unless `skip_save_prompt = True`.                            |
+| **Drive Upload**          | Never executed.                             | Skipped.                                                           | Uploaded to `Telegram Music` or `Telegram Music Review`.           |
+| **Language Tree**         | Folder name used for caption/indexing only. | Drive path `/{language}/...`                                       | Drive path `/{language}/...`                                       |
+| **Correct Telegram File** | Caption-only (unless `🙏` or `✍️`).         | Replaces media if toggle is `True`.                                | Replaces media if toggle is `True`.                                |
+| **Delete Original**       | Deletes upload if toggle is `True`.         | Deletes upload if toggle is `True`.                                | Deletes upload if toggle is `True`.                                |
+| **👍 / 👎 Reaction**      | Local SQLite user copy only.                | Copies/moves file in user's Drive.                                 | Copies/moves file in user's Drive.                                 |
+| **Daily Cleanup Cron**    | Drop local file after **7 days**.           | Retain local file 7 days post-upload, then drop if Drive verified. | Retain local file 7 days post-upload, then drop if Drive verified. |
+
+
+---
+
+
+
+## 4. Interactive Reactions & Tag Editor State Machine
+
+Users interact with published audio cards using Telegram emoji reactions.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PublishedCard: Bot Posts Tagged Audio Card
+
+    %% Reaction Triggers
+    PublishedCard --> LibraryPlan: 👍 Added (Save to Library)
+    PublishedCard --> ReviewPlan: 👎 Added (Save to Review)
+    PublishedCard --> DeletePlan: 💩 or 🙉 Added (Delete Copy)
+    PublishedCard --> ReIdentifyPlan: 🙏 Added (Re-identify Original)
+    PublishedCard --> StagingTagEdit: ✍️ Added (Collaborative Tag Editor)
+
+    %% Thumbs Up / Down Transitions
+    state LibraryPlan {
+        [*] --> CheckUserCopyLib
+        CheckUserCopyLib --> AlreadyLib: User Already Has Library Copy
+        CheckUserCopyLib --> ConfirmMoveLib: User Has Review Copy
+        CheckUserCopyLib --> ConfirmCopyLib: User Has No Copy
+        AlreadyLib --> [*]: Reply 'Already in your library.'
+        ConfirmMoveLib --> MoveLibExec: Confirm 'yes'
+        ConfirmCopyLib --> CopyLibExec: Confirm 'yes'
+        ConfirmMoveLib --> [*]: Cancel 'no'
+        ConfirmCopyLib --> [*]: Cancel 'no'
+    }
+
+    state ReviewPlan {
+        [*] --> CheckUserCopyRev
+        CheckUserCopyRev --> AlreadyRev: User Already Has Review Copy
+        CheckUserCopyRev --> ConfirmMoveRev: User Has Library Copy
+        CheckUserCopyRev --> ConfirmCopyRev: User Has No Copy
+        AlreadyRev --> [*]: Reply 'Already in your review folder.'
+        ConfirmMoveRev --> MoveRevExec: Confirm 'yes'
+        ConfirmCopyRev --> CopyRevExec: Confirm 'yes'
+        ConfirmMoveRev --> [*]: Cancel 'no'
+        ConfirmCopyRev --> [*]: Cancel 'no'
+    }
+
+    LibraryPlan --> PublishedCard: Operation Complete
+    ReviewPlan --> PublishedCard: Operation Complete
+
+    %% Delete Plan
+    state DeletePlan {
+        [*] --> ConfirmDelete
+        ConfirmDelete --> DeleteExec: Confirm 'yes' (Delete Drive & Local)
+        ConfirmDelete --> [*]: Cancel 'no'
+    }
+    DeletePlan --> PublishedCard: Removed
+
+    %% Re-Identify Plan
+    state ReIdentifyPlan {
+        [*] --> StageOriginal: Download / Stage Telegram File
+        StageOriginal --> EnqueuePray: Force drive_dest=none & correct_telegram=true
+        EnqueuePray --> RunWorker: Enqueue to asyncio.Queue
+        RunWorker --> ReplaceGroupMedia: Re-tag & Edit Group Audio Card
+    }
+    ReIdentifyPlan --> PublishedCard: Group Media Replaced
+
+    %% Tag Editor Subsystem
+    state StagingTagEdit {
+        [*] --> StageLocalCopy: Stage Track in /data/tmp/editor_<id>
+        StageLocalCopy --> FieldMenu: Send Private Editor Keyboard
+        
+        state FieldMenu {
+            [*] --> IdleMenu
+            IdleMenu --> EditField: Tap Field Button (Title, Artist, Genre, etc.)
+            IdleMenu --> EditCover: Tap Cover Button
+            IdleMenu --> PullLyrics: Tap 'Pull from internet'
+            
+            EditField --> IdleMenu: Input Value via DM Text / Tap Suggestion
+            EditCover --> IdleMenu: Upload Photo / Image Document / URL
+            PullLyrics --> IdleMenu: Fetch Synced Lyrics from LRCLIB
+        }
+
+        FieldMenu --> ExitPrompt: ✍️ Reaction Removed by Editor
+        
+        state ExitPrompt {
+            [*] --> ConfirmExit: Prompt 'Commit changes or cancel?'
+            ConfirmExit --> CommitGroup: Confirm 'Commit'
+            ConfirmExit --> DiscardExit: Confirm 'Cancel' / 24h Expiry
+        }
+
+        CommitGroup --> [*]: editMessageMedia (Replace Audio for Group)
+        DiscardExit --> [*]: Unlink Staged Files & Unlock
+    }
+    StagingTagEdit --> PublishedCard: Editor Committed / Discarded
 ```
 
-Pending review rows that wait on the user expire ~24h on the **15-minute expire job** ([§7](#7-scheduled-and-background-processes)). Interrupted `queued`/`processing` jobs are re-queued on **boot recovery**, not on that timer.
 
-### After a successful save
-
-Caption becomes `Saved (library|review)` or `Tagged (not copied to Drive)` / `Updated the group file`, plus tags, optional Drive link, `editor:<id>` if someone later ✍️-commits.
 
 ---
 
-## 4. Reactions
 
-Only on a **public audio+caption card** the catalog (or caption/Drive/index probe) can resolve. Bot reactions ignored. User must pass `allow_user`. Confirm UI is private.
 
-```text
-message_reaction
-  resolve track (sqlite by chat+message, else caption / Drive id / library index)
-  ├─ 👍  → plan copy/move to YOUR library
-  ├─ 👎  → plan copy/move to YOUR review
-  ├─ 💩 or 🙉 → plan delete YOUR copy only (group message stays)
-  ├─ 🙏  → plan re-identify the group/channel file (Drive copies untouched)
-  └─ ✍️  added → private tag editor on a staged copy
-      ✍️  removed → commit/cancel prompt
+### Decision Matrix: Reaction × Existing User Copy
+
+
+| Existing User Copy        | 👍 (Move / Save Library)                           | 👎 (Move / Save Review)                           | 💩 or 🙉 (Delete Copy)                           |
+| ------------------------- | -------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------ |
+| **None**                  | Confirm: Copy Telegram file → User's Library Drive | Confirm: Copy Telegram file → User's Review Drive | No-op: `Track not in your library.`              |
+| **In Library (Uploaded)** | No-op: `Already in your library.`                  | Confirm: **Move** Drive file Library → Review     | Confirm: **Delete** user's Drive & local copies. |
+| **In Review (Uploaded)**  | Confirm: **Move** Drive file Review → Library      | No-op: `Already in your review folder.`           | Confirm: **Delete** user's Drive & local copies. |
+
+
+---
+
+
+
+## 5. Google OAuth 2.0 (PKCE) & Drive Synchronization
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Telegram User
+    participant TG as Telegram Bot
+    participant Web as aiohttp Server (:8080)
+    participant Google as Google OAuth 2.0 / Drive API
+    participant DB as SQLite (catalog)
+
+    User->>TG: /login or Mini App 'Connect'
+    TG->>DB: Generate Single-Use OAuth Ticket (Bound to user_id, 10 min TTL)
+    TG-->>User: Button: Mini App / Browser Redirect URL
+    User->>Web: GET /oauth/start?token=<ticket>
+    Web->>Web: Verify Ticket, Generate PKCE verifier + SHA-256 challenge, state
+    Web-->>User: 302 Redirect to accounts.google.com/o/oauth2/v2/auth<br/>(scopes: drive.file, drive.install, email, openid)
+
+    User->>Google: Authenticate & Authorize Access
+    Google-->>Web: GET /oauth/callback?code=<code>&state=<state>
+
+    alt State Expired or Invalid
+        Web-->>User: HTTP 400: 'This login session expired.'
+    else User Cancelled Consent (access_denied)
+        Web-->>User: HTTP 400: 'Google denied access. Use /login again.'
+    else Code Exchange Missing Refresh Token
+        Web-->>User: HTTP 400: 'needs_login' (Must prompt explicit consent)
+    else Google Email != Previously Linked Email
+        Web-->>User: HTTP 403: Forbidden (Refuse account switching)
+    else Success
+        Web->>Google: POST /token (Exchange code + PKCE verifier)
+        Google-->>Web: Return refresh_token, access_token, id_token
+        Web->>Google: Ensure 'Telegram Music' & 'Telegram Music Review' folders exist
+        Google-->>Web: Return folder IDs
+        Web->>DB: Store refresh_token, google_email, folder IDs in users table
+        Web->>DB: Invalidate cached Drive client for user
+        Web-->>User: 200 HTML: 'Google Drive connected. Return to Telegram.'
+    end
 ```
 
-👍 / 👎 first look at **your** existing copy of that recording (SHA, then MBID, then same `user_id`):
 
-| Your copy | 👍 | 👎 |
-| --- | --- | --- |
-| none | confirm: copy Telegram file → your library | confirm: copy → your review |
-| already library, uploaded | “Already in your library.” | confirm: **move** that Drive copy library → review |
-| already review, uploaded | confirm: **move** review → library | “Already in your review folder.” |
-
-Copy uses the **current Telegram file** when possible, else local/Drive. Confirm Yes runs `copy_track_for_user` / `relocate_track` / `delete_track`. No cancels. Drive copies of other users are never touched.
-
-🙏 sets dest to Telegram-only (`drive_dest=none`) and `correct_telegram=true`, then re-runs the identify worker against a staged original (Telegram → local → Drive). Group/channel media is replaced after identify. In a DM, a listen copy is sent first.
-
-✍️ commit **replaces the group/channel audio for everyone** and stamps `last_editor_user_id`. Drive files stay until someone 👍/👎 copies the new file. Cancel discards the staged copy. The **15-minute expire job** discards `react_exit` after 24h (`Edit timed out`). 👍/👎 confirm prompts are not auto-expired.
-
-If ✍️ is still open, 👍/👎/💩/🙏 reply “Finish or cancel ✍️ first.”
 
 ---
 
-## 5. Settings
 
-Stored per Telegram user in `users.settings_json`. Changed in Mini App (`POST /api/settings`) or by answering a dest prompt (which writes the same prefs).
 
-| Setting | Values | Default | Effect |
-| --- | --- | --- | --- |
-| **Google Drive** | connected / unlink | off | See [Google login](#6-google-login). Unlink clears refresh token + folder ids; tagging continues. |
-| **Default save (`default_dest`)** | `library` / `review` / `none` | `none` | Where a **new** identify job goes **if Drive is connected**. Forced to `none` while logged out. |
-| **Correct Telegram file** | on / off | off | After save, `editMessageMedia` replaces the public audio with the tagged file. Off: caption-only on first save. Later ✍️ / 🙏 still replace media. |
-| **Delete original file** | on / off | off | After a successful save, delete the **user’s original** audio message (not the bot’s public card). |
-| **Do not ask again (`skip_save_prompt`)** | on / off | off | Logged-in only. Skip the dest keyboard; use the toggles above. Forced **off** while logged out so a later login still prompts. |
-| **Listen-for formats** | flac, mp3, m4a, ogg, opus, wav | flac+mp3 | Which files ingest. Others silently ignored. HiFi picks use the same list. |
-| **Suggest similarity** | 0.0–1.0 | 0.5 | Last.fm familiarity slider (Explorer ↔ Familiar). |
-| **Allow songs unlike library** | on / off | off | Loosen `/suggest` filtering. |
+### OAuth Failure Modes & Error Codes
 
-### Dest prompt (Telegram, after identify)
 
-Shown only when logged in **and** `skip_save_prompt` is false **and** this job has not already confirmed dest (🙏 forces confirmed `none`).
+| Failure Code     | Underlying Cause                                                       | Recovery Instruction to User                                                       |
+| ---------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `ticket_expired` | Reused or TTL passed (>600s).                                          | Run `/login` again to issue a fresh ticket.                                        |
+| `access_denied`  | User clicked Cancel on Google consent screen.                          | Run `/login` again when ready.                                                     |
+| `invalid_grant`  | Refresh token expired (~7 days in Testing mode) or revoked.            | Prompt: `Google login expired. Use /login again.`                                  |
+| `email_mismatch` | User attempted to link a different Google email than previously bound. | HTTP 403. User must disconnect old account or re-authenticate with original email. |
+| `needs_login`    | Token exchange returned no refresh token (missing `prompt=consent`).   | Re-run `/login` to trigger explicit consent prompt.                                |
 
-Toggles: Drive library / Drive review / No Drive upload, Correct Telegram file, Delete original file, Do not ask again. **OK** commits and **persists** those prefs for next time. Cancel aborts the pending row.
-
-### Setting × login matrix (identify / save)
-
-| | Logged out | Logged in, dest `none` | Logged in, dest `library` or `review` |
-| --- | --- | --- | --- |
-| Dest prompt | **skipped**; dest locked `none` | shown unless “do not ask again” | same |
-| Drive upload | never | no | yes, into `Telegram Music` or `Telegram Music Review` |
-| Language folder | still used for caption/index; no Drive tree | Drive path `/{language}/…` when dest is library | same |
-| Correct Telegram file | caption-only unless 🙏/✍️ | honors toggle | honors toggle |
-| Delete original | honors toggle | honors toggle | honors toggle |
-| 👍 / 👎 copy | local user copy only (no Drive root) | upload to that user’s Drive | same |
-| `/review` Drive sync | no remote listing | lists Drive review extras | same |
-| Daily cleanup cron | drop local after **7 days**; skip Drive retry | keep local 7 days after Drive-confirmed upload, then drop if Drive still has the file | Drive retry on `failed` rows |
 
 ---
 
-## 6. Google login
 
-`logged_in` ⇔ non-empty `google_refresh_token`.
 
-### Connect
+## 6. Scheduled Daemons & Background Maintenance
 
-```text
-/login or Mini App Connect
-  issue one-time ticket (user_id bound)
-  GET /oauth/start?token=…  → consume ticket
-  redirect Google auth (PKCE, drive.file + drive.install + email + openid, prompt=consent, offline)
-  GET /oauth/callback
-  ├─ error=access_denied → “Google denied access. Use /login again.”
-  ├─ bad/expired state → “This login session expired.”
-  ├─ token exchange missing refresh_token → needs_login
-  ├─ email ≠ previously linked email → forbidden (old token kept)
-  └─ ok
-        ensure Drive folders “Telegram Music” + “Telegram Music Review”
-        store refresh token, email, folder ids
-        drop cached Drive client for that user
-        HTML: “Google Drive connected…”
+All scheduled processes run inside the primary `bot` container. APScheduler coordinates interval and cron schedules; asynchronous background tasks handle job queues and indexing.
+
+```mermaid
+flowchart TD
+    %% Boot Sequence
+    subgraph BootSequence ["Container Boot Sequence (app/bot.py:main)"]
+        BOOT["python -m app"] --> B_SCHED["Initialize APScheduler (UTC)"]
+        BOOT --> B_WORKER["Spawn Tagger Worker (asyncio task)"]
+        BOOT --> B_WAIT["Wait for Local Bot API Health (:8081)"]
+        B_WAIT --> B_HTTP["Bind aiohttp Server (:8080)"]
+        B_HTTP --> B_REC["Run Boot Recovery: recover_interrupted()"]
+        B_REC --> B_WARM["Spawn Library Index Warmup (background task)"]
+        B_WARM --> B_POLL["Start aiogram Long Polling"]
+    end
+
+    %% Periodic Schedules
+    subgraph PeriodicSchedules ["Scheduled Cron Daemons (APScheduler)"]
+        SCHED_15["Interval: Every 15 Minutes"] --> CRON_P15["run_expire_pending()"]
+        SCHED_DAILY["Cron: Daily at 03:00 UTC (CLEANUP_CRON)"] --> CRON_DAILY["run_cleanup()"]
+    end
+
+    %% 15-Minute Expiration Flow
+    subgraph ExpirePendingFlow ["15-Minute Expiration: run_expire_pending()"]
+        CRON_P15 --> P_QUERY["Query: status = 'waiting' AND expires_at <= NOW()<br/>(Excludes react_edit, react_confirm with ~10-yr expiry)"]
+        P_QUERY --> P_PHASE{"Evaluate Phase"}
+        P_PHASE -->|phase = 'tags'| P_TAGS["Auto-commit current tags -> route to Review Drive folder"]
+        P_PHASE -->|phase = 'cover'| P_COVER["Select candidate cover #1 -> promote followers -> proceed to Drive"]
+        P_PHASE -->|phase = 'drive'| P_DRIVE["Abort Drive upload -> retain file in local cache"]
+        P_PHASE -->|phase = 'react_exit'| P_EXIT["Discard staged /data/tmp copy -> unlock track ('Edit timed out')"]
+        P_PHASE -->|phase IN (intake, lang, dest)| P_PURGE["Delete files in /data/pending -> set status = 'expired'"]
+    end
+
+    %% Daily Cleanup 13-Step Flow
+    subgraph DailyCleanupFlow ["Daily Maintenance: run_cleanup() (13 Sequential Stages)"]
+        CRON_DAILY --> S1["1. run_expire_pending()"]
+        S1 --> S2["2. Drive Retry (status='failed')"]
+        S2 --> S3["3. Sweep Drive-Confirmed Local Files (>7 days)"]
+        S3 --> S4["4. Prune Logged-Out Local Files (>7 days)"]
+        S4 --> S5["5. Clean /data/cache Unused Entries (>7 days)"]
+        S5 --> S6["6. Forget Idle Users (>3 months inactive)"]
+        S6 --> S7["7. Recursively rmdir Empty Local Directories"]
+        S7 --> S8["8. Sweep /data/tmp Files (>7 days)"]
+        S8 --> S9["9. Sweep /data/covers Files (>7 days)"]
+        S9 --> S10["10. Sweep Leftover Bot API Downloads (>24h)"]
+        S10 --> S11["11. Hard-Delete Finished pending_reviews (>30 days)"]
+        S11 --> S12["12. Purge Expired /suggest Sessions & Last.fm Cache"]
+        S12 --> S13["13. Sweep Empty Remote Drive Review Folders"]
+    end
 ```
 
-Ticket/state TTL default 600s, single use. `GOOGLE_CLIENT_SECRET` stays on the server. Testing-mode Google tokens die ~7 days → `Google login expired. Use /login again.` (`invalid_grant` never dumps the token).
 
-Second Google account on the same Telegram user is refused.
-
-### Logged out (never connected, unlinked, or token cleared)
-
-- Identify / tag / public caption still run.
-- No dest prompt; no Drive create/replace/delete.
-- 👍/👎/💩 operate on **local** per-user copies only; `relocate_track` skips Drive when folder ids are empty.
-- Daily cron: no upload retry; locals older than 7 days deleted; idle users forgotten after `USER_INACTIVE_MONTHS` (default 3; tokens first if any remain). See [§7](#7-scheduled-and-background-processes).
-- Mini App home: “Tagging still works in Telegram without Drive.” + Connect button.
-
-### Logged in
-
-- Dest prompt (unless skipped) can copy tagged audio into that user’s Drive only (`drive.file` — folders this app created after login).
-- 👍 copies the current Telegram file into **your** library Drive; 👎 into **your** review Drive; 💩 deletes **your** Drive+local copy.
-- 🙏 / ✍️ do **not** rewrite Drive until a later 👍/👎.
-- Name conflict on upload: Replace / Keep both / Skip (Skip keeps local).
-- Daily cron (`CLEANUP_CRON`, default 03:00 UTC): retry failed Drive uploads; after 7 days drop a local whose Drive copy still exists.
-- Unlink: `POST /api/settings` `{unlink: true}` — Drive files already saved stay in Google until the user deletes them.
-
-### Login failures the user sees
-
-| Symptom | Cause |
-| --- | --- |
-| Login link expired | Ticket reused or TTL passed. `/login` again. |
-| Google denied access | Consent cancelled. |
-| Google login expired. Use /login again. | Refresh token dead / `invalid_grant`. |
-| Access denied / forbidden | Blacklisted, or a different Google email than the one already linked. |
-| Private access requires membership… | DM without a known group (and not env admin). |
 
 ---
 
-## Identify pipeline (shared by audio, HiFi pick, 🙏)
 
-1. **Hints** from filename + existing tags.
-2. **AcoustID** → recordings; **MusicBrainz** for credits, album, track/disc, composer.
-3. **Enrich**: Last.fm tags → `genre \| mood \| language \| instrument`; LRCLIB **synced** lyrics only; cover URLs.
-4. **Normalize** artist lists (`A, B, C & D`) and genre allowlist.
-5. **Low confidence** → human review (group diff keyboard or DM editor) before dest/cover.
-6. **High confidence** → language → cover → dest → tags on disk → Drive (if dest ≠ `none`) → public caption/media.
 
-Tags written: `TITLE`, `ALBUM`, `ARTIST`, `ALBUMARTIST`, `COMPOSER`, `GENRE`, `DATE`, `TRACKNUMBER`, `DISCNUMBER`, `LYRICS`, one front cover. Everything else stripped.
+### Boot Recovery Matrix (`recover_interrupted`)
 
----
+Executed once at boot before polling starts:
 
-## 7. Scheduled and background processes
 
-All of these run **inside the `bot` container** (APScheduler + `asyncio` tasks). Compose `website` / `ftp` / `telegram-bot-api` are other services, not this scheduler. Different **triggers** are separate process flows.
+| Interrupted State & Phase                      | Recovery Action                                              | Restored Status & Phase                    |
+| ---------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------ |
+| `cleanup_pending` (any status)                 | Delete leftover review folder source file in Drive.          | `status = 'done'`                          |
+| `phase = 'intake'` (`queued` / `processing`)   | Re-enqueue `Job` into `asyncio.Queue`.                       | `status = 'queued'`, `phase = 'intake'`    |
+| `phase = 'dm_topic'` (`queued` / `processing`) | Re-enqueue `Job` into `asyncio.Queue`.                       | `status = 'queued'`, `phase = 'dm_topic'`  |
+| `status = 'uploading'`                         | Set destination to Drive; auto-apply `Replace` on collision. | `status = 'processing'`, `phase = 'drive'` |
+| `phase = 'dest'`                               | Restore destination selection keyboard in Telegram.          | `status = 'waiting'`, `phase = 'dest'`     |
+| `phase = 'lang'` or `'cover'`                  | Restore active gallery pickers and language selectors.       | `status = 'waiting'`                       |
+| Any other interrupted state                    | Fallback to waiting state.                                   | `status = 'waiting'`                       |
 
-```text
-python -m app
-  start APScheduler
-       ├─ every 15 min: expire pending
-       └─ CLEANUP_CRON: daily cleanup
-  start tagger worker                    ← Job queue (asyncio task)
-  wait for local Bot API
-  start HTTP (Mini App + OAuth)          ← request-triggered
-  recover interrupted jobs               ← once, boot
-  warm library tag index (background)    ← once, boot
-  poll Telegram                          ← update-triggered (sections 1–6)
-```
 
 ---
 
-### Process: tagger worker
 
-**Trigger:** `Job` enqueued (audio ingest, HiFi pick, 🙏 restart). Not on a clock.
 
-**Flow:** dequeue → claim pending `queued`→`processing` → `process_job` (identify / prompts / Drive) → mark done or fail → notify user on error. Telegram network drop parks the row as `queued` for boot recovery. One failed job does not kill the worker.
+### Passive TTL & Cache Invalidation Registry
 
-Details: [audio worker](#worker-process_job).
 
----
+| Entity                          | Time-To-Live (TTL)           | Expiration Trigger                                | Fallback Action on Expiry                        |
+| ------------------------------- | ---------------------------- | ------------------------------------------------- | ------------------------------------------------ |
+| **OAuth Ticket / State**        | 600 seconds (10 min)         | Evaluated on `/oauth/start` or `/oauth/callback`. | Rejection: `This login session expired.`         |
+| **Mini App** `initData`         | 300 seconds (5 min)          | Evaluated on every `/api/`* request.              | HTTP 401: `Unauthorized / Session expired.`      |
+| **HiFi Result Buttons**         | 1 hour                       | Evaluated on inline button click.                 | Telegram notification: `Search session expired.` |
+| **Suggest Interactive Session** | 24 hours                     | Evaluated on page / pick callback.                | Session reset: `Suggestion session expired.`     |
+| **Membership Check Cache**      | 60 seconds (5 min API grace) | Evaluated on private DM access gate.              | Re-queries Telegram `getChatMember`.             |
+| **Google Refresh Token**        | ~7 days (Testing mode)       | Evaluated on any Google Drive API request.        | Marks user `needs_login`; halts remote sync.     |
 
-### Process: boot recovery
-
-**Trigger:** once, after Telegram is up and HTTP is listening, **before** polling.
-
-**Flow:** load pending rows in `queued` / `processing` / `uploading` / `expiring` / `cleanup_pending`.
-
-```text
-recover_interrupted
-  ├─ cleanup_pending → delete promoted review Drive source; mark done
-  ├─ dm_topic queued/processing → re-queue Job (private)
-  ├─ intake queued/processing → re-queue Job (needs file id or local path)
-  ├─ uploading → phase=drive, auto Replace
-  ├─ dest → restore dest prompt (waiting)
-  ├─ lang / cover processing → waiting (prompts restored next)
-  └─ else → waiting
-  then restore waiting cover galleries + language prompts
-```
-
-Does **not** expire 24h rows; that is the interval job.
 
 ---
 
-### Process: library index warmup
 
-**Trigger:** once, as a background task when polling starts. Failure is logged; bot keeps running.
 
-**Flow:** `ensure_library_index` so `/suggest` and reaction resolve can read Drive/sqlite tags without blocking the first user.
+## 7. System States & Key References
 
----
 
-### Process: expire pending (24h waiters)
 
-**Trigger:** APScheduler **interval, every 15 minutes** (`run_expire_pending`). Also the **first step** of the daily cleanup cron (same function, not a second implementation).
+### `pending_reviews` Lifecycle State Machine
 
-**Selects:** `status=waiting` and `expires_at <= now`. **Skips** `react_edit` and `react_confirm` (👍/👎/💩/🙏 confirms use a ~10-year `expires_at` so they are not auto-cleared). `react_exit` (✍️ removed, waiting commit/cancel) uses 24h and **is** expired here.
 
-Also retries `cleanup_pending` (delete leftover review-folder Drive file after a promote).
+| Phase             | Valid Statuses          | Description                                                                          |
+| ----------------- | ----------------------- | ------------------------------------------------------------------------------------ |
+| `intake`          | `queued`, `processing`  | Audio file downloaded, waiting for worker AcoustID identification.                   |
+| `tags`            | `waiting`, `processing` | Low-confidence metadata match awaiting user approval of tag-diff keyboard.           |
+| `cover`           | `waiting`, `processing` | Multiple artwork candidates detected; awaiting user pick on leader track.            |
+| `lang`            | `waiting`, `processing` | Multiple languages detected on genre; awaiting folder language selection.            |
+| `dest`            | `waiting`, `processing` | Identification complete; awaiting user destination choice (Library / Review / None). |
+| `drive`           | `waiting`, `processing` | Name conflict in Google Drive target folder; awaiting Replace / Keep both / Skip.    |
+| `react_edit`      | `waiting`, `processing` | Active collaborative tag editor session (`✍️` added).                                |
+| `react_exit`      | `waiting`               | Editor session closing (`✍️` removed); awaiting Commit or Cancel.                    |
+| `react_confirm`   | `waiting`, `processing` | Awaiting confirmation for 👍 (Library), 👎 (Review), 💩 (Delete), or 🙏 (Restart).   |
+| `cleanup_pending` | `processing`, `done`    | Promoted review track awaiting deletion of old remote source file in Drive.          |
 
-```text
-claim row → status=expiring
-  ├─ phase tags     → write current tags, auto-commit to review
-  │                    (Drive keep-both if name clash)
-  ├─ phase cover    → first cover option, then dest/upload as usual
-  │                    (leader timeout promotes the next album picker)
-  ├─ phase drive    → skip Drive upload, keep local
-  ├─ phase react_exit → discard staged ✍️ copy; “Edit timed out.”
-  └─ else (lang, dest, intake, …)
-        delete pending-root files → status=expired
-        “Expired after 24 hours. Start again.”
-```
-
-Intake / dest / language prompts typically set `expires_at` to **now + 24h**. Cover/tag review same. Failure in this job marks the row `failed`.
 
 ---
 
-### Process: daily cleanup
 
-**Trigger:** APScheduler **cron** `CLEANUP_CRON` (env, default `0 3 * * *`, **03:00 UTC**). Timezone UTC.
 
-**Does not run** on the 15-minute timer (except the expire-pending prefix).
+### Audio Handling & Tagging Invariants
 
-```text
-run_cleanup
-  1. expire pending          (same as the 15-minute job)
-  2. Drive retry             tracks status=failed
-  3. drop Drive-confirmed locals
-  4. drop logged-out locals
-  5. drop unused /data/cache entries (7 days)
-  6. forget idle users
-  7. rmdir empty library/review/cache dirs
-  8. drop /data/tmp older than 7 days
-  9. drop /data/covers older than 7 days
- 10. sweep leftover local Bot API downloads (>24h)
- 11. prune finished pending_reviews older than 30 days
-       (done / cancelled / expired / skipped)
- 12. prune expired /suggest sessions + Last.fm cache rows
- 13. prune empty Drive review subfolders (logged-in users still active)
-```
+1. **Zero Transcoding Invariant:** Audio is **never** re-encoded, downsampled, or transcoded. Bit depth, sample rate, and codec remain 100% identical to the source file.
+2. **Tags Written:** `TITLE`, `ALBUM`, `ARTIST`, `ALBUMARTIST`, `COMPOSER`, `GENRE`, `DATE`, `TRACKNUMBER`, `DISCNUMBER`, `LYRICS` (synced LRCLIB only), front cover art.
+3. **Tags Stripped:** All unlisted tags, comments, vendor strings, encoder notes, and private metadata blocks.
+4. **Data Isolation:** User operations via reactions or Mini App APIs are cryptographically scoped via `initData` HMAC and verified Telegram user IDs. Users cannot inspect, overwrite, or delete audio or Google Drive files belonging to other users.
+5. **Stack Trace Sanitization:** Telegram chat replies and HTTP HTML responses **never** contain raw stack traces, file system paths, database credentials, or OAuth tokens. Errors map to human-friendly codes (`needs_login`, `busy`, `expired`).
 
-Skip `processing` / `uploading` when deleting locals. Env admin is never forgotten.
-
-#### Step 2 — Drive retry (`status=failed`)
-
-| Google | What happens |
-| --- | --- |
-| Logged out, or no Drive folder id | **skip** that row |
-| Logged in, local file missing | DM: `Drive retry failed: local file missing.` |
-| Logged in, local present | re-upload audio (+ review sidecar, library cover if missing). Fail → DM `Drive upload failed. Retry later or /login.` |
-
-#### Step 3 — Drop local after Drive has it
-
-Only `status=uploaded` with a `local_path` **and** `drive_file_id`. Wait **7 days** from `uploaded_at` / `created_at`. Then `files.get`: if Drive still has the file, unlink local+sidecar and clear paths. If Drive is missing, mark failed and run the retry in step 2.
-
-Logged-out users never get this path (no successful Drive id).
-
-#### Step 4 — Logged-out locals
-
-User has no refresh token. Local+sidecar older than **7 days** (mtime) deleted; catalog paths cleared. Drive copies are not deleted (there usually are none).
-
-#### Step 6 — Forget idle users
-
-`last_active_at` older than `USER_INACTIVE_MONTHS` (default **3 months**). Skip env admin. Skip if that user still has `queued`/`processing`/`uploading` pending.
-
-Order: **clear Google tokens and folder ids first**, then drop sqlite user index / OAuth tickets / HiFi picks, delete that user’s track rows and their locals. **Drive files already saved stay in Google.**
-
-#### Step 13 — Empty review folders
-
-Only users active within the idle window **and** with a review folder id. `prune_empty_folders` on `Telegram Music Review`. Failure is logged, not DMed.
-
----
-
-### Not a scheduler (passive TTL, checked on use)
-
-These expire when something **reads** them, not on the 15-minute or daily jobs (except Last.fm/suggest rows, which the daily job also deletes).
-
-| Item | TTL | When it dies |
-| --- | --- | --- |
-| OAuth login ticket / PKCE state | `OAUTH_TICKET_TTL_SECONDS` (default 600s), one-shot | `/oauth/start` or `/oauth/callback` |
-| Mini App `initData` | `INITDATA_MAX_AGE_SECONDS` (default 300s) | each `/api/*` |
-| HiFi result buttons | 1 hour | pick callback |
-| `/suggest` session | 24h | pick/page callback; also daily prune |
-| Last.fm cache rows | 7 days | suggest lookup; also daily prune |
-| Google refresh token (OAuth Testing) | ~7 days (Google, not us) | next Drive call → `needs_login` |
-| Membership cache | 60s (5 min grace on API fail) | next `allow_user` DM check |
-
----
-
-## Error / privacy notes
-
-- User-facing strings are short codes (`needs_login`, `timeout`, `busy`, …). Telegram and HTML never get stack traces, tokens, or Google bodies.
-- Asker gets ephemeral/DM. Infra (dead HiFi session, disk full, HTTP bind) DMs the env admin.
-- One failed job does not kill the worker, dispatcher, or HTTP server.
-- Mini App APIs trust `initData` HMAC only, scoped to that user.

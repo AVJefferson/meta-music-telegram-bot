@@ -11,6 +11,7 @@ This directory contains the commands for the bot. The commands are case insensit
 - [hifi.md](hifi.md)
 - [review.md](review.md)
 - [suggest.md](suggest.md)
+- [cancel.md](cancel.md)
 
 ## Admin Commands
 
@@ -39,3 +40,4 @@ This directory contains the commands for the bot. The commands are case insensit
 - **Caviats:** The caviats of the command.
 - **No Notifications:** There are no notifications for the command. This is used when the command does not send any notifications to the user or admin.
 - **Notifications:** The notifications of the command.
+

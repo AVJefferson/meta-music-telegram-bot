@@ -48,5 +48,6 @@ Buttons: Pagination buttons
 3. Paginations are kept only for short durations. controlled by environment variable.
 4. buttons have return_type as "callback_data" and return_data as "group_id" for the group. So pagination will not work after long time, but group buttons will still work.
 5. recent groups are listed in the order of most recent first. max Y are listed. (Y is set in environment variable as "MAX_RECENT_GROUPS_TO_REMEMBER").
+6. app remembers all active groups but only recent Y are listed in text. Rest are paginated buttons only.
 
 ## No Notifications
