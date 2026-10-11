@@ -6,7 +6,7 @@ from pathlib import Path
 
 ALL_FORMATS = ("flac", "mp3", "m4a", "ogg", "opus", "wav")
 ALL_FORMAT_SET = frozenset(ALL_FORMATS)
-DEFAULT_ALLOWED = ("flac", "mp3")
+DEFAULT_ALLOWED = ("flac", "mp3", "m4a", "wav")
 DEFAULT_ALLOWED_SET = frozenset(DEFAULT_ALLOWED)
 
 _LABELS = {
@@ -208,17 +208,16 @@ def normalize_save_dest(value: object, default: str = "none") -> str:
 
 
 def save_prefs_from_settings(settings: object) -> SavePrefs:
+    from app.prefs import as_save_prefs, process_prefs_from_settings
+
     data = settings if isinstance(settings, dict) else {}
-    return SavePrefs(
-        dest=normalize_save_dest(data.get("default_dest")),
-        correct_telegram=truthy_setting(data.get("correct_telegram")),
-        skip_save_prompt=truthy_setting(data.get("skip_save_prompt")),
-        delete_original=truthy_setting(data.get("delete_original")),
-    )
+    return as_save_prefs(process_prefs_from_settings(data))
 
 
 def user_save_prefs(user: object | None) -> SavePrefs:
-    return save_prefs_from_settings(user_settings_dict(user))
+    from app.prefs import as_save_prefs, process_prefs_from_user
+
+    return as_save_prefs(process_prefs_from_user(user))
 
 
 def clamp_suggest_similarity(value: object, default: float = 0.5) -> float:

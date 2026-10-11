@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -62,12 +64,14 @@ def user_keyboard(ctx: Ctx, user_id: int, session_id: str, picks: list[tuple[str
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def search_songs(ctx: Ctx, user_id: int, query: str) -> InlineKeyboardMarkup:
+async def search_songs(ctx: Ctx, user_id: int, query: str) -> InlineKeyboardMarkup | None:
     max_q = int(getattr(ctx.settings, "hifi_queue_max", 8) or 8)
     if _lock.locked() and len(_sessions) >= max_q:
         raise AppError("busy")
     async with _lock:
         session_id, picks = await _search_locked(ctx, user_id, query)
+    if not picks:
+        return None
     return user_keyboard(ctx, user_id, session_id, picks)
 
 
@@ -81,9 +85,13 @@ async def _search_locked(ctx: Ctx, user_id: int, query: str) -> tuple[str, list[
     rows = await asyncio.wait_for(client.search(username, query), timeout=timeout)
     picks = strip_hifi_keyboard(rows)
     nav = [btn for row in rows for btn in row if is_nav_label(str(getattr(btn, "text", None) or ""))]
-    _sessions[session_id] = {"user_id": user_id, "client": client, "nav": nav, "username": username}
-    if not picks:
-        raise AppError("not_found")
+    _sessions[session_id] = {
+        "user_id": user_id,
+        "client": client,
+        "nav": nav,
+        "username": username,
+        "created": time.time(),
+    }
     return session_id, picks
 
 
@@ -177,43 +185,94 @@ def build_hifi_router() -> Router:
             await callback.answer()
             return
         user_id = callback.from_user.id
+        from app.membership import answer_if_blocked
+
+        if await answer_if_blocked(ctx, callback):
+            return
         if not await allow_from_callback(ctx, callback):
             await callback.answer("Not allowed.", show_alert=True)
             return
         touch(ctx, user_id, callback.from_user)
         pick_id = (callback.data or "")[3:]
+        chat = callback.message.chat if callback.message else None
+        if chat is None:
+            await callback.answer()
+            return
+        from app.audio_in import downloading_text, source_deleted
+        from app.notify import send_notice
+
+        with contextlib.suppress(Exception):
+            await ctx.bot.send_chat_action(chat.id, "upload_document")
+        placeholder = await ctx.bot.send_message(chat.id, downloading_text("song", 0))
+        await callback.answer()
         try:
             check_upload_rate(ctx, user_id)
-            path = await pick_song(ctx, user_id, pick_id)
+            download = asyncio.create_task(pick_song(ctx, user_id, pick_id))
+            while not download.done():
+                if await source_deleted(ctx.bot, chat.id, placeholder.message_id):
+                    download.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await download
+                    await send_notice(
+                        ctx, user_id, "Download cancelled", level="info", chat_id=chat.id
+                    )
+                    return
+                await asyncio.wait({download}, timeout=1)
+            path = download.result()
         except AppError as exc:
-            await callback.answer(exc.user_message, show_alert=True)
+            text = "File not found" if exc.code == "not_found" else exc.user_message
+            with contextlib.suppress(Exception):
+                await placeholder.edit_text(text)
+            from app.notify import send_notice
+
+            await send_notice(ctx, user_id, text, level="error", chat_id=chat.id)
             return
         except Exception as exc:
             await notify_error(ctx, user_id, exc)
-            await callback.answer("Failed.", show_alert=True)
+            with contextlib.suppress(Exception):
+                await placeholder.edit_text("Failed.")
             return
         from app.formats import is_allowed_audio, user_allowed_formats
         from app.intake import ingest_local_audio
 
         file_name = Path(path).name or "track.flac"
         if not is_allowed_audio(file_name, "", user_allowed_formats(ctx, user_id)):
-            await callback.answer("That format is off in Settings.", show_alert=True)
+            with contextlib.suppress(Exception):
+                await placeholder.edit_text("File format not supported")
             return
-        await callback.answer()
-        chat = callback.message.chat if callback.message else None
-        if chat is None:
+        if await source_deleted(ctx.bot, chat.id, placeholder.message_id):
+            await send_notice(ctx, user_id, "Download cancelled", level="info", chat_id=chat.id)
             return
-        await ingest_local_audio(ctx, chat=chat, user_id=user_id, path=path, file_name=file_name)
+        with contextlib.suppress(Exception):
+            await placeholder.edit_text(downloading_text(file_name, 100))
+        await ingest_local_audio(
+            ctx,
+            chat=chat,
+            user_id=user_id,
+            path=path,
+            file_name=file_name,
+            status_message_id=placeholder.message_id,
+        )
 
     @router.callback_query(F.data.startswith("hfmore:"))
     async def on_more(callback: CallbackQuery, ctx: Ctx) -> None:
         if not callback.from_user:
             await callback.answer()
             return
+        from app.membership import answer_if_blocked
+
+        if await answer_if_blocked(ctx, callback):
+            return
         if not await allow_from_callback(ctx, callback):
             await callback.answer("Not allowed.", show_alert=True)
             return
         session_id = (callback.data or "").split(":", 1)[-1]
+        session = _sessions.get(session_id)
+        ttl = int(getattr(ctx.settings, "pagination_ttl_seconds", 300) or 300)
+        created = float(session.get("created") or 0) if session else 0
+        if not session or time.time() - created > ttl:
+            await callback.answer("Expired.", show_alert=True)
+            return
         try:
             markup = await more_results(ctx, callback.from_user.id, session_id)
         except AppError as exc:

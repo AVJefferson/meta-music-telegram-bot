@@ -11,7 +11,14 @@ from pathlib import Path
 
 from PIL import Image
 
-from app.enrich import _fit_cover, fetch_cover, list_caa_fronts, list_itunes_album_cover
+from app.enrich import (
+    _fit_cover,
+    fetch_cover,
+    list_caa_fronts,
+    list_discogs_album_cover,
+    list_itunes_album_cover,
+    list_lastfm_album_cover,
+)
 from app.library import UNKNOWN_LANGUAGE_FOLDER
 from app.models import Ctx, Identity, TagSet
 from app.util import format_artist_list, normalize_match_text, sanitize_filename
@@ -22,7 +29,15 @@ COVER_NAME = "cover.jpg"
 COVER_TTL = timedelta(days=7)
 MAX_COVER_OPTIONS = 10
 _PLACEHOLDER_ALBUMS = {"", "unknown", "unknown album"}
-SOURCE_LABELS = {"file": "file", "caa": "CAA", "itunes": "iTunes", "drive": "Drive", "cache": "Drive"}
+SOURCE_LABELS = {
+    "file": "File",
+    "lastfm": "Last.fm",
+    "caa": "CAA",
+    "discogs": "Discogs",
+    "itunes": "iTunes",
+    "drive": "Drive",
+    "cache": "Drive",
+}
 
 
 @dataclass
@@ -142,7 +157,7 @@ def source_display_label(sources: list[str]) -> str:
         name = SOURCE_LABELS.get(source, source)
         if name not in names:
             names.append(name)
-    return " == ".join(names) if names else "cover"
+    return " = ".join(names) if names else "cover"
 
 
 def add_cover_option(
@@ -267,8 +282,22 @@ async def list_cover_candidates(
 
     if file_cover and file_cover[0]:
         add_cover_option(options, file_cover[0], "file")
+    lastfm = await list_lastfm_album_cover(
+        ctx.http, identity, getattr(ctx.settings, "lastfm_api_key", "") or ""
+    )
+    if lastfm:
+        cover, url = lastfm
+        add_cover_option(options, cover[0], "lastfm", url=url)
     for cover, mbid, url in await list_caa_fronts(ctx.http, identity):
         add_cover_option(options, cover[0], "caa", caa_release=mbid, url=url)
+    discogs = await list_discogs_album_cover(
+        ctx.http,
+        identity,
+        getattr(ctx.settings, "musicbrainz_user_agent", "") or "",
+    )
+    if discogs:
+        cover, url = discogs
+        add_cover_option(options, cover[0], "discogs", url=url)
     itunes = await list_itunes_album_cover(ctx.http, identity)
     if itunes:
         cover, url = itunes

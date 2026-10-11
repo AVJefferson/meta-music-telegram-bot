@@ -360,22 +360,26 @@ class SearchDisabledTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_search_skips_hifi(self) -> None:
         from unittest.mock import AsyncMock, patch
 
-        from app.user_cmd import SEARCH_DISABLED_TEXT, SEARCH_ENABLED, _start_search
+        from app.user_cmd import SEARCH_ENABLED, _start_search
 
         self.assertFalse(SEARCH_ENABLED)
         sent: list[str] = []
+        levels: list[str] = []
 
-        async def fake_send(ctx, **kwargs):
-            sent.append(kwargs["text"])
+        async def fake_send(ctx, user_id, text, **kwargs):
+            del ctx, user_id
+            sent.append(text)
+            levels.append(str(kwargs.get("level") or ""))
 
         ctx = SimpleNamespace(bot=SimpleNamespace(id=1), catalog=SimpleNamespace())
         msg = SimpleNamespace(
             from_user=SimpleNamespace(id=9, is_bot=False),
             chat=SimpleNamespace(id=9),
         )
-        with patch("app.user_cmd.send_private", fake_send), patch(
+        with patch("app.notify.send_notice", fake_send), patch(
             "app.hifi.search_songs", AsyncMock()
         ) as search:
             await _start_search(ctx, msg, "neon")
         search.assert_not_called()
-        self.assertEqual(sent, [SEARCH_DISABLED_TEXT])
+        self.assertEqual(sent, ["@HiFiAudioBot has not been enabled by admin"])
+        self.assertEqual(levels, ["error"])

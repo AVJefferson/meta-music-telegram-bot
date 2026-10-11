@@ -35,6 +35,7 @@ def index_entry(
     message_id: int | None = None,
     card_message_id: int | None = None,
     thread_id: int | None = None,
+    sha256: str = "",
 ) -> dict[str, str]:
     return {
         "relative_path": relative_path,
@@ -50,6 +51,7 @@ def index_entry(
         "message_id": str(message_id or "") if message_id else "",
         "card_message_id": str(card_message_id or "") if card_message_id else "",
         "thread_id": str(thread_id) if thread_id is not None else "",
+        "sha256": (sha256 or "").strip().lower(),
     }
 
 
@@ -110,6 +112,16 @@ def tags_from_songlog(text: str) -> TagSet:
     )
 
 
+def songlog_sha256(text: str) -> str:
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if line.startswith("== "):
+            break
+        if line.casefold().startswith("sha256:"):
+            return line.split(":", 1)[1].strip().lower()
+    return ""
+
+
 def _index_tags_ready(tags: TagSet) -> bool:
     return bool(tags.title and tags.artist)
 
@@ -154,6 +166,7 @@ def upsert_entries(entries: list[dict[str, str]], entry: dict[str, str]) -> list
             "card_message_id",
             "thread_id",
             "drive_file_id",
+            "sha256",
         ):
             merged[field] = _keep_meta(item, entry, field)
         out.append(merged)
@@ -203,6 +216,9 @@ def entries_to_tracks(entries: list[dict[str, str]], *, topic: str | None = None
         track.source_message_id = int(msg_raw) if msg_raw.isdigit() else None
         if thread_raw.lstrip("-").isdigit():
             track.thread_id = int(thread_raw)
+        sha = str(item.get("sha256") or "").strip().lower()
+        if sha:
+            track.audio_sha256 = sha
         tracks.append(track)
     return tracks
 
@@ -332,6 +348,7 @@ def upsert_library_index(
     message_id: int | None = None,
     card_message_id: int | None = None,
     thread_id: int | None = None,
+    sha256: str = "",
 ) -> None:
     with _INDEX_LOCK:
         entries = load_index_entries(ctx)
@@ -353,9 +370,27 @@ def upsert_library_index(
                 message_id=message_id,
                 card_message_id=card_message_id,
                 thread_id=thread_id,
+                sha256=sha256,
             ),
         )
         persist_index(ctx, entries)
+
+
+def find_indexed_sha(ctx: Ctx, sha256: str) -> dict[str, str] | None:
+    want = (sha256 or "").strip().lower()
+    if not want:
+        return None
+    try:
+        entries = load_index_entries(ctx)
+    except Exception:
+        log.debug("sha index lookup skipped", exc_info=True)
+        return None
+    if not entries:
+        return None
+    for item in entries:
+        if str(item.get("sha256") or "").strip().lower() == want:
+            return item
+    return None
 
 
 def remove_library_index(ctx: Ctx, relative_path: str | None) -> None:
@@ -395,10 +430,11 @@ def extract_item_tags(ctx: Ctx, item: DriveReviewItem, tmp_root: Path) -> TagSet
             log.debug("index sidecar read failed %s", item.relative_path, exc_info=True)
     if item.log_id:
         try:
-            tags = overlay_tagset(
-                tags,
-                tags_from_songlog(ctx.drive.download_bytes(item.log_id).decode("utf-8")),
-            )
+            text = ctx.drive.download_bytes(item.log_id).decode("utf-8")
+            tags = overlay_tagset(tags, tags_from_songlog(text))
+            sha = songlog_sha256(text)
+            if sha:
+                item.audio_sha256 = sha
         except Exception:
             log.debug("index song log read failed %s", item.relative_path, exc_info=True)
     if _index_tags_ready(tags):
@@ -451,6 +487,7 @@ def rebuild_index(ctx: Ctx, *, on_progress: Callable[[int, int], None] | None = 
                 if str(old.get("card_message_id") or "").isdigit()
                 else None,
                 thread_id=int(old["thread_id"]) if str(old.get("thread_id") or "").lstrip("-").isdigit() else None,
+                sha256=str(getattr(item, "audio_sha256", "") or old.get("sha256") or ""),
             )
         )
         if index == 1 or index == total or index % 25 == 0:
@@ -502,6 +539,7 @@ def remember_library_tags(
     card_message_id: int | None = None,
     thread_id: int | None = None,
     user_id: int = 0,
+    sha256: str = "",
 ) -> None:
     if kind != "library" or not relative_path:
         return
@@ -521,6 +559,7 @@ def remember_library_tags(
             message_id=message_id,
             card_message_id=card_message_id,
             thread_id=thread_id,
+            sha256=sha256,
         )
     except Exception:
         log.warning("library tag index upsert failed path=%s", relative_path, exc_info=True)

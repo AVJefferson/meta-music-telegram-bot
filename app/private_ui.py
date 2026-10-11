@@ -28,7 +28,7 @@ from PIL import Image
 from app.botapi import discard_download
 from app.edit_ui import EDITOR_FIELDS, current_edit_field, handle_edit_text, show_field_menu
 from app.genre import genre_tokens
-from app.membership import allow_user, message_from_bot, user_is_bot
+from app.membership import allow_user, user_is_bot
 from app.models import Ctx, Identity, Job, PendingReview, tagset_from_dict
 from app.tags import audio_info, normalize_tagset, read_cover, read_tagset, write_tags
 from app.util import format_bytes, html_esc, sanitize_filename
@@ -40,9 +40,9 @@ TOPIC_PAGE_SIZE = 10
 
 class AudioMessageFilter(BaseFilter):
     async def __call__(self, message: Message) -> bool:
-        from app.formats import is_known_audio_message
+        from app.audio_in import looks_like_audio
 
-        return is_known_audio_message(message)
+        return looks_like_audio(message)
 
 
 FlacMessageFilter = AudioMessageFilter
@@ -484,47 +484,9 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
 
     @router.message(F.chat.type == "private", AudioMessageFilter())
     async def private_media(message: Message, ctx: Ctx) -> None:
-        from app.bot import file_info
-        from app.botapi import discard_download
-        from app.formats import is_allowed_audio_message, stored_download_name, user_allowed_formats
-        from app.intake import ingest_local_audio
+        from app.bot import intake_audio_message
 
-        if not await _require_private(message, ctx):
-            return
-        if message_from_bot(message, ctx.bot):
-            return
-        if not message.from_user:
-            return
-        if not is_allowed_audio_message(message, user_allowed_formats(ctx, message.from_user.id)):
-            return
-        if ctx.catalog.get_active_for_chat(message.chat.id):
-            await message.reply("Finish or cancel current action first.")
-            return
-        file_id, file_name = file_info(message)
-        pending_dir = ctx.settings.pending_root / str(uuid.uuid4())
-        pending_dir.mkdir(parents=True, exist_ok=True)
-        mime = ""
-        media = message.document or message.audio
-        if media is not None:
-            mime = getattr(media, "mime_type", None) or ""
-        local = pending_dir / stored_download_name(file_name, mime)
-        try:
-            telegram_file = await ctx.bot.get_file(file_id)
-            await ctx.bot.download(telegram_file, destination=local)
-            await asyncio.to_thread(discard_download, telegram_file.file_path)
-            await ingest_local_audio(
-                ctx,
-                chat=message.chat,
-                user_id=message.from_user.id,
-                path=local,
-                file_name=file_name,
-                telegram_file_id=file_id,
-                source_message_id=message.message_id,
-            )
-        except Exception:
-            shutil.rmtree(pending_dir, ignore_errors=True)
-            log.exception("private audio ingest failed")
-            await message.reply("Could not process audio. Try again.")
+        await intake_audio_message(message, ctx)
 
     @router.callback_query(F.data.regexp(r"^d\d+:"))
     async def private_callback(callback: CallbackQuery, ctx: Ctx) -> None:
@@ -540,6 +502,10 @@ def build_private_router(jobs: asyncio.Queue[Job]) -> Router:
             return
         if not callback.from_user:
             await callback.answer()
+            return
+        from app.membership import answer_if_blocked
+
+        if await answer_if_blocked(ctx, callback):
             return
         if not await allow_user(ctx, callback.from_user.id, callback.message.chat):
             await callback.answer("Access denied.", show_alert=True)

@@ -58,7 +58,7 @@ def lyrics_preview(text: str, *, lines: int = 3, keep_time: bool = False) -> str
         if keep_time and stamp:
             clock = format_clock(_stamp_seconds(stamp.group(0)), seekable=True)
             if clock:
-                line = f"{clock}  {line}"
+                line = f"{clock} {line}"
         out.append(line)
         if len(out) >= lines:
             break
@@ -71,7 +71,7 @@ def lyrics_card_text(text: str | None, *, lines: int = 3) -> str:
         return "Lyrics: none"
     preview = lyrics_preview(raw, lines=lines, keep_time=is_synced_lrc(raw))
     if not preview:
-        return "Lyrics: present"
+        return "Lyrics:\n—"
     return f"Lyrics:\n{preview}"
 
 
@@ -498,6 +498,136 @@ def _itunes_album_match(identity: Identity, results: list[dict]) -> dict | None:
     return results[0] if results else None
 
 
+_LASTFM_IMAGE_SIZES = ("mega", "extralarge", "large")
+
+
+def lastfm_image_url(payload: dict) -> str:
+    album = payload.get("album") if isinstance(payload, dict) else None
+    images = album.get("image") if isinstance(album, dict) else None
+    if not isinstance(images, list):
+        return ""
+    by_size: dict[str, str] = {}
+    for item in images:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("#text") or "").strip()
+        size = str(item.get("size") or "").strip().casefold()
+        if url and size:
+            by_size[size] = url
+    for size in _LASTFM_IMAGE_SIZES:
+        if size in by_size:
+            return by_size[size]
+    return ""
+
+
+async def list_lastfm_album_cover(
+    http: httpx.AsyncClient,
+    identity: Identity,
+    api_key: str,
+) -> tuple[tuple[bytes, str], str] | None:
+    key = (api_key or "").strip()
+    album = (identity.album or "").strip()
+    artists = list(identity.album_artists or identity.artists or [])
+    artist = (artists[0] if artists else "").strip()
+    if not key or not album or not artist:
+        return None
+    try:
+        response = await http.get(
+            "https://ws.audioscrobbler.com/2.0/",
+            params={
+                "method": "album.getinfo",
+                "api_key": key,
+                "artist": artist,
+                "album": album,
+                "format": "json",
+            },
+            timeout=20.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    url = lastfm_image_url(payload if isinstance(payload, dict) else {})
+    if not url:
+        return None
+    try:
+        image = await http.get(url, timeout=20.0)
+        image.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    data = image.content
+    if not data:
+        return None
+    try:
+        fitted = _fit_cover(data)
+    except Exception:
+        return None
+    return fitted, url
+
+
+def discogs_cover_url(payload: dict, album: str) -> str:
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(results, list):
+        return ""
+    album_n = (album or "").strip().casefold()
+    fallback = ""
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("cover_image") or item.get("thumb") or "").strip()
+        if not url or url.endswith("spacer.gif"):
+            continue
+        title = str(item.get("title") or "").casefold()
+        if album_n and album_n in title:
+            return url
+        if not fallback:
+            fallback = url
+    return fallback
+
+
+async def list_discogs_album_cover(
+    http: httpx.AsyncClient,
+    identity: Identity,
+    user_agent: str,
+) -> tuple[tuple[bytes, str], str] | None:
+    album = (identity.album or "").strip()
+    artists = list(identity.album_artists or identity.artists or [])
+    artist = (artists[0] if artists else "").strip()
+    if not album or not artist:
+        return None
+    try:
+        response = await http.get(
+            "https://api.discogs.com/database/search",
+            params={"q": f"{artist} {album}", "type": "release", "per_page": "5"},
+            headers={"User-Agent": user_agent or "telegram-music-bot/1.0"},
+            timeout=20.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    url = discogs_cover_url(payload if isinstance(payload, dict) else {}, album)
+    if not url:
+        return None
+    try:
+        image = await http.get(
+            url,
+            headers={"User-Agent": user_agent or "telegram-music-bot/1.0"},
+            timeout=20.0,
+        )
+        image.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    data = image.content
+    if not data:
+        return None
+    try:
+        fitted = _fit_cover(data)
+    except Exception:
+        return None
+    return fitted, url
+
+
 async def list_itunes_album_cover(
     http: httpx.AsyncClient, identity: Identity
 ) -> tuple[tuple[bytes, str], str] | None:
@@ -652,7 +782,7 @@ async def _lrclib(http: httpx.AsyncClient, identity: Identity) -> tuple[str | No
         return None, False
     if hit.instrumental:
         return None, True
-    if is_synced_lrc(hit.lyrics):
+    if (hit.lyrics or "").strip():
         return hit.lyrics, False
     return None, False
 

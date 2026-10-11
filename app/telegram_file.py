@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from aiogram.types import FSInputFile, InputMediaAudio, InputMediaDocument
+from aiogram.types import BufferedInputFile, FSInputFile, InputMediaAudio, InputMediaDocument
 
 from app.captions import music_caption
 from app.models import TagSet, TrackRecord
@@ -37,6 +37,22 @@ def audio_send_kwargs(path: Path, tags: TagSet | None = None) -> dict:
     return kwargs
 
 
+def audio_thumbnail(path: Path):
+    """JPEG cover embedded in the file, for Telegram's player artwork."""
+    try:
+        from app.tags import read_cover
+
+        data, _mime = read_cover(path)
+    except Exception:
+        log.debug("cover thumbnail unavailable path=%s", path, exc_info=True)
+        return None
+    if not data or data[:2] != b"\xff\xd8":
+        return None
+    if len(data) > 200_000:
+        return None
+    return BufferedInputFile(data, filename="cover.jpg")
+
+
 async def send_public_audio(
     ctx,
     chat_id: int,
@@ -51,6 +67,9 @@ async def send_public_audio(
     name = filename or path.name
     media = FSInputFile(path, filename=name)
     extra = audio_send_kwargs(path, tags)
+    thumb = audio_thumbnail(path)
+    if thumb is not None:
+        extra["thumbnail"] = thumb
     send_kwargs: dict = {"parse_mode": "HTML"}
     if caption:
         send_kwargs["caption"] = caption
@@ -77,6 +96,9 @@ async def update_public_audio(
     file_id: str | None = None
     if correct_media and path.is_file() and message_id:
         extra = audio_send_kwargs(path, tags)
+        thumb = audio_thumbnail(path)
+        if thumb is not None:
+            extra["thumbnail"] = thumb
         media_file = FSInputFile(path, filename=path.name)
         try:
             edited = await ctx.bot.edit_message_media(

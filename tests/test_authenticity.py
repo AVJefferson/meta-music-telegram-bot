@@ -134,11 +134,11 @@ class StampAndPreviewTests(unittest.TestCase):
         self.assertEqual(authenticity_from(report, identity).verdict, "FAKE_CERTAIN")
         preview = tag_preview(TagSet(title="Stay"), AudioMetrics(172, 16, 44100, 987), authenticity=result)
         self.assertNotIn("Authenticity:", preview)
-        self.assertIn("Format: FLAC", preview)
-        self.assertIn("<b>Stay</b>", preview)
+        self.assertIn("FLAC |", preview)
+        self.assertIn("<i>Stay</i>", preview)
         queued = _preview(TagSet(title="Stay"), identity, report=report)
         self.assertNotIn("Authenticity:", queued)
-        self.assertIn("<b>Stay</b>", queued)
+        self.assertIn("<i>Stay</i>", queued)
 
     def test_songlog_has_authenticity_block(self) -> None:
         text = render_songlog(
@@ -237,7 +237,16 @@ class ProcessJobFlagOnlyTests(unittest.IsolatedAsyncioTestCase):
             analyze_kw = {"side_effect": side_effect} if side_effect else {"return_value": result}
             with (
                 patch("app.queue.edit_status", fake_edit),
-                patch("app.queue.read_hints", return_value=TagHints(title="Stay", filename="stay.flac")),
+                patch(
+                    "app.queue.read_hints",
+                    return_value=TagHints(
+                        title="Stay",
+                        album="Hour",
+                        artist="Sam",
+                        albumartist="Sam",
+                        filename="stay.flac",
+                    ),
+                ),
                 patch("app.queue.read_cover", return_value=(None, None)),
                 patch("app.queue.identify_file", return_value=identity),
                 patch("app.queue.enrich", fake_enrich),

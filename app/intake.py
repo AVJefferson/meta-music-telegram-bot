@@ -7,7 +7,6 @@ from pathlib import Path
 
 from aiogram.types.chat import Chat
 
-from app.captions import music_caption
 from app.errors import AppError
 from app.formats import stored_download_name
 from app.membership import check_upload_rate, touch
@@ -34,6 +33,7 @@ async def ingest_local_audio(
     topic_name: str = "",
     telegram_file_id: str = "",
     source_message_id: int = 0,
+    status_message_id: int | None = None,
 ) -> int:
     touch(ctx, user_id)
     check_upload_rate(ctx, user_id)
@@ -41,29 +41,36 @@ async def ingest_local_audio(
     if not local.is_file():
         raise AppError("not_found")
     sha = await asyncio.to_thread(file_sha256, local)
-    existing = ctx.catalog.find_user_track_by_sha(user_id, sha)
-    if existing:
-        caption = music_caption(track=existing, extra="already in library/review")
-        await send_public_audio(
+    remember_cache(ctx, sha, local)
+    from app.audio_in import CHECKS_TEXT
+
+    tags = TagSet(title=Path(file_name).stem)
+    caption = CHECKS_TEXT
+    ctx.catalog.increment_songs_processed(user_id)
+    text_status = bool(status_message_id)
+    if text_status:
+        sent_id = int(status_message_id or 0)
+        try:
+            await ctx.bot.edit_message_text(
+                caption,
+                chat_id=chat.id,
+                message_id=sent_id,
+                parse_mode="HTML",
+            )
+        except Exception:
+            log.debug("placeholder edit failed message=%s", sent_id, exc_info=True)
+        sent_file_id = telegram_file_id
+    else:
+        sent = await send_public_audio(
             ctx,
             chat.id,
-            Path(existing.local_path or local),
+            local,
             caption=caption,
             thread_id=thread_id,
+            tags=tags,
         )
-        return existing.id
-    remember_cache(ctx, sha, local)
-    tags = TagSet(title=Path(file_name).stem)
-    caption = music_caption(tags=tags, extra="identifying…")
-    sent = await send_public_audio(
-        ctx,
-        chat.id,
-        local,
-        caption=caption,
-        thread_id=thread_id,
-        tags=tags,
-    )
-    sent_file_id = telegram_file_id or message_file_id(sent)
+        sent_id = sent.message_id
+        sent_file_id = telegram_file_id or message_file_id(sent)
     pending_id = ctx.catalog.insert_pending_review(
         phase="intake",
         status="queued",
@@ -76,17 +83,17 @@ async def ingest_local_audio(
         working_json="{}",
         candidates_json="[]",
         identity_json="{}",
-        source_report_json="{}",
+        source_report_json='{"text_status": true}' if text_status else "{}",
         chat_id=chat.id,
         thread_id=thread_id,
-        status_message_id=sent.message_id,
+        status_message_id=sent_id,
         topic_name=topic_name or "",
         file_name=sanitize_filename(file_name) or stored_download_name(file_name),
         telegram_file_id=sent_file_id,
-        source_message_id=source_message_id or sent.message_id,
+        source_message_id=source_message_id or sent_id,
         expires_at=_expires(),
         user_id=user_id,
-        public_message_id=sent.message_id,
+        public_message_id=sent_id,
     )
     await ctx.jobs.put(
         Job(
@@ -95,13 +102,13 @@ async def ingest_local_audio(
             topic_name=topic_name or "",
             file_id=sent_file_id,
             file_name=file_name,
-            status_message_id=sent.message_id,
+            status_message_id=sent_id,
             local_path=str(local),
             private=chat.id > 0,
             source_pending_id=pending_id,
-            source_message_id=source_message_id or sent.message_id,
+            source_message_id=source_message_id or sent_id,
             user_id=user_id,
-            public_message_id=sent.message_id,
+            public_message_id=sent_id,
         )
     )
     return pending_id

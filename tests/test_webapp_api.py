@@ -185,14 +185,14 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
                     data=json.dumps({"allowed_formats": []}),
                 )
                 empty_data = await empty.json()
-            self.assertEqual(me_data["allowed_formats"], ["flac", "mp3"])
+            self.assertEqual(me_data["allowed_formats"], ["flac", "mp3", "m4a", "wav"])
             self.assertEqual(saved_data["allowed_formats"], ["flac", "wav"])
             self.assertEqual(dest_data["allowed_formats"], ["flac", "wav"])
             self.assertEqual(dest_data["default_dest"], "review")
-            self.assertEqual(empty_data["allowed_formats"], ["flac", "mp3"])
+            self.assertEqual(empty_data["allowed_formats"], ["flac", "mp3", "m4a", "wav"])
             stored = json.loads(catalog.get_user(11).settings_json)
             self.assertEqual(stored["default_dest"], "review")
-            self.assertEqual(stored["allowed_formats"], ["flac", "mp3"])
+            self.assertEqual(stored["allowed_formats"], ["flac", "mp3", "m4a", "wav"])
 
     async def test_suggest_lastfm_flag_and_bool_in_library(self) -> None:
         directory, catalog = temp_catalog()
@@ -282,7 +282,7 @@ class WebappApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data["library_count"], 3)
             self.assertEqual(data["suggest_similarity"], 0.5)
             self.assertEqual(data["suggest_library"], "any")
-            self.assertFalse(data["correct_telegram"])
+            self.assertTrue(data["correct_telegram"])
             self.assertFalse(data["skip_save_prompt"])
             self.assertFalse(data["delete_original"])
             self.assertTrue(data["notify_group_save"])

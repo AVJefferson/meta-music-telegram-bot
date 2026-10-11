@@ -91,7 +91,7 @@ class CoverLabelTests(unittest.TestCase):
         add_cover_option(options, payload, "file")
         add_cover_option(options, payload, "itunes")
         self.assertEqual(len(options), 1)
-        self.assertEqual(options[0].label, "file == iTunes")
+        self.assertEqual(options[0].label, "File = iTunes")
         self.assertEqual(options[0].width, 1200)
         self.assertEqual(options[0].height, 1200)
 
@@ -101,7 +101,7 @@ class CoverLabelTests(unittest.TestCase):
         add_cover_option(options, payload, "file")
         add_cover_option(options, payload, "caa")
         add_cover_option(options, payload, "itunes")
-        self.assertEqual(options[0].label, "file == CAA == iTunes")
+        self.assertEqual(options[0].label, "File = CAA = iTunes")
 
     def test_identical_caa_stays_caa(self) -> None:
         payload = _jpeg((640, 640), (4, 5, 6))
@@ -120,10 +120,13 @@ class CoverLabelTests(unittest.TestCase):
         self.assertEqual([opt.label for opt in options], ["CAA 1", "CAA 2"])
 
     def test_caption_includes_size(self) -> None:
-        option = {"label": "file == iTunes", "width": 1200, "height": 1200}
-        self.assertEqual(cover_option_text(0, option), "1. file == iTunes (1200x1200)")
+        option = {"label": "File = iTunes", "width": 1200, "height": 1200}
+        self.assertEqual(cover_option_text(0, option), "1. File = iTunes (1200x1200)")
+        from app.review_ui import cover_image_caption
+
+        self.assertEqual(cover_image_caption(option), "File = iTunes (1200x1200)")
         prompt = format_cover_prompt("Album", "Artist", [option], "song.flac")
-        self.assertIn("1. file == iTunes (1200x1200)", prompt)
+        self.assertIn("1. File = iTunes (1200x1200)", prompt)
 
 
 class CoverChoiceHoldTests(unittest.IsolatedAsyncioTestCase):

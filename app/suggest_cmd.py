@@ -8,7 +8,14 @@ from pathlib import Path
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    WebAppInfo,
+)
 
 from app.enrich import fetch_lrclib
 from app.formats import user_settings_dict
@@ -112,6 +119,20 @@ def load_session_payload(raw: str) -> tuple[str | None, list[Suggestion]]:
     return language, items
 
 
+def _pagination_fresh(ctx: Ctx, created_at: str) -> bool:
+    from datetime import datetime, timezone
+
+    ttl = int(getattr(ctx.settings, "pagination_ttl_seconds", 300) or 300)
+    try:
+        created = datetime.fromisoformat(created_at)
+    except ValueError:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - created).total_seconds()
+    return age <= ttl
+
+
 async def _authorized(message: Message, ctx: Ctx) -> bool:
     if not message.from_user or user_is_bot(message.from_user, ctx.bot):
         return False
@@ -160,12 +181,19 @@ def _page_items(items: list[Suggestion], page: int) -> tuple[int, list[Suggestio
 
 
 def _list_text(
-    page: int, pages: int, language: str | None, query: str, *, chat_id: int | None = None
+    page: int,
+    pages: int,
+    language: str | None,
+    query: str,
+    *,
+    chat_id: int | None = None,
+    total: int | None = None,
 ) -> str:
     scope = html_esc(language) if language else "all languages"
     extra = f" · {html_esc(query)}" if query else ""
     legend = "\n✓ = in library. Pick a row." if _library_mark(chat_id) else "\nPick a row."
-    return f"<b>Suggestions</b> — {scope}{extra}\npage {page + 1}/{pages}{legend}"
+    head = f"Found {total} songs in @HiFiAudioBot.\n" if total is not None else ""
+    return f"{head}<b>Suggestions</b> — {scope}{extra}\npage {page + 1}/{pages}{legend}"
 
 
 def _mark_page(ctx: Ctx, user_id: int, items: list[Suggestion], page: int) -> None:
@@ -190,10 +218,34 @@ async def _show_session(
     page = max(0, min(page, pages - 1))
     _mark_page(ctx, user_id, items, page)
     chat_id = message.chat.id
+    markup = suggest_list_keyboard(session_id, items, page, chat_id=chat_id)
+    from app.user_cmd import _webapp_url
+
+    url = _webapp_url(ctx, "suggest", q=query or None)
+    if url:
+        start = page * PAGE_SIZE
+        visible = items[start : start + PAGE_SIZE]
+        rows: list[list[InlineKeyboardButton]] = []
+        for item in visible:
+            song_q = " ".join(part for part in (item.artist, item.title) if part)
+            song_url = _webapp_url(ctx, "suggest", q=song_q) or url
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=suggest_label(item, chat_id=chat_id),
+                        web_app=WebAppInfo(url=song_url),
+                    )
+                ]
+            )
+        for row in markup.inline_keyboard:
+            if any((button.callback_data or "").startswith("sg:") for button in row):
+                rows.append(row)
+        rows.append([InlineKeyboardButton(text="Open suggestions", web_app=WebAppInfo(url=url))])
+        markup = InlineKeyboardMarkup(inline_keyboard=rows)
     await _deliver(
         message,
-        _list_text(page, pages, language, query, chat_id=chat_id),
-        suggest_list_keyboard(session_id, items, page, chat_id=chat_id),
+        _list_text(page, pages, language, query, chat_id=chat_id, total=len(items)),
+        markup,
         edit=edit,
     )
 
@@ -294,7 +346,7 @@ async def _run_suggest(message: Message, ctx: Ctx, query: str) -> None:
         await _deliver(message, "Last.fm lookup failed. Try again.")
         return
     if not items:
-        await _deliver(message, "No similar tracks found. Try another topic, genre, or seed song.")
+        await _deliver(message, "Found 0 songs in @HiFiAudioBot.")
         return
     _fill_origin_messages(ctx, items)
     session_id = ctx.catalog.insert_suggest_session(
@@ -463,28 +515,36 @@ def build_suggest_command_router() -> Router:
 
     @router.message(Command("suggest"))
     async def suggest_cmd(message: Message, ctx: Ctx, command: CommandObject | None = None) -> None:
+        from app.user_cmd import _blocked
+
+        if await _blocked(message, ctx):
+            return
         if not await _authorized(message, ctx):
             if message.chat.type == "private":
                 await message.reply("Private access requires membership in a known group.")
             return
-        from app.ephemeral import send_private
         from app.membership import touch
-        from app.user_cmd import _web_or_url_keyboard
+        from app.notify import send_notice
 
         touch(ctx, message.from_user.id, message.from_user)
         query = parse_command_args(message, command)
-        kb = _web_or_url_keyboard(ctx, "suggest", None, "Open suggestions", q=query or None)
-        await send_private(
-            ctx,
-            chat_id=message.chat.id,
-            user_id=message.from_user.id,
-            text="Suggestions. Mini App if available, or pick below.",
-            reply_markup=kb,
-        )
+        if not query:
+            await send_notice(
+                ctx,
+                message.from_user.id,
+                "Please provide a valid search query",
+                level="error",
+                chat_id=message.chat.id,
+            )
+            return
         await _run_suggest(message, ctx, query)
 
     @router.callback_query(F.data.regexp(r"^sg:\d+:\d+$"))
     async def suggest_page(callback: CallbackQuery, ctx: Ctx) -> None:
+        from app.membership import answer_if_blocked
+
+        if await answer_if_blocked(ctx, callback):
+            return
         if not await allow_from_callback(ctx, callback):
             await callback.answer("Access denied.", show_alert=True)
             return
@@ -495,6 +555,9 @@ def build_suggest_command_router() -> Router:
         session = ctx.catalog.get_suggest_session(int(session_s))
         if session is None or session.user_id != callback.from_user.id:
             await callback.answer("Suggestions expired. Run /suggest again.", show_alert=True)
+            return
+        if not _pagination_fresh(ctx, session.created_at):
+            await callback.answer("Expired.", show_alert=True)
             return
         await callback.answer()
         language, items = load_session_payload(session.results_json)
@@ -515,6 +578,10 @@ def build_suggest_command_router() -> Router:
 
     @router.callback_query(F.data.regexp(r"^sgt:\d+:\d+$"))
     async def suggest_pick(callback: CallbackQuery, ctx: Ctx) -> None:
+        from app.membership import answer_if_blocked
+
+        if await answer_if_blocked(ctx, callback):
+            return
         if not await allow_from_callback(ctx, callback):
             await callback.answer("Access denied.", show_alert=True)
             return

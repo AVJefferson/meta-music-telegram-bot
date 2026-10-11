@@ -321,25 +321,36 @@
   }
 
   function formatLabel(list) {
-    const formats = Array.isArray(list) && list.length ? list : ["flac", "mp3"];
+    const formats = Array.isArray(list) && list.length ? list : ["flac", "mp3", "m4a", "wav"];
     return formats.map((fmt) => String(fmt).toUpperCase()).join(", ");
   }
 
   function destSeg(current) {
     return `<div class="seg" role="radiogroup" aria-label="Default save">
-      ${["library", "review", "none"]
+      ${["library", "review", "none", "ask"]
         .map(
           (dest) =>
             `<button type="button" class="seg-btn${current === dest ? " is-on" : ""}" data-dest="${dest}">${
-              dest === "none" ? "None" : dest[0].toUpperCase() + dest.slice(1)
+              dest === "none" ? "None" : dest === "ask" ? "Ask each time" : dest[0].toUpperCase() + dest.slice(1)
             }</button>`,
         )
         .join("")}
     </div>`;
   }
 
+  function choiceSeg(attr, current, options) {
+    return `<div class="seg wrap" role="radiogroup">
+      ${options
+        .map(
+          ([value, label]) =>
+            `<button type="button" class="seg-btn${current === value ? " is-on" : ""}" data-${attr}="${value}">${label}</button>`,
+        )
+        .join("")}
+    </div>`;
+  }
+
   function formatSeg(selected) {
-    const on = new Set(Array.isArray(selected) && selected.length ? selected : ["flac", "mp3"]);
+    const on = new Set(Array.isArray(selected) && selected.length ? selected : ["flac", "mp3", "m4a", "wav"]);
     return `<div class="seg wrap" role="group" aria-label="Listen for">
       ${FORMAT_IDS.map(
         (fmt) =>
@@ -451,9 +462,11 @@
     const months = me && me.inactive_months != null ? me.inactive_months : 3;
     const sim = Math.round(similarityValue() * 100);
     const library = libraryFilter();
-    const correct = Boolean(me && me.correct_telegram);
-    const skipAsk = Boolean(me && me.skip_save_prompt);
-    const deleteOrig = Boolean(me && me.delete_original);
+    const correctMode = (me && me.correct_mode) || "yes";
+    const deleteMode = (me && me.delete_mode) || "no";
+    const notifyMode = (me && me.notifications) || "all";
+    const channelMode = (me && me.notification_channel) || "current";
+    const forward = Array.isArray(me && me.auto_forward) ? me.auto_forward.join(",") : "";
     const notifySave = !(me && me.notify_group_save === false);
     const adminCard =
       me && me.admin
@@ -486,17 +499,35 @@
       </div>
       <div class="card">
         <h2>Default save</h2>
-        <p class="muted">Where new saves go when Drive is connected. Do not ask again skips the Telegram prompt and uses these toggles. Delete original file removes the message you sent after a successful save.</p>
-        ${destSeg((me && me.default_dest) || "none")}
-        <button type="button" class="check-btn${correct ? " is-on" : ""}" data-act="toggle-correct-tg">${
-          correct ? "Correct Telegram file on" : "Correct Telegram file"
-        }</button>
-        <button type="button" class="check-btn${deleteOrig ? " is-on" : ""}" data-act="toggle-delete-orig">${
-          deleteOrig ? "Delete original file on" : "Delete original file"
-        }</button>
-        <button type="button" class="check-btn${skipAsk ? " is-on" : ""}" data-act="toggle-skip-save">${
-          skipAsk ? "Do not ask again on" : "Do not ask again"
-        }</button>
+        <p class="muted">Where new saves go when Drive is connected. Ask each time sends a question in the chat.</p>
+        ${destSeg((me && me.default_dest) || "ask")}
+        <p class="muted mt">Correct telegram file</p>
+        ${choiceSeg("correct", correctMode, [
+          ["yes", "Yes"],
+          ["no", "No"],
+          ["ask", "Ask each time"],
+        ])}
+        <p class="muted mt">Delete original file</p>
+        ${choiceSeg("delete", deleteMode, [
+          ["yes", "Yes"],
+          ["no", "No"],
+          ["ask", "Ask each time"],
+        ])}
+        <p class="muted mt">Auto forward. Comma-separated chat ids. Empty means none.</p>
+        <input id="auto-forward" value="${esc(forward)}" aria-label="Auto forward chat ids">
+        <button type="button" class="btn btn-ghost mt" data-act="save-forward">Save auto forward</button>
+        <p class="muted mt">Notifications</p>
+        ${choiceSeg("notify", notifyMode, [
+          ["all", "All"],
+          ["errors", "Errors Only"],
+          ["none", "None"],
+        ])}
+        <p class="muted mt">Notification channel</p>
+        ${choiceSeg("channel", channelMode, [
+          ["current", "Current Chat"],
+          ["private", "Private Chat"],
+          ["reactions", "Reactions Only"],
+        ])}
         <p class="muted mt">After a successful save in a group or channel, send you a private note with the save location. The song card in the chat stays the same.</p>
         <button type="button" class="check-btn${notifySave ? " is-on" : ""}" data-act="toggle-group-save-note">${
           notifySave
@@ -506,7 +537,7 @@
       </div>
       <div class="card">
         <h2>Listen for</h2>
-        <p class="muted">Which files the bot tags for you. FLAC and MP3 start on; the rest stay off until you tap them.</p>
+        <p class="muted">Which files the bot tags for you. FLAC, MP3, M4A, and WAV start on.</p>
         ${formatSeg(me && me.allowed_formats)}
       </div>
       <p class="muted">Idle sessions are forgotten after ${esc(months)} months. Copies already in Drive stay until you delete them.</p>`;
@@ -590,6 +621,12 @@
         <h2>Saves per day</h2>
         <p class="muted">Last 14 days.</p>
         ${dayItems.length ? barChart(dayItems) : `<p class="muted">No saves yet.</p>`}
+      </div>
+      <div class="card">
+        <h2>Max audio size</h2>
+        <p class="muted">Files larger than this are rejected before download.</p>
+        <input id="max-audio-mb" type="number" min="1" step="1" value="${esc(data.max_audio_mb || 50)}">
+        <button type="button" class="btn btn-primary mt" data-act="save-max-mb">Save limit</button>
       </div>
       <div class="metrics">
         <div class="metric"><strong>${esc(formatBytes(server.rss_bytes))}</strong><span>Memory</span></div>
@@ -1091,13 +1128,32 @@
     }
   }
 
+  async function saveMaxAudio() {
+    const input = document.getElementById("max-audio-mb");
+    const value = input ? Number(input.value) : 0;
+    if (!value || value <= 0) return;
+    try {
+      await api("/api/admin/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ max_audio_mb: value }),
+      });
+      haptic("success");
+    } catch (err) {
+      haptic("error");
+      showBanner(err);
+    }
+  }
+
   async function saveSavePrefs(extra) {
     const body = Object.assign(
       {
-        default_dest: (me && me.default_dest) || "none",
-        correct_telegram: Boolean(me && me.correct_telegram),
-        skip_save_prompt: Boolean(me && me.skip_save_prompt),
-        delete_original: Boolean(me && me.delete_original),
+        default_dest: (me && me.default_dest) || "ask",
+        correct_mode: (me && me.correct_mode) || "yes",
+        delete_mode: (me && me.delete_mode) || "no",
+        notifications: (me && me.notifications) || "all",
+        notification_channel: (me && me.notification_channel) || "current",
+        auto_forward: (me && me.auto_forward) || [],
         notify_group_save: !(me && me.notify_group_save === false),
       },
       extra || {},
@@ -1110,8 +1166,13 @@
       });
       me.default_dest = data.default_dest;
       me.correct_telegram = data.correct_telegram;
+      me.correct_mode = data.correct_mode;
       me.skip_save_prompt = data.skip_save_prompt;
       me.delete_original = data.delete_original;
+      me.delete_mode = data.delete_mode;
+      me.auto_forward = data.auto_forward;
+      me.notifications = data.notifications;
+      me.notification_channel = data.notification_channel;
       me.notify_group_save = data.notify_group_save;
       return data;
     } catch (err) {
@@ -1121,6 +1182,28 @@
     }
   }
 
+  async function setMode(field, value) {
+    const extra = {};
+    extra[field] = value;
+    const data = await saveSavePrefs(extra);
+    if (!data) return;
+    haptic("light");
+    renderSettings();
+  }
+
+  async function saveForward() {
+    const input = document.getElementById("auto-forward");
+    const raw = input ? input.value : "";
+    const ids = raw
+      .split(/[,\s]+/)
+      .map((part) => part.trim())
+      .filter(Boolean);
+    const data = await saveSavePrefs({ auto_forward: ids });
+    if (!data) return;
+    haptic("success");
+    renderSettings();
+  }
+
   async function setDest(dest) {
     const data = await saveSavePrefs({ default_dest: dest });
     if (!data) return;
@@ -1128,30 +1211,6 @@
     mainEl.querySelectorAll("[data-dest]").forEach((btn) => {
       btn.classList.toggle("is-on", btn.dataset.dest === dest);
     });
-  }
-
-  async function toggleCorrectTelegram() {
-    if (!me) return;
-    me.correct_telegram = !me.correct_telegram;
-    const btn = mainEl.querySelector("[data-act=toggle-correct-tg]");
-    if (btn) {
-      btn.classList.toggle("is-on", me.correct_telegram);
-      btn.textContent = me.correct_telegram ? "Correct Telegram file on" : "Correct Telegram file";
-    }
-    haptic("light");
-    await saveSavePrefs({ correct_telegram: me.correct_telegram });
-  }
-
-  async function toggleSkipSave() {
-    if (!me) return;
-    me.skip_save_prompt = !me.skip_save_prompt;
-    const btn = mainEl.querySelector("[data-act=toggle-skip-save]");
-    if (btn) {
-      btn.classList.toggle("is-on", me.skip_save_prompt);
-      btn.textContent = me.skip_save_prompt ? "Do not ask again on" : "Do not ask again";
-    }
-    haptic("light");
-    await saveSavePrefs({ skip_save_prompt: me.skip_save_prompt });
   }
 
   async function toggleGroupSaveNote() {
@@ -1166,18 +1225,6 @@
     }
     haptic("light");
     await saveSavePrefs({ notify_group_save: me.notify_group_save });
-  }
-
-  async function toggleDeleteOriginal() {
-    if (!me) return;
-    me.delete_original = !me.delete_original;
-    const btn = mainEl.querySelector("[data-act=toggle-delete-orig]");
-    if (btn) {
-      btn.classList.toggle("is-on", me.delete_original);
-      btn.textContent = me.delete_original ? "Delete original file on" : "Delete original file";
-    }
-    haptic("light");
-    await saveSavePrefs({ delete_original: me.delete_original });
   }
 
   async function toggleFormat(fmt) {
@@ -1299,10 +1346,9 @@
     else if (kind === "cancel-login") cancelConnect();
     else if (kind === "unlink") unlinkDrive();
     else if (kind === "suggest-back") closeSuggestDetail();
-    else if (kind === "toggle-correct-tg") toggleCorrectTelegram();
-    else if (kind === "toggle-delete-orig") toggleDeleteOriginal();
-    else if (kind === "toggle-skip-save") toggleSkipSave();
     else if (kind === "toggle-group-save-note") toggleGroupSaveNote();
+    else if (kind === "save-forward") saveForward();
+    else if (kind === "save-max-mb") saveMaxAudio();
     else if (kind === "save-tags") reviewAction(act.dataset.id, "tags", act);
     else if (kind === "library" || kind === "cancel") reviewAction(act.dataset.id, kind, act);
   });
@@ -1310,6 +1356,14 @@
   mainEl.addEventListener("click", (event) => {
     const dest = event.target.closest("[data-dest]");
     if (dest) setDest(dest.dataset.dest);
+    const correct = event.target.closest("[data-correct]");
+    if (correct) setMode("correct_mode", correct.dataset.correct);
+    const deletion = event.target.closest("[data-delete]");
+    if (deletion) setMode("delete_mode", deletion.dataset.delete);
+    const notify = event.target.closest("[data-notify]");
+    if (notify) setMode("notifications", notify.dataset.notify);
+    const channel = event.target.closest("[data-channel]");
+    if (channel) setMode("notification_channel", channel.dataset.channel);
     const fmt = event.target.closest("[data-format]");
     if (fmt) toggleFormat(fmt.dataset.format);
     const library = event.target.closest("[data-library]");

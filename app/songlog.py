@@ -91,6 +91,7 @@ def render_songlog(report: dict[str, Any]) -> str:
 
     header = [
         _line("file", report.get("file") or ""),
+        _line("sha256", report.get("sha256") or ""),
         f"duration: {duration_s}  {bit_depth}/{sample_rate}",
         f"confidence: {report.get('confidence') or ''}  reason: {report.get('confidence_reason') or ''}",
         f"chosen: {report.get('chosen_source') or ''} recording {report.get('chosen_mbid') or ''}",

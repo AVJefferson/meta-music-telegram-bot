@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import re
 from contextlib import suppress
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -14,7 +15,14 @@ from mutagen.wave import WAVE
 
 from app.formats import format_from_path, format_label, normalize_ext
 from app.models import Enrichment, Identity, TagHints, TagSet
-from app.util import format_artist_list, is_synced_lrc, normalize_name_list, parse_track_number, sanitize_filename, year_from_date
+from app.util import (
+    format_artist_list,
+    format_credit_groups,
+    normalize_name_list,
+    parse_track_number,
+    sanitize_filename,
+    year_from_date,
+)
 
 ALLOWED = (
     "TITLE",
@@ -28,7 +36,7 @@ ALLOWED = (
     "DISCNUMBER",
     "LYRICS",
 )
-SPARSE_TAG_FIELDS = ("composer", "genre", "date")
+SPARSE_TAG_FIELDS = ("composer", "genre", "date", "lyrics")
 _ID3_CLEAR = ("TIT2", "TALB", "TPE1", "TPE2", "TCOM", "TCON", "TDRC", "TYER", "TRCK", "TPOS", "USLT", "APIC")
 
 
@@ -314,6 +322,8 @@ class AudioMetrics:
     sample_rate: int | None = None
     bitrate_kbps: int | None = None
     format_name: str | None = None
+    channels: int | None = None
+    size_bytes: int | None = None
 
 
 def read_audio_metrics(path: Path) -> AudioMetrics:
@@ -348,7 +358,20 @@ def read_audio_metrics(path: Path) -> AudioMetrics:
         kbps = max(1, round(path.stat().st_size * 8 / duration / 1000))
     else:
         kbps = None
-    return AudioMetrics(duration, bit_depth, sample_rate, kbps, format_label(path))
+    channels = getattr(info, "channels", None)
+    try:
+        size_bytes = path.stat().st_size
+    except OSError:
+        size_bytes = None
+    return AudioMetrics(
+        duration,
+        bit_depth,
+        sample_rate,
+        kbps,
+        format_label(path),
+        int(channels) if channels else None,
+        size_bytes,
+    )
 
 
 def audio_info(path: Path) -> tuple[float, int | None, int | None]:
@@ -357,12 +380,14 @@ def audio_info(path: Path) -> tuple[float, int | None, int | None]:
 
 
 def identity_to_tags(identity: Identity, enrichment: Enrichment) -> TagSet:
-    lyrics = enrichment.lyrics if is_synced_lrc(enrichment.lyrics) else ""
+    lyrics = (enrichment.lyrics or "").strip()
     albumartist = format_artist_list(identity.album_artists) or format_artist_list(identity.artists)
     return TagSet(
         title=identity.title,
         album=identity.album,
-        artist=format_artist_list(identity.artists, lead=albumartist),
+        artist=format_credit_groups(
+            identity.artists, getattr(identity, "featured_artists", None), lead=albumartist
+        ),
         albumartist=albumartist,
         composer=format_artist_list(identity.composers, lead=albumartist),
         genre=enrichment.genre,
@@ -373,15 +398,38 @@ def identity_to_tags(identity: Identity, enrichment: Enrichment) -> TagSet:
     )
 
 
+_OST_TITLE = re.compile(
+    r"\s*[\(\[]\s*original soundtrack(?:\s+from\s+(?:the\s+)?(?:movie|film)\s+(?P<movie>[^)\]]+))?\s*[\)\]]\s*",
+    re.IGNORECASE,
+)
+
+
+def strip_soundtrack_title(title: str, album: str) -> tuple[str, str]:
+    match = _OST_TITLE.search(title or "")
+    if not match:
+        return title or "", album or ""
+    movie = (match.group("movie") or "").strip(" -")
+    cleaned = _OST_TITLE.sub(" ", title or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -")
+    if movie and movie.casefold() not in (album or "").casefold():
+        album = movie
+    return cleaned or (title or ""), album or ""
+
+
 def normalize_tagset(tags: TagSet, mapper=None) -> TagSet:
     albumartist = normalize_name_list(tags.albumartist)
+    title, album = strip_soundtrack_title(tags.title, tags.album)
     genre = mapper.compose(tags.genre) if mapper is not None else tags.genre
     return replace(
         tags,
+        title=title,
+        album=album,
         albumartist=albumartist,
         artist=normalize_name_list(tags.artist, lead=albumartist),
         composer=normalize_name_list(tags.composer, lead=albumartist),
         genre=genre,
+        tracknumber=(tags.tracknumber or "").strip() or "1",
+        discnumber=(tags.discnumber or "").strip() or "1",
     )
 
 

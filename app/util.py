@@ -12,6 +12,7 @@ _ARTIST_SEPARATORS = re.compile(
     r"\s*;\s*|\s+/\s+|\s+&\s+|\s+(?:feat|ft|featuring)\.?\s+",
     re.IGNORECASE,
 )
+_FEAT_SPLIT = re.compile(r"\s+(?:feat|ft|featuring)\.?\s+", re.IGNORECASE)
 
 
 def unique_names(names: list[str]) -> list[str]:
@@ -62,8 +63,39 @@ def format_artist_list(names: list[str], *, lead: list[str] | str | None = None)
     return join_credit_names(sort_credit_names(names, lead=lead))
 
 
+def split_credit_groups(value: str) -> tuple[list[str], list[str]]:
+    """Primary names, then names after feat/ft/featuring."""
+    text = (value or "").strip()
+    if not text:
+        return [], []
+    parts = _FEAT_SPLIT.split(text, maxsplit=1)
+    primary = split_artist_field(parts[0])
+    featured = split_artist_field(parts[1]) if len(parts) > 1 else []
+    featured = [name for name in featured if name.casefold() not in {item.casefold() for item in primary}]
+    return primary, featured
+
+
+def format_credit_groups(
+    primary: list[str],
+    featured: list[str] | None = None,
+    *,
+    lead: list[str] | str | None = None,
+) -> str:
+    """Album artist leads. Featured names stay after Ft."""
+    mains = sort_credit_names(primary, lead=lead)
+    guests = sort_credit_names(list(featured or []))
+    guest_keys = {name.casefold() for name in guests}
+    mains = [name for name in mains if name.casefold() not in guest_keys]
+    left = join_credit_names(mains)
+    right = join_credit_names(guests)
+    if left and right:
+        return f"{left} Ft. {right}"
+    return left or right
+
+
 def normalize_name_list(value: str, *, lead: str = "") -> str:
-    return format_artist_list(split_artist_field(value), lead=lead)
+    primary, featured = split_credit_groups(value)
+    return format_credit_groups(primary, featured, lead=lead)
 
 
 def diff_credit_html(old: str, new: str) -> str:

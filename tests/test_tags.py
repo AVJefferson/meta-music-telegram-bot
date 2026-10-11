@@ -12,7 +12,14 @@ from app.models import TagSet
 from app.queue import tag_preview
 from app.relocate import hydrate_track_tags, read_tags_for_card
 from app.review_cmd import format_song_card
-from app.tags import AudioMetrics, overlay_tagset, read_audio_metrics, read_tagset, write_tags
+from app.tags import (
+    AudioMetrics,
+    overlay_tagset,
+    read_audio_metrics,
+    read_tagset,
+    strip_soundtrack_title,
+    write_tags,
+)
 from app.util import format_tech_lines
 
 
@@ -95,7 +102,7 @@ class TagReadTests(unittest.TestCase):
             self.assertIn("Stay With Me", text)
             self.assertIn("Sam Smith", text)
             self.assertIn("In the Lonely Hour", text)
-            self.assertIn("Format: FLAC", text)
+            self.assertIn("FLAC |", text)
             self.assertNotIn("<b>03 - Sam Smith - Stay With Me</b>", text)
 
 
@@ -156,12 +163,12 @@ class AudioCardTests(unittest.TestCase):
         text = format_tech_lines(duration=172, bit_depth=16, sample_rate=44100, bitrate_kbps=987)
         self.assertEqual(text, "Format: FLAC\nDuration: 02\u223652\n987 kbps | 44.1 kHz | 16 bits")
         preview = tag_preview(TagSet(title="Stay"), AudioMetrics(172, 16, 44100, 987))
-        self.assertIn("Format: FLAC", preview)
-        self.assertIn("Duration: 02\u223652", preview)
-        self.assertNotIn("Duration: 02:52", preview)
-        self.assertIn("987 kbps | 44.1 kHz | 16 bits", preview)
-        self.assertIn("<b>Stay</b>", preview)
-        self.assertIn("Lyrics: none", preview)
+        self.assertIn("<i>Stay</i>", preview)
+        self.assertIn("FLAC | 02:52 |", preview)
+        self.assertIn("987kbps", preview)
+        self.assertIn("44.1KHz", preview)
+        self.assertIn("16bit", preview)
+        self.assertIn("Lyrics:", preview)
 
     def test_tech_lines_other_format(self) -> None:
         text = format_tech_lines(duration=172, bitrate_kbps=320, format_name="MP3")
@@ -208,8 +215,26 @@ class AudioCardTests(unittest.TestCase):
             AudioMetrics(172, 16, 44100, 987),
         )
         self.assertIn("Lyrics:", preview)
-        self.assertIn("00:12  Guess it's true", preview)
-        self.assertIn("00:16  I'm not good", preview)
-        self.assertIn("00:20  At a one night stand", preview)
+        self.assertIn("00:12 Guess it's true", preview)
+        self.assertIn("00:16 I'm not good", preview)
+        self.assertIn("00:20 At a one night stand", preview)
         self.assertNotIn("skipped", preview)
-        self.assertIn("Duration: 02\u223652", preview)
+        self.assertIn("02:52", preview)
+
+
+class SoundtrackTitleTests(unittest.TestCase):
+    def test_movie_name_moves_to_album(self) -> None:
+        title, album = strip_soundtrack_title(
+            "Teardrop (Original Soundtrack from the Movie Inception)",
+            "Score",
+        )
+        self.assertEqual(title, "Teardrop")
+        self.assertEqual(album, "Inception")
+
+    def test_album_already_containing_movie_stays(self) -> None:
+        title, album = strip_soundtrack_title(
+            "Teardrop (Original Soundtrack from the Movie Inception)",
+            "Inception Deluxe",
+        )
+        self.assertEqual(title, "Teardrop")
+        self.assertEqual(album, "Inception Deluxe")

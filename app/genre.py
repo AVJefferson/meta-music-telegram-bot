@@ -8,6 +8,8 @@ import yaml
 from app.util import html_esc, unique_names
 
 BUCKETS = ("genres", "moods", "languages", "instruments")
+# Song card order: language, then genre, mood, and instrument.
+DISPLAY_ORDER = ("languages", "genres", "moods", "instruments")
 
 # MusicBrainz text-representation / work.language: ISO 639-1 or 639-2/3.
 ISO639_TO_LANGUAGE = {
@@ -90,7 +92,12 @@ class GenreMapper:
                 mapping[str(item).casefold()] = str(item)
             self._sets[bucket] = mapping
 
-    def classify(self, tags: list[str], extra_language: str | None = None) -> str:
+    def classify(
+        self,
+        tags: list[str],
+        extra_language: str | None = None,
+        primary_language: str | None = None,
+    ) -> str:
         ordered: dict[str, list[str]] = {b: [] for b in BUCKETS}
         seen: set[str] = set()
         for raw in tags:
@@ -120,11 +127,23 @@ class GenreMapper:
                 if display.casefold() not in existing:
                     ordered["languages"].append(display)
 
+        if primary_language:
+            display = self.language_from_raw(primary_language) or str(primary_language).strip()
+            if display:
+                langs = [
+                    item for item in ordered["languages"] if item.casefold() != display.casefold()
+                ]
+                ordered["languages"] = [display, *langs]
         parts: list[str] = []
-        for bucket in BUCKETS:
-            ordered[bucket].sort(key=str.casefold)
+        for bucket in DISPLAY_ORDER:
+            if bucket != "languages":
+                ordered[bucket].sort(key=str.casefold)
             parts.extend(ordered[bucket])
         return " | ".join(parts)
+
+    def pin_language(self, genre: str, primary: str) -> str:
+        """Primary language is the first token. Other buckets stay in card order."""
+        return self.classify(genre_tokens(genre), primary_language=primary)
 
     def is_allowed(self, raw: str) -> bool:
         token = self._normalize(raw)

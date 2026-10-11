@@ -20,25 +20,26 @@ from app.util import (
     format_quality,
     html_esc,
     normalize_name_list,
-    safe_link,
     same_artist_names,
 )
 
 TG_LIMIT = 4000
 FIELDS: list[tuple[str, str]] = [
     ("title", "Title"),
-    ("artist", "Artist"),
+    ("tracknumber", "Track Number"),
+    ("discnumber", "Disc Number"),
     ("album", "Album"),
-    ("albumartist", "Album artist"),
-    ("composer", "Composer"),
-    ("genre", "Genre"),
+    ("artist", "Artist"),
+    ("albumartist", "Album Artist"),
+    ("composer", "Composers"),
     ("year", "Year"),
+    ("genre", "Genre"),
 ]
 FIELD_KEYS = {key for key, _ in FIELDS}
 MULTI_VALUE_FIELDS = {"artist", "albumartist", "composer"}
 SPARSE_FILL_FIELDS = {"composer", "genre", "year"}
 _CALLBACK = re.compile(
-    r"^p(\d+):(ok|rev|cancel|back|dr|dk|ds|cv(\d+)|c(\d+)|t:([a-z]+)|uf|ur|dl|dv|dn|dt|da|do|lg:([a-z]+))$"
+    r"^p(\d+):(ok|rev|cancel|back|dr|dk|ds|cv(\d+)|c(\d+)|t:([a-z]+)|uf|ur|dl|dv|dn|dt|da|do|lg:([a-z]+)|mp(\d+))$"
 )
 
 
@@ -96,6 +97,8 @@ def parse_callback(data: str | None) -> PendingAction | None:
         return PendingAction(pending_id, "cand", index=int(match.group(4)))
     if rest.startswith("t:") and match.group(5) in FIELD_KEYS:
         return PendingAction(pending_id, "toggle", field=match.group(5))
+    if rest.startswith("mp") and match.group(7) is not None:
+        return PendingAction(pending_id, "match_page", index=int(match.group(7)))
     return None
 
 
@@ -116,6 +119,16 @@ def _shows_choice(key: str, file_val: str, rec_val: str) -> bool:
     if key in SPARSE_FILL_FIELDS and (not file_val or not rec_val):
         return False
     return not _values_match(key, file_val, rec_val)
+
+
+def cover_image_caption(option: dict[str, Any]) -> str:
+    """Photo caption is the source name and pixel size."""
+    label = str(option.get("label") or "Cover")
+    width = option.get("width")
+    height = option.get("height")
+    if width and height:
+        return f"{label} ({int(width)}x{int(height)})"[:1024]
+    return label[:1024]
 
 
 def cover_option_text(index: int, option: dict[str, Any]) -> str:
@@ -174,10 +187,8 @@ def format_summary(
     tech: str = "",
     genre_mapper=None,
 ) -> str:
-    lines = ["<b>Low confidence — check tags</b>"]
-    if reason:
-        lines.append(f"Reason: {html_esc(reason)}")
-    lines.append("")
+    del reason
+    lines: list[str] = []
     lead = normalize_name_list(
         _get_field(working, "albumartist")
         or _get_field(recommended, "albumartist")
@@ -201,53 +212,47 @@ def format_summary(
             now_val = genre_mapper.compose(now_val)
         if key == "composer":
             if not file_val or not rec_val:
-                shown = rec_val or file_val
-                line = f"<b>{label}</b>: {html_esc(shown) or '—'}"
-                if now_val != shown:
-                    line += f"\n  now: {html_esc(now_val) or '—'}"
-                lines.append(line)
+                shown = now_val or rec_val or file_val
+                if file_val and not _values_match(key, file_val, shown):
+                    lines.append(
+                        f"{label}: <s>{html_esc(file_val) or '—'}</s> -> {html_esc(shown) or '—'}"
+                    )
+                else:
+                    lines.append(f"<b>{label}</b>: {html_esc(shown) or '—'}")
             else:
                 lines.append(f"<b>{label}</b>: {diff_credit_html(file_val, now_val)}")
             continue
         if key == "genre":
             if not file_val or not rec_val:
-                shown = rec_val or file_val
-                shown_html = (
-                    genre_mapper.format_html(shown)
-                    if genre_mapper is not None
-                    else html_esc(shown)
-                )
-                line = f"<b>{label}</b>: {shown_html or '—'}"
-                if now_val != shown:
-                    line += f"\n  now: {html_esc(now_val) or '—'}"
-                lines.append(line)
+                shown = now_val or rec_val or file_val
+                if file_val and not _values_match(key, file_val, shown):
+                    lines.append(
+                        f"{label}: <s>{html_esc(file_val) or '—'}</s> -> {html_esc(shown) or '—'}"
+                    )
+                else:
+                    shown_html = (
+                        genre_mapper.format_html(shown)
+                        if genre_mapper is not None
+                        else html_esc(shown)
+                    )
+                    lines.append(f"<b>{label}</b>: {shown_html or '—'}")
             else:
                 lines.append(f"<b>{label}</b>: {diff_genre_html(file_val, now_val, genre_mapper)}")
             continue
         if key in SPARSE_FILL_FIELDS and (not file_val or not rec_val):
-            shown = rec_val or file_val
-            line = f"<b>{label}</b>: {html_esc(shown) or '—'}"
-            if now_val != shown:
-                line += f"\n  now: {html_esc(now_val) or '—'}"
-            lines.append(line)
-        elif _values_match(key, file_val, rec_val):
-            line = f"<b>{label}</b>: {html_esc(rec_val) or '—'}"
-            if file_val != rec_val:
-                line += " (reordered)"
-            if not _values_match(key, now_val, rec_val):
-                line += f"\n  now: {html_esc(now_val) or '—'}"
-            lines.append(line)
+            shown = now_val or rec_val or file_val
+            if file_val and not _values_match(key, file_val, shown):
+                lines.append(
+                    f"{label}: <s>{html_esc(file_val) or '—'}</s> -> {html_esc(shown) or '—'}"
+                )
+            else:
+                lines.append(f"<b>{label}</b>: {html_esc(shown) or '—'}")
+        elif _values_match(key, file_val, rec_val) and _values_match(key, now_val or rec_val, rec_val):
+            lines.append(f"<b>{label}</b>: {html_esc(now_val or rec_val) or '—'}")
         else:
-            file_sel = now_val == file_val
-            rec_sel = now_val == rec_val
-            block = (
-                f"<b>{label}</b>\n"
-                f"{_choice_line('file', file_val, selected=file_sel, strike=rec_sel)}\n"
-                f"{_choice_line('rec', rec_val, selected=rec_sel, strike=file_sel)}"
+            lines.append(
+                f"{label}: <s>{html_esc(file_val) or '—'}</s> -> {html_esc(now_val) or '—'}"
             )
-            if now_val not in {file_val, rec_val}:
-                block += f"\n  now: {html_esc(now_val) or '—'}"
-            lines.append(block)
     if tech:
         lines.append("")
         lines.append(tech)
@@ -360,32 +365,90 @@ def review_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def match_prompt_text(acoustid: str, count: int) -> str:
+    link = f"https://acoustid.org/track/{acoustid}" if acoustid else ""
+    head = f'AcousticId: <a href="{html_esc(link)}">{html_esc(acoustid)}</a>' if link else "AcousticId: —"
+    return (
+        f"{head}\n"
+        f"Song Matches: {count}\n\n"
+        "Unable to pinpoint the song. Please pick the correct song from the possible matches."
+    )
+
+
+def match_keyboard(
+    pending_id: int,
+    candidates: list,
+    page: int,
+    *,
+    page_size: int = 5,
+    selected: int = 0,
+) -> InlineKeyboardMarkup:
+    total = len(candidates)
+    page = max(0, page)
+    start = page * page_size
+    if start >= total and total:
+        page = max(0, (total - 1) // page_size)
+        start = page * page_size
+    rows: list[list[InlineKeyboardButton]] = []
+    for offset, cand in enumerate(candidates[start : start + page_size]):
+        if isinstance(cand, dict):
+            album = str(cand.get("album") or "—")
+            artist = str(cand.get("artist") or "—")
+            title = str(cand.get("title") or "—")
+        else:
+            album = str(getattr(cand, "album", "") or "—")
+            artist = str(getattr(cand, "artist", "") or "—")
+            title = str(getattr(cand, "title", "") or "—")
+        mark = "● " if start + offset == selected else ""
+        label = f"{mark}{album} - {artist} - {title}"[:64]
+        rows.append(
+            [InlineKeyboardButton(text=label, callback_data=f"p{pending_id}:c{start + offset}")]
+        )
+    nav: list[InlineKeyboardButton] = []
+    if page:
+        nav.append(InlineKeyboardButton(text="Previous", callback_data=f"p{pending_id}:mp{page - 1}"))
+    if start + page_size < total:
+        nav.append(InlineKeyboardButton(text="Next", callback_data=f"p{pending_id}:mp{page + 1}"))
+    controls = [
+        InlineKeyboardButton(text="Confirm", callback_data=f"p{pending_id}:ok"),
+        InlineKeyboardButton(text="Cancel", callback_data=f"p{pending_id}:cancel"),
+        *nav,
+    ]
+    rows.append(controls)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def cover_keyboard(
     pending_id: int,
     options: list[dict[str, Any]],
     *,
     from_review: bool = False,
     waiting: bool = False,
+    selected: int | None = None,
 ) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    if not waiting:
-        for index, option in enumerate(options):
-            label = str(option.get("label") or f"{index + 1}")
-            row = [
-                InlineKeyboardButton(
-                    text=f"{index + 1} {label}",
-                    callback_data=f"p{pending_id}:cv{index}",
-                )
-            ]
-            url = str(option.get("url") or "")
-            if url.startswith("http://") or url.startswith("https://"):
-                row.append(InlineKeyboardButton(text="view", url=url))
-            rows.append(row)
+    chosen = 0 if selected is None else int(selected)
     controls: list[InlineKeyboardButton] = []
+    if not waiting:
+        controls.append(InlineKeyboardButton(text="Confirm", callback_data=f"p{pending_id}:ok"))
     if from_review:
         controls.append(InlineKeyboardButton(text="Back", callback_data=f"p{pending_id}:back"))
     controls.append(InlineKeyboardButton(text="Cancel", callback_data=f"p{pending_id}:cancel"))
-    rows.append(controls)
+    rows: list[list[InlineKeyboardButton]] = [controls]
+    if not waiting:
+        for index, option in enumerate(options):
+            label = str(option.get("label") or f"{index + 1}")
+            width = option.get("width")
+            height = option.get("height")
+            size = f" ({int(width)}x{int(height)})" if width and height else ""
+            mark = "● " if index == chosen else ""
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{mark}{label}{size}"[:64],
+                        callback_data=f"p{pending_id}:cv{index}",
+                    )
+                ]
+            )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -401,39 +464,24 @@ def format_cover_prompt(
 ) -> str:
     if queued:
         return _clip(
-            f"<b>Waiting for album cover</b>\n"
+            f"<i>Album cover</i>\n"
             f"{html_esc(albumartist)} — {html_esc(album)}\n"
-            f"File: <code>{html_esc(filename)}</code>\n\n"
-            "Waiting — another cover pick is in progress."
+            "Waiting until the other album cover pick in this chat is done."
         )
     if waiting:
         return _clip(
-            f"<b>Waiting for album cover</b>\n"
+            f"<i>Album cover</i>\n"
             f"{html_esc(albumartist)} — {html_esc(album)}\n"
-            f"File: <code>{html_esc(filename)}</code>\n\n"
-            "Pick the cover on the first track of this album."
+            "Using the cover from the first track of this album."
         )
-    lines = [
-        "<b>Pick album cover</b>",
-        f"{html_esc(albumartist)} — {html_esc(album)}",
-        f"File: <code>{html_esc(filename)}</code>",
-        "",
-    ]
+    lines = ["<i>Pick Album Cover</i>"]
     for index, option in enumerate(options):
-        desc = html_esc(cover_option_text(index, option))
-        href = safe_link(option.get("url"))
-        if href:
-            lines.append(f'{desc} — <a href="{href}">preview</a>')
-        else:
-            lines.append(desc)
-    lines.append("")
-    lines.append("Later tracks of this album reuse the pick.")
+        lines.append(html_esc(cover_option_text(index, option)))
     if rights_warning:
         lines.append("")
         lines.append(
             "Bot cannot send photos in this group. "
-            "Make it admin, or enable Photos and Files in group permissions. "
-            "Tap <b>view</b> / preview links until then."
+            "Make it admin, or enable Photos and Files in group permissions."
         )
     return _clip("\n".join(lines))
 
@@ -457,39 +505,60 @@ def dest_keyboard(
     correct_telegram: bool,
     skip_ask: bool = False,
     delete_original: bool = False,
+    *,
+    ask_dest: bool = True,
+    ask_correct: bool = True,
+    ask_delete: bool = True,
+    ask_skip: bool = True,
 ) -> InlineKeyboardMarkup:
     def mark(active: bool, label: str) -> str:
         return f"● {label}" if active else label
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=mark(dest == "library", "Drive library"), callback_data=f"p{pending_id}:dl")],
-            [InlineKeyboardButton(text=mark(dest == "review", "Drive review"), callback_data=f"p{pending_id}:dv")],
-            [InlineKeyboardButton(text=mark(dest == "none", "No Drive upload"), callback_data=f"p{pending_id}:dn")],
+    rows: list[list[InlineKeyboardButton]] = []
+    if ask_dest:
+        rows.append(
+            [InlineKeyboardButton(text=mark(dest == "library", "Library"), callback_data=f"p{pending_id}:dl")]
+        )
+        rows.append(
+            [InlineKeyboardButton(text=mark(dest == "review", "Review"), callback_data=f"p{pending_id}:dv")]
+        )
+        rows.append(
+            [InlineKeyboardButton(text=mark(dest == "none", "None"), callback_data=f"p{pending_id}:dn")]
+        )
+    if ask_correct:
+        rows.append(
             [
                 InlineKeyboardButton(
                     text=mark(correct_telegram, "Correct Telegram file"),
                     callback_data=f"p{pending_id}:dt",
                 )
-            ],
+            ]
+        )
+    if ask_delete:
+        rows.append(
             [
                 InlineKeyboardButton(
                     text=mark(delete_original, "Delete original file"),
                     callback_data=f"p{pending_id}:do",
                 )
-            ],
+            ]
+        )
+    if ask_skip:
+        rows.append(
             [
                 InlineKeyboardButton(
                     text=mark(skip_ask, "Do not ask again"),
                     callback_data=f"p{pending_id}:da",
                 )
-            ],
-            [
-                InlineKeyboardButton(text="OK", callback_data=f"p{pending_id}:ok"),
-                InlineKeyboardButton(text="Cancel", callback_data=f"p{pending_id}:cancel"),
-            ],
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(text="Confirm", callback_data=f"p{pending_id}:ok"),
+            InlineKeyboardButton(text="Cancel", callback_data=f"p{pending_id}:cancel"),
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def dest_prompt_text(
@@ -497,20 +566,24 @@ def dest_prompt_text(
     correct_telegram: bool,
     skip_ask: bool = False,
     delete_original: bool = False,
+    *,
+    show_skip: bool = True,
 ) -> str:
-    return (
-        "<b>Save options</b>\n"
-        f"Drive: <code>{html_esc(dest)}</code>\n"
-        f"Correct Telegram file: {'on' if correct_telegram else 'off (first save)'}\n"
-        f"Delete original file: {'on' if delete_original else 'off'}\n"
-        f"Do not ask again: {'on' if skip_ask else 'off'}\n"
-        "OK writes local + Drive per the toggles."
-    )
+    lines = [
+        "<b>Save options</b>",
+        f"Drive: <code>{html_esc(dest)}</code>",
+        f"Correct Telegram file: {'on' if correct_telegram else 'off (first save)'}",
+        f"Delete original file: {'on' if delete_original else 'off'}",
+    ]
+    if show_skip:
+        lines.append(f"Do not ask again: {'on' if skip_ask else 'off'}")
+    lines.append("Confirm writes local + Drive per the toggles.")
+    return "\n".join(lines)
 
 
 def language_keyboard(pending_id: int, languages: list[str]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    for lang in languages[:8]:
+    for lang in languages:
         slug = lang.casefold()
         if not slug.isalpha():
             continue
@@ -522,9 +595,9 @@ def language_keyboard(pending_id: int, languages: list[str]) -> InlineKeyboardMa
 def language_prompt_text(languages: list[str]) -> str:
     listed = " | ".join(html_esc(item) for item in languages) or "—"
     return (
-        "<b>Primary language?</b>\n"
-        f"Genre keeps all: {listed}\n"
-        "Tap one for the Drive/library folder."
+        "<i>Pick the primary language</i>\n"
+        f"{listed}\n"
+        "The one you tap stays first in the genre list."
     )
 
 

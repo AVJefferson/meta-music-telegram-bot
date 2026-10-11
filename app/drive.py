@@ -70,6 +70,10 @@ class DriveAccessError(RuntimeError):
     """Folder missing, wrong auth, or Drive rejected the upload."""
 
 
+class DriveDownloadStopped(Exception):
+    """Caller asked the in-flight download to stop. Not a Drive failure."""
+
+
 _INVALID_GRANT = "Google login expired. Use /login again."
 
 
@@ -102,7 +106,7 @@ def retry_drive_io[T](
     for i in range(attempts):
         try:
             return op()
-        except DriveAccessError:
+        except (DriveAccessError, DriveDownloadStopped):
             raise
         except HttpError as exc:
             last = wrap_http(exc) if wrap_http else exc
@@ -284,6 +288,28 @@ class DriveClient:
                 break
         return out
 
+    def search_audio_names(self, query: str, *, limit: int = 20) -> list[DriveChild]:
+        text = " ".join((query or "").split())
+        if len(text) < 2:
+            return []
+        safe = _escape_query(text)
+        drive_query = (
+            f"name contains '{safe}' and trashed = false and mimeType != '{FOLDER_MIME}'"
+        )
+        resp = (
+            self._service.files()
+            .list(
+                q=drive_query,
+                spaces="drive",
+                fields="files(id, name, mimeType, size, modifiedTime)",
+                pageSize=max(1, min(limit, 40)),
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
+        return [_child_from_meta(meta) for meta in resp.get("files") or []]
+
     def find_by_name(
         self, parent_id: str, name: str, *, folders_only: bool = False
     ) -> list[DriveChild]:
@@ -374,12 +400,20 @@ class DriveClient:
             parent = found.id
         return parent
 
-    def _download_media(self, file_id: str, stream) -> None:
+    def _download_media(self, file_id: str, stream, stop=None, on_progress=None) -> None:
         request = self._service.files().get_media(fileId=file_id, supportsAllDrives=True)
         downloader = MediaIoBaseDownload(stream, request)
         done = False
         while not done:
-            _status, done = downloader.next_chunk()
+            if stop is not None and stop.is_set():
+                raise DriveDownloadStopped()
+            status, done = downloader.next_chunk()
+            if on_progress is None or status is None:
+                continue
+            try:
+                on_progress(int(float(status.progress()) * 100))
+            except Exception:
+                log.debug("drive progress callback failed", exc_info=True)
 
     def download_bytes(self, file_id: str) -> bytes:
         def op() -> bytes:
@@ -393,12 +427,12 @@ class DriveClient:
             wrap_http=self._wrap_http_error,
         )
 
-    def download_to(self, file_id: str, destination: Path) -> Path:
+    def download_to(self, file_id: str, destination: Path, *, stop=None, on_progress=None) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
 
         def op() -> Path:
             with destination.open("wb") as stream:
-                self._download_media(file_id, stream)
+                self._download_media(file_id, stream, stop=stop, on_progress=on_progress)
             return destination
 
         try:
@@ -408,6 +442,9 @@ class DriveClient:
                 wrap_http=self._wrap_http_error,
                 on_fail=lambda: destination.unlink(missing_ok=True),
             )
+        except DriveDownloadStopped:
+            destination.unlink(missing_ok=True)
+            raise
         except Exception:
             destination.unlink(missing_ok=True)
             raise

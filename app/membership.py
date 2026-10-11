@@ -167,6 +167,34 @@ async def user_is_blocked(ctx: Any, user_id: int | None) -> bool:
     return bool(ctx.catalog.is_user_blacklisted(int(user_id)))
 
 
+async def answer_if_blocked(ctx: Any, callback: Any) -> bool:
+    """Stop a button press from a blocked user. Other denials stay with the caller."""
+    from app.audio_in import BLOCKED_TEXT
+
+    user = getattr(callback, "from_user", None)
+    user_id = getattr(user, "id", None)
+    if not user_id:
+        return False
+    settings = getattr(ctx, "settings", None)
+    if settings is not None and is_admin(ctx, int(user_id)):
+        return False
+    catalog = getattr(ctx, "catalog", None)
+    listed = getattr(catalog, "is_user_blacklisted", None)
+    blocked = bool(callable(listed) and listed(int(user_id)))
+    message = getattr(callback, "message", None)
+    chat = getattr(message, "chat", None) if message is not None else None
+    chat_id = int(getattr(chat, "id", 0) or 0)
+    scoped = getattr(catalog, "is_user_blocked_in_chat", None)
+    if chat_id < 0 and callable(scoped) and scoped(int(user_id), chat_id):
+        blocked = True
+    if not blocked:
+        return False
+    answer = getattr(callback, "answer", None)
+    if callable(answer):
+        await answer(BLOCKED_TEXT, show_alert=True)
+    return True
+
+
 async def allow_from_callback(ctx: Any, callback: Any) -> bool:
     user = getattr(callback, "from_user", None)
     if user is None or user_is_bot(user, getattr(ctx, "bot", None)):
@@ -183,6 +211,9 @@ async def allow_user(ctx: Any, user_id: int | None, chat: Any | None = None) -> 
     if await user_is_blocked(ctx, user_id):
         return False
     chat_id = int(getattr(chat, "id", 0) or 0) if chat is not None else 0
+    scoped = getattr(ctx.catalog, "is_user_blocked_in_chat", None)
+    if chat_id and callable(scoped) and scoped(user_id, chat_id):
+        return False
     chat_type = str(getattr(chat, "type", "") or "") if chat is not None else ""
     if chat_id < 0:
         if ctx.catalog.is_chat_blacklisted(chat_id):

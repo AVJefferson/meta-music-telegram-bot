@@ -388,6 +388,28 @@ class Catalog:
             for name in ("username", "first_name", "last_name"):
                 if name not in user_columns:
                     self._conn.execute(f"ALTER TABLE users ADD COLUMN {name} TEXT")
+            if "songs_processed" not in user_columns:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN songs_processed INTEGER NOT NULL DEFAULT 0"
+                )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS blacklist_chat_users (
+                  telegram_user_id INTEGER NOT NULL,
+                  chat_id INTEGER NOT NULL,
+                  created_at TEXT NOT NULL,
+                  PRIMARY KEY (telegram_user_id, chat_id)
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_settings (
+                  key TEXT PRIMARY KEY,
+                  value TEXT NOT NULL
+                )
+                """
+            )
             chat_columns = {
                 row["name"]
                 for row in self._conn.execute("PRAGMA table_info(chats)").fetchall()
@@ -1234,6 +1256,7 @@ class Catalog:
             first_seen_at=str(row["first_seen_at"]),
             last_active_at=str(row["last_active_at"]),
             songs_edited=int(row["songs_edited"] or 0),
+            songs_processed=int(_row_get(row, "songs_processed") or 0),
             google_refresh_token=row["google_refresh_token"],
             google_email=row["google_email"],
             gdrive_folder_id=row["gdrive_folder_id"],
@@ -1305,6 +1328,7 @@ class Catalog:
             first_seen_at=user.first_seen_at,
             last_active_at=now,
             songs_edited=user.songs_edited,
+            songs_processed=user.songs_processed,
             google_refresh_token=user.google_refresh_token,
             google_email=user.google_email,
             gdrive_folder_id=user.gdrive_folder_id,
@@ -1314,6 +1338,16 @@ class Catalog:
             first_name=stored["first_name"],
             last_name=stored["last_name"],
         )
+
+    def increment_songs_processed(self, telegram_user_id: int) -> None:
+        self.ensure_user(telegram_user_id)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET songs_processed=songs_processed+1, last_active_at=? "
+                "WHERE telegram_user_id=?",
+                (_utc_now(), telegram_user_id),
+            )
+            self._conn.commit()
 
     def increment_songs_edited(self, telegram_user_id: int) -> None:
         self.ensure_user(telegram_user_id)
@@ -1333,6 +1367,7 @@ class Catalog:
             "gdrive_review_folder_id",
             "settings_json",
             "songs_edited",
+            "songs_processed",
             "last_active_at",
             "username",
             "first_name",
@@ -1606,6 +1641,92 @@ class Catalog:
             ).fetchone()
         return row is not None
 
+    def get_setting(self, key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM app_settings WHERE key=?", (key,)
+            ).fetchone()
+        if not row:
+            return None
+        return str(row["value"])
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO app_settings(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+            self._conn.commit()
+
+    def is_user_blocked_in_chat(self, telegram_user_id: int, chat_id: int) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM blacklist_chat_users WHERE telegram_user_id=? AND chat_id=?",
+                (telegram_user_id, chat_id),
+            ).fetchone()
+        return row is not None
+
+    def block_user_in_chat(self, telegram_user_id: int, chat_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO blacklist_chat_users(telegram_user_id, chat_id, created_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(telegram_user_id, chat_id) DO NOTHING",
+                (telegram_user_id, chat_id, _utc_now()),
+            )
+            self._conn.commit()
+
+    def unblock_user_in_chat(self, telegram_user_id: int, chat_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM blacklist_chat_users WHERE telegram_user_id=? AND chat_id=?",
+                (telegram_user_id, chat_id),
+            )
+            self._conn.commit()
+
+    def find_user_by_username(self, username: str) -> UserRecord | None:
+        handle = str(username or "").strip().lstrip("@").casefold()
+        if not handle:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM users WHERE lower(username)=?", (handle,)
+            ).fetchone()
+        return self._row_to_user(row) if row else None
+
+    def find_chat_by_username(self, username: str) -> ChatRecord | None:
+        handle = str(username or "").strip().lstrip("@").casefold()
+        if not handle:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM chats WHERE lower(username)=?", (handle,)
+            ).fetchone()
+        return self._row_to_chat(row) if row else None
+
+    def search_user_tracks(self, user_id: int, query: str) -> list[TrackRecord]:
+        needle = " ".join((query or "").casefold().split())
+        if not needle:
+            return []
+        hits: list[TrackRecord] = []
+        for track in self.list_user_tracks(user_id):
+            if track.status == "deleted":
+                continue
+            blob = " ".join(
+                part
+                for part in (
+                    track.title,
+                    track.artist,
+                    track.album,
+                    track.file_name,
+                    track.relative_path,
+                )
+                if part
+            ).casefold()
+            if needle in blob:
+                hits.append(track)
+        return hits
+
     def blacklist_user(self, telegram_user_id: int) -> None:
         with self._lock:
             self._conn.execute(
@@ -1708,6 +1829,32 @@ class Catalog:
                 (sha256, path, size, now, now),
             )
             self._conn.commit()
+
+    def search_cached_files(self, query: str) -> list[tuple[str, str]]:
+        needle = " ".join((query or "").casefold().split())
+        if not needle:
+            return []
+        with self._lock:
+            rows = self._conn.execute("SELECT sha256, path FROM cached_files").fetchall()
+        hits: list[tuple[str, str]] = []
+        for row in rows:
+            path = str(row["path"] or "")
+            if needle in Path(path).name.casefold():
+                hits.append((str(row["sha256"]), path))
+        return hits
+
+    def cached_file_by_prefix(self, prefix: str) -> str | None:
+        text = (prefix or "").strip().lower()
+        if len(text) < 8:
+            return None
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT path FROM cached_files WHERE sha256 LIKE ?",
+                (text + "%",),
+            ).fetchall()
+        if len(rows) != 1:
+            return None
+        return str(rows[0]["path"] or "") or None
 
     def get_cached_file(self, sha256: str) -> str | None:
         now = _utc_now()

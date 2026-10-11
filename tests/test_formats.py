@@ -37,14 +37,14 @@ class FormatRegistryTests(unittest.TestCase):
         self.assertIsNone(detect_format("notes.pdf", "application/pdf"))
 
     def test_normalize_allowed(self) -> None:
-        self.assertEqual(normalize_allowed(None), ["flac", "mp3"])
-        self.assertEqual(normalize_allowed([]), ["flac", "mp3"])
+        self.assertEqual(normalize_allowed(None), ["flac", "mp3", "m4a", "wav"])
+        self.assertEqual(normalize_allowed([]), ["flac", "mp3", "m4a", "wav"])
         self.assertEqual(normalize_allowed(["wav", "FLAC", "bogus", "wav"]), ["flac", "wav"])
         self.assertEqual(normalize_allowed("mpeg"), ["mp3"])
 
     def test_user_allowed_defaults(self) -> None:
         ctx = SimpleNamespace(catalog=SimpleNamespace(get_user=lambda _uid: None))
-        self.assertEqual(user_allowed_formats(ctx, 1), ["flac", "mp3"])
+        self.assertEqual(user_allowed_formats(ctx, 1), ["flac", "mp3", "m4a", "wav"])
         user = SimpleNamespace(settings_json=json.dumps({"allowed_formats": ["ogg"]}))
         ctx = SimpleNamespace(catalog=SimpleNamespace(get_user=lambda _uid: user))
         self.assertEqual(user_allowed_formats(ctx, 9), ["ogg"])
@@ -64,9 +64,15 @@ class FormatRegistryTests(unittest.TestCase):
             prefs,
             SavePrefs(dest="review", correct_telegram=True, skip_save_prompt=True, delete_original=True),
         )
-        self.assertEqual(user_save_prefs(None), SavePrefs())
+        self.assertEqual(
+            user_save_prefs(None),
+            SavePrefs(dest="none", correct_telegram=True, skip_save_prompt=False, delete_original=False),
+        )
         user = SimpleNamespace(settings_json="{not json")
-        self.assertEqual(user_save_prefs(user), SavePrefs())
+        self.assertEqual(
+            user_save_prefs(user),
+            SavePrefs(dest="none", correct_telegram=True, skip_save_prompt=False, delete_original=False),
+        )
         self.assertTrue(notify_group_save_enabled({}))
         self.assertTrue(notify_group_save_enabled({"notify_group_save": True}))
         self.assertFalse(notify_group_save_enabled({"notify_group_save": False}))

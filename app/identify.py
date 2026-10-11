@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -40,18 +41,34 @@ def _as_list(value: Any) -> list:
     return [value]
 
 
-def artist_names_from_credit(credit: Any) -> list[str]:
-    names: list[str] = []
+def _credit_name(part: dict) -> str:
+    name = part.get("name")
+    if not name:
+        artist = part.get("artist") or {}
+        name = artist.get("name")
+    return str(name or "").strip()
+
+
+def credit_groups(credit: Any) -> tuple[list[str], list[str]]:
+    """Split a MusicBrainz artist-credit on a feat/ft joinphrase."""
+    primary: list[str] = []
+    featured: list[str] = []
+    bucket = primary
     for part in _as_list(credit):
         if not isinstance(part, dict):
             continue
-        name = part.get("name")
-        if not name:
-            artist = part.get("artist") or {}
-            name = artist.get("name")
+        name = _credit_name(part)
         if name:
-            names.append(str(name))
-    return names
+            bucket.append(name)
+        join = str(part.get("joinphrase") or "")
+        if re.search(r"\b(?:feat|ft|featuring)\.?\b", join, re.IGNORECASE):
+            bucket = featured
+    return primary, featured
+
+
+def artist_names_from_credit(credit: Any) -> list[str]:
+    primary, featured = credit_groups(credit)
+    return primary + featured
 
 
 def artist_names_from_acoustid(artists: Any) -> list[str]:
@@ -218,7 +235,7 @@ def _identity_from_recording(
     source: str,
 ) -> Identity:
     recording = mb.recording(mbid)
-    artists = artist_names_from_credit(recording.get("artist-credit"))
+    artists, featured_artists = credit_groups(recording.get("artist-credit"))
     title = str(recording.get("title") or "")
     raw_tags = _tags_from(recording)
 
@@ -274,6 +291,7 @@ def _identity_from_recording(
         title=title,
         album=album,
         artists=artists,
+        featured_artists=featured_artists,
         album_artists=album_artists or artists,
         composers=composers,
         year=year,
@@ -547,7 +565,9 @@ def _identity_from_hints(
     bit_depth: int | None,
     sample_rate: int | None,
 ) -> Identity:
-    artists = split_artist_field(hints.artist)
+    from app.util import split_credit_groups
+
+    artists, featured_artists = split_credit_groups(hints.artist)
     album_artists = split_artist_field(hints.albumartist)
     composers = split_artist_field(hints.composer)
     title = hints.title or file_stem_hints(hints.filename)
@@ -556,6 +576,7 @@ def _identity_from_hints(
         title=title,
         album=hints.album,
         artists=artists,
+        featured_artists=featured_artists,
         album_artists=album_artists or artists,
         composers=composers,
         year=year_from_date(hints.date),

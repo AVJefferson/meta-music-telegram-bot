@@ -25,10 +25,7 @@ from app.errors import AppError, to_app_error
 from app.formats import (
     default_filename,
     detect_format,
-    is_allowed_audio_message,
-    is_known_audio_message,
     stored_download_name,
-    user_allowed_formats,
 )
 from app.genre import GenreMapper
 from app.hifi import build_hifi_router
@@ -129,6 +126,122 @@ def is_flac_message(message: Message) -> bool:
     return detect_format(name, mime) == "flac"
 
 
+async def intake_audio_message(message: Message, ctx: Ctx) -> None:
+    from app.audio_in import (
+        BLOCKED_TEXT,
+        CHECKS_TEXT,
+        CORRUPT_TEXT,
+        FORMAT_TEXT,
+        LARGE_TEXT,
+        SongDeleted,
+        chat_download_lock,
+        download_telegram,
+        downloading_text,
+        known_supported,
+        looks_like_audio,
+        max_audio_bytes,
+        media_size,
+        source_deleted,
+        user_wants_format,
+    )
+    from app.botapi import discard_download
+    from app.intake import ingest_local_audio
+    from app.membership import user_is_blocked
+    from app.tags import read_audio_metrics
+
+    if message_from_bot(message, ctx.bot) or not message.from_user:
+        return
+    if not looks_like_audio(message):
+        return
+    if await user_is_blocked(ctx, message.from_user.id) or (
+        message.chat.id < 0 and ctx.catalog.is_user_blocked_in_chat(message.from_user.id, message.chat.id)
+    ):
+        await message.reply(BLOCKED_TEXT)
+        return
+    if not await allow_user(ctx, message.from_user.id, message.chat):
+        if message.chat.type == "private":
+            await message.reply("Private access requires membership in a known group.")
+        return
+    if not known_supported(message):
+        await message.reply(FORMAT_TEXT)
+        return
+    if not user_wants_format(ctx, message.from_user.id, message):
+        return
+    size = media_size(message)
+    if size is not None and size > max_audio_bytes(ctx):
+        await message.reply(LARGE_TEXT)
+        return
+    touch(ctx, message.from_user.id, message.from_user)
+    file_id, file_name = file_info(message)
+    thread_id, _topic_name = resolve_topic(message, ctx)
+    async with chat_download_lock(message.chat.id):
+        status = await message.reply(downloading_text(file_name, 0))
+        pending_dir = ctx.settings.pending_root / f"{message.chat.id}-{message.message_id}"
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        mime = ""
+        media = message.document or message.audio
+        if media is not None:
+            mime = getattr(media, "mime_type", None) or ""
+        local = pending_dir / stored_download_name(file_name, mime)
+
+        async def _on_progress(pct: int) -> None:
+            try:
+                await status.edit_text(downloading_text(file_name, pct))
+            except Exception:
+                log.debug("download progress edit failed", exc_info=True)
+
+        async def _deleted() -> bool:
+            return await source_deleted(ctx.bot, message.chat.id, message.message_id)
+
+        try:
+            if await _deleted():
+                raise SongDeleted()
+            telegram_file = await ctx.bot.get_file(file_id)
+            await download_telegram(
+                ctx.bot, telegram_file, local, _on_progress, _deleted, total_hint=size
+            )
+            await asyncio.to_thread(discard_download, getattr(telegram_file, "file_path", None))
+            if await _deleted():
+                raise SongDeleted()
+            try:
+                await asyncio.to_thread(read_audio_metrics, local)
+            except Exception:
+                await status.edit_text(CORRUPT_TEXT)
+                return
+            await status.edit_text(CHECKS_TEXT)
+            await ingest_local_audio(
+                ctx,
+                chat=message.chat,
+                user_id=message.from_user.id,
+                path=local,
+                file_name=file_name,
+                thread_id=thread_id,
+                topic_name="",
+                telegram_file_id=file_id,
+                source_message_id=message.message_id,
+            )
+            with contextlib.suppress(Exception):
+                await status.delete()
+        except SongDeleted:
+            local.unlink(missing_ok=True)
+            from app.notify import send_notice
+
+            await send_notice(
+                ctx,
+                message.from_user.id,
+                "Song deleted while downloading",
+                level="error",
+                chat_id=message.chat.id,
+            )
+            with contextlib.suppress(Exception):
+                await status.edit_text("Song deleted while downloading")
+        except AppError as exc:
+            await notify_user(ctx, message.from_user.id, exc.user_message, chat_id=message.chat.id)
+        except Exception as exc:
+            log.exception("audio ingest failed")
+            await notify_user(ctx, message.from_user.id, to_app_error(exc).user_message, chat_id=message.chat.id)
+
+
 def file_info(message: Message) -> tuple[str, str]:
     if message.document:
         mime = message.document.mime_type or ""
@@ -197,48 +310,7 @@ def build_router(jobs: asyncio.Queue[Job]) -> Router:
             ctx.catalog.upsert_topic(message.message_thread_id, edited.name)
 
     async def _intake_audio(message: Message, ctx: Ctx) -> None:
-        if not is_known_audio_message(message):
-            return
-        if message_from_bot(message, ctx.bot) or not message.from_user:
-            log.debug("ignored bot or anonymous audio chat=%s", message.chat.id)
-            return
-        if not await allow_user(ctx, message.from_user.id, message.chat):
-            return
-        if not is_allowed_audio_message(message, user_allowed_formats(ctx, message.from_user.id)):
-            return
-        touch(ctx, message.from_user.id, message.from_user)
-        file_id, file_name = file_info(message)
-        thread_id, _topic_name = resolve_topic(message, ctx)
-        from app.botapi import discard_download
-        from app.intake import ingest_local_audio
-
-        pending_dir = ctx.settings.pending_root / f"{message.chat.id}-{message.message_id}"
-        pending_dir.mkdir(parents=True, exist_ok=True)
-        mime = ""
-        media = message.document or message.audio
-        if media is not None:
-            mime = getattr(media, "mime_type", None) or ""
-        local = pending_dir / stored_download_name(file_name, mime)
-        try:
-            telegram_file = await ctx.bot.get_file(file_id)
-            await ctx.bot.download(telegram_file, destination=local)
-            await asyncio.to_thread(discard_download, telegram_file.file_path)
-            await ingest_local_audio(
-                ctx,
-                chat=message.chat,
-                user_id=message.from_user.id,
-                path=local,
-                file_name=file_name,
-                thread_id=thread_id,
-                topic_name="",
-                telegram_file_id=file_id,
-                source_message_id=message.message_id,
-            )
-        except AppError as exc:
-            await notify_user(ctx, message.from_user.id, exc.user_message, chat_id=message.chat.id)
-        except Exception as exc:
-            log.exception("group audio ingest failed")
-            await notify_user(ctx, message.from_user.id, to_app_error(exc).user_message, chat_id=message.chat.id)
+        await intake_audio_message(message, ctx)
 
     @router.message(F.document | F.audio)
     async def on_media(message: Message, ctx: Ctx) -> None:
@@ -340,7 +412,10 @@ async def main() -> None:
     scheduler.add_job(run_expire_pending, "interval", minutes=15, args=[ctx])
     scheduler.start()
 
-    worker_task = asyncio.create_task(worker("main", jobs, ctx), name="tagger-worker")
+    worker_tasks = [
+        asyncio.create_task(worker(f"tagger-{index}", jobs, ctx), name=f"tagger-{index}")
+        for index in range(3)
+    ]
     index_task: asyncio.Task | None = None
     http_runner = None
     try:
@@ -358,9 +433,11 @@ async def main() -> None:
             index_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await index_task
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
+        for task in worker_tasks:
+            task.cancel()
+        for task in worker_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         scheduler.shutdown(wait=False)
         await http.aclose()
         await bot.session.close()

@@ -8,6 +8,45 @@ from app.errors import AppError, log_error, redact, to_app_error
 log = logging.getLogger(__name__)
 
 
+async def send_notice(
+    ctx: Any,
+    user_id: int,
+    text: str,
+    *,
+    level: str = "info",
+    chat_id: int | None = None,
+    thread_id: int | None = None,
+    reply_markup=None,
+) -> None:
+    """User-facing notice. Honors notification mode and channel. Reactions wait for that process."""
+    from app.prefs import load_user_prefs
+
+    prefs = load_user_prefs(ctx, user_id)
+    if prefs.notifications == "none":
+        return
+    if prefs.notifications == "errors" and level != "error":
+        return
+    if prefs.channel == "reactions":
+        return
+    target = user_id if prefs.channel == "private" else (chat_id or user_id)
+    if target < 0:
+        from app.ephemeral import send_private
+
+        await send_private(
+            ctx,
+            chat_id=target,
+            user_id=user_id,
+            text=text,
+            thread_id=thread_id,
+            reply_markup=reply_markup,
+        )
+        return
+    try:
+        await ctx.bot.send_message(target, text, reply_markup=reply_markup)
+    except Exception:
+        log.warning("send_notice failed user_id=%s", user_id, exc_info=True)
+
+
 async def notify_user(
     ctx: Any,
     user_id: int,

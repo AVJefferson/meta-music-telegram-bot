@@ -241,11 +241,11 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(params, EphemeralMessageParameters)
         self.assertEqual(params.receiver_user_id, 7)
 
-    async def test_private_save_card_has_drive_link_only(self) -> None:
+    async def test_private_save_card_is_song_details_only(self) -> None:
         edits, sends, captions = await self._save(42)
         public = "\n".join(edits)
         _card_hides_personal(public)
-        self.assertIn(DRIVE_URL, edits[-1])
+        self.assertNotIn(DRIVE_URL, public)
         self.assertNotIn("<code>", public)
         self.assertEqual(sends, [])
         self.assertTrue(captions)

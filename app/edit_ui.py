@@ -765,6 +765,10 @@ async def handle_edit_callback(callback, ctx: Ctx) -> None:
     if callback.message and callback.message.chat.id != row.chat_id:
         await callback.answer()
         return
+    from app.membership import answer_if_blocked
+
+    if await answer_if_blocked(ctx, callback):
+        return
     if not await allow_from_callback(ctx, callback):
         await callback.answer("Access denied.", show_alert=True)
         return
@@ -875,6 +879,61 @@ async def handle_edit_callback(callback, ctx: Ctx) -> None:
         ctx.catalog.update_pending_review(row.id, status="waiting")
 
 
+_TAG_LABELS = {
+    "title": "title",
+    "track number": "tracknumber",
+    "track": "tracknumber",
+    "disc number": "discnumber",
+    "disc": "discnumber",
+    "album": "album",
+    "artist": "artist",
+    "album artist": "albumartist",
+    "composers": "composer",
+    "composer": "composer",
+    "year": "date",
+    "genre": "genre",
+}
+
+
+async def handle_tag_line(message, ctx: Ctx) -> bool:
+    """Reply `Title: value` on an identify card to type that tag."""
+    from app.membership import allow_user
+
+    if not message.text or message.text.startswith("/"):
+        return False
+    reply = message.reply_to_message
+    if reply is not None:
+        row = ctx.catalog.get_pending_by_message(message.chat.id, reply.message_id)
+    elif getattr(message.chat, "type", "") == "private":
+        row = ctx.catalog.get_waiting_for_chat(message.chat.id)
+    else:
+        return False
+    if row is None or row.phase not in {"tags", "match"} or row.status != "waiting":
+        return False
+    if not message.from_user or not await allow_user(ctx, message.from_user.id, message.chat):
+        return False
+    if row.user_id and message.from_user.id != row.user_id:
+        return False
+    label, _, value = message.text.partition(":")
+    key = _TAG_LABELS.get(label.strip().casefold())
+    if not key:
+        return False
+    if not ctx.catalog.claim_pending(row.id, "processing"):
+        return True
+    ctx.catalog.update_pending_review(
+        row.id,
+        phase="tags",
+        working_json=set_working_field(row, key, value.strip(), ctx.genre),
+        status="waiting",
+    )
+    refreshed = ctx.catalog.get_pending_review(row.id)
+    if refreshed:
+        from app.queue import _refresh_tag_ui
+
+        await _refresh_tag_ui(ctx, refreshed)
+    return True
+
+
 async def handle_edit_text(message, ctx: Ctx) -> bool:
     from app.membership import allow_user
 
@@ -935,7 +994,7 @@ def build_edit_router() -> Router:
 
     @router.message(F.text, ~F.text.startswith("/"))
     async def on_edit_text(message: Message, ctx: Ctx) -> None:
-        handled = await handle_edit_text(message, ctx)
+        handled = await handle_tag_line(message, ctx) or await handle_edit_text(message, ctx)
         if not handled:
             raise SkipHandler()
 

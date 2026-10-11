@@ -36,6 +36,7 @@ class Identity:
     title: str = ""
     album: str = ""
     artists: list[str] = field(default_factory=list)
+    featured_artists: list[str] = field(default_factory=list)
     album_artists: list[str] = field(default_factory=list)
     composers: list[str] = field(default_factory=list)
     year: str = ""
@@ -199,6 +200,7 @@ class UserRecord:
     first_seen_at: str
     last_active_at: str
     songs_edited: int = 0
+    songs_processed: int = 0
     google_refresh_token: str | None = None
     google_email: str | None = None
     gdrive_folder_id: str | None = None

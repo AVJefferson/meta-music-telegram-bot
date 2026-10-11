@@ -587,6 +587,7 @@ def _remember_resolved(
         message_id=source_id,
         card_message_id=card_id,
         thread_id=track.thread_id if track.thread_id is not None else hint.thread_id,
+        sha256=str(getattr(track, "audio_sha256", "") or ""),
     )
 
 

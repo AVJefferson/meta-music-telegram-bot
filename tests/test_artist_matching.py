@@ -114,7 +114,7 @@ class ReviewUiTests(unittest.TestCase):
         recommended = {"title": "Song", "genre": "Rock", "composer": ""}
         summary = format_summary(original, recommended, recommended)
         self.assertIn("<b>Genre</b>: Rock", summary)
-        self.assertIn("<b>Composer</b>: Bach", summary)
+        self.assertIn("<b>Composers</b>: Bach", summary)
         self.assertNotIn("file: Bach", summary)
         self.assertNotIn("rec: Rock", summary)
 
@@ -122,7 +122,7 @@ class ReviewUiTests(unittest.TestCase):
         original = {"title": "Song", "composer": "Bach, Mozart & Salieri"}
         recommended = {"title": "Song", "composer": "Bach & Mozart"}
         summary = format_summary(original, recommended, recommended)
-        self.assertIn("<b>Composer</b>: Bach &amp; Mozart, <s>Salieri</s>", summary)
+        self.assertIn("<b>Composers</b>: Bach &amp; Mozart, <s>Salieri</s>", summary)
         self.assertNotIn("<s>Bach</s>", summary)
         self.assertNotIn("file: Bach", summary)
 
@@ -165,6 +165,13 @@ class FormatRoundTripTests(unittest.TestCase):
 
     def test_normalize_name_list_dedupes(self) -> None:
         self.assertEqual(normalize_name_list("B, A, b & C"), "A, B & C")
+
+    def test_featured_names_follow_ft(self) -> None:
+        self.assertEqual(normalize_name_list("A; B / C feat. D"), "A, B & C Ft. D")
+        self.assertEqual(
+            normalize_name_list("C feat. B & A", lead="C"),
+            "C Ft. A & B",
+        )
 
     def test_diff_credit_html_strikes_removed_only(self) -> None:
         html = diff_credit_html("Bach, Mozart & Salieri", "Bach & Mozart")

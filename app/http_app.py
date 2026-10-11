@@ -87,6 +87,7 @@ def create_http_app(ctx: Ctx) -> web.Application:
     app.router.add_get("/app/{page}", webapp_index)
     app.router.add_get("/api/me", api_me)
     app.router.add_get("/api/admin/overview", api_admin_overview)
+    app.router.add_post("/api/admin/settings", api_admin_settings)
     app.router.add_get("/api/login", api_login)
     app.router.add_post("/api/settings", api_settings)
     app.router.add_get("/api/review", api_review)
@@ -246,8 +247,32 @@ async def api_admin_overview(request: web.Request) -> web.Response:
     if not is_admin(ctx, user_id):
         return web.json_response(AppError("forbidden").as_json(), status=403)
     payload = ctx.catalog.admin_overview()
+    raw = ctx.catalog.get_setting("max_audio_mb")
+    payload["max_audio_mb"] = float(raw) if raw else float(getattr(ctx.settings, "max_audio_mb", 50) or 50)
     payload["server"] = _server_stats(ctx)
     return _json_ok(payload)
+
+
+async def api_admin_settings(request: web.Request) -> web.Response:
+    try:
+        ctx, user_id = await _api_user(request)
+        body = await request.json()
+    except AppError as exc:
+        return web.json_response(exc.as_json(), status=exc.http_status)
+    except Exception:
+        return web.json_response(AppError("bad_input").as_json(), status=400)
+    if not is_admin(ctx, user_id):
+        return web.json_response(AppError("forbidden").as_json(), status=403)
+    if "max_audio_mb" in body:
+        try:
+            mb = float(body.get("max_audio_mb"))
+        except (TypeError, ValueError):
+            return web.json_response(AppError("bad_input").as_json(), status=400)
+        if mb <= 0:
+            return web.json_response(AppError("bad_input").as_json(), status=400)
+        ctx.catalog.set_setting("max_audio_mb", str(mb))
+    raw = ctx.catalog.get_setting("max_audio_mb")
+    return _json_ok({"max_audio_mb": float(raw) if raw else float(getattr(ctx.settings, "max_audio_mb", 50) or 50)})
 
 
 def _json_ok(data: dict, status: int = 200) -> web.Response:
@@ -281,12 +306,20 @@ def _suggest_prefs(settings: dict) -> tuple[float, str]:
 
 
 def _save_prefs_payload(settings: dict) -> dict:
-    prefs = save_prefs_from_settings(settings)
+    from app.prefs import process_prefs_from_settings
+
+    prefs = process_prefs_from_settings(settings)
+    legacy = save_prefs_from_settings(settings)
     return {
-        "default_dest": prefs.dest,
-        "correct_telegram": prefs.correct_telegram,
-        "skip_save_prompt": prefs.skip_save_prompt,
-        "delete_original": prefs.delete_original,
+        "default_dest": prefs.save,
+        "correct_telegram": legacy.correct_telegram,
+        "correct_mode": prefs.correct,
+        "skip_save_prompt": legacy.skip_save_prompt,
+        "delete_original": legacy.delete_original,
+        "delete_mode": prefs.delete,
+        "auto_forward": list(prefs.auto_forward),
+        "notifications": prefs.notifications,
+        "notification_channel": prefs.channel,
         "notify_group_save": notify_group_save_enabled(settings),
     }
 
@@ -401,19 +434,51 @@ async def api_settings(request: web.Request) -> web.Response:
     user = ctx.catalog.ensure_user(user_id)
     settings = user_settings_dict(user)
     if dest is not None:
-        settings["default_dest"] = dest
+        raw_dest = str(body.get("default_dest") or "").strip().casefold().replace(" ", "_")
+        if raw_dest in {"ask", "ask_each_time"}:
+            settings["default_dest"] = "ask"
+            if "skip_save_prompt" not in body:
+                settings["skip_save_prompt"] = False
+        else:
+            settings["default_dest"] = dest
+            if "skip_save_prompt" not in body:
+                settings["skip_save_prompt"] = True
     if "allowed_formats" in body:
         settings["allowed_formats"] = normalize_allowed(body.get("allowed_formats"))
     if "suggest_similarity" in body:
         settings["suggest_similarity"] = clamp_suggest_similarity(body.get("suggest_similarity"))
     if "suggest_library" in body:
         settings["suggest_library"] = normalize_suggest_library(body.get("suggest_library"))
-    if "correct_telegram" in body:
-        settings["correct_telegram"] = truthy_setting(body.get("correct_telegram"))
+    if "correct_mode" in body:
+        from app.prefs import tri_state
+
+        settings["correct_telegram"] = tri_state(body.get("correct_mode"), "yes")
+    elif "correct_telegram" in body:
+        value = body.get("correct_telegram")
+        if isinstance(value, str) and value.strip().casefold() in {"ask", "ask_each_time"}:
+            settings["correct_telegram"] = "ask"
+        else:
+            settings["correct_telegram"] = truthy_setting(value)
+    if "delete_mode" in body:
+        from app.prefs import tri_state
+
+        settings["delete_original"] = tri_state(body.get("delete_mode"), "no")
     if "skip_save_prompt" in body:
         settings["skip_save_prompt"] = truthy_setting(body.get("skip_save_prompt"))
-    if "delete_original" in body:
+    if "delete_original" in body and "delete_mode" not in body:
         settings["delete_original"] = truthy_setting(body.get("delete_original"))
+    if "auto_forward" in body:
+        from app.prefs import resolve_forward
+
+        settings["auto_forward"] = list(resolve_forward(body.get("auto_forward")))
+    if "notifications" in body:
+        from app.prefs import resolve_notifications
+
+        settings["notifications"] = resolve_notifications(body.get("notifications"))
+    if "notification_channel" in body:
+        from app.prefs import resolve_channel
+
+        settings["notification_channel"] = resolve_channel(body.get("notification_channel"))
     if "notify_group_save" in body:
         settings["notify_group_save"] = truthy_setting(body.get("notify_group_save"))
     if (
@@ -424,6 +489,11 @@ async def api_settings(request: web.Request) -> web.Response:
         and "correct_telegram" not in body
         and "skip_save_prompt" not in body
         and "delete_original" not in body
+        and "delete_mode" not in body
+        and "correct_mode" not in body
+        and "auto_forward" not in body
+        and "notifications" not in body
+        and "notification_channel" not in body
         and "notify_group_save" not in body
     ):
         settings["default_dest"] = normalize_save_dest(body.get("default_dest"))

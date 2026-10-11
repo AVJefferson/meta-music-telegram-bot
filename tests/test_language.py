@@ -31,6 +31,15 @@ class LanguageDetectTests(unittest.TestCase):
         self.assertIsNone(genre.language_from_raw("spanish guitar"))
         self.assertIsNone(genre.language_from_raw("General"))
 
+    def test_classify_puts_language_before_genre_and_pins_primary(self) -> None:
+        genre = mapper()
+        text = genre.classify(["pop", "happy", "tamil", "piano"])
+        parts = [part.strip() for part in text.split("|")]
+        self.assertEqual(parts[0].casefold(), "tamil")
+        self.assertLess(text.casefold().find("tamil"), text.casefold().find("pop"))
+        pinned = genre.pin_language("Pop | Tamil | Malayalam", "Malayalam")
+        self.assertTrue(pinned.casefold().startswith("malayalam"))
+
     def test_classify_keeps_every_language(self) -> None:
         text = mapper().classify(["pop", "malayalam songs", "tamil", "french house"])
         folded = text.casefold()

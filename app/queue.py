@@ -6,7 +6,7 @@ import json
 import logging
 import shutil
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -34,7 +34,7 @@ from app.covers import (
     resolve_album_cover,
     upload_album_cover_if_missing,
 )
-from app.enrich import enrich, lyrics_card_text
+from app.enrich import enrich
 from app.formats import (
     SAVE_DEST_SET,
     SavePrefs,
@@ -64,8 +64,8 @@ from app.models import (
 from app.review_ui import (
     bulk_choice,
     conflict_keyboard,
+    cover_image_caption,
     cover_keyboard,
-    cover_option_text,
     dest_keyboard,
     dest_prompt_text,
     empty_markup,
@@ -74,6 +74,8 @@ from app.review_ui import (
     format_summary,
     language_keyboard,
     language_prompt_text,
+    match_keyboard,
+    match_prompt_text,
     parse_callback,
     review_keyboard,
     toggle_working_field,
@@ -90,7 +92,7 @@ from app.tags import (
     read_hints,
     write_tags,
 )
-from app.util import format_audio_block, html_esc, safe_link
+from app.util import format_audio_block, html_esc
 
 log = logging.getLogger(__name__)
 _cover_pick_lock = asyncio.Lock()
@@ -100,40 +102,34 @@ def quality(bit_depth: int | None, sample_rate: int | None) -> tuple[int, int]:
     return (bit_depth or 0, sample_rate or 0)
 
 
-def tag_preview(tags: TagSet, metrics: AudioMetrics | None = None, authenticity=None) -> str:
+def tag_preview(
+    tags: TagSet,
+    metrics: AudioMetrics | None = None,
+    authenticity=None,
+    *,
+    size_bytes: int | None = None,
+) -> str:
     # The check can still run. Song cards and status previews do not print it.
     del authenticity
-    audio = format_audio_block(metrics)
-    return (
-        f"<b>{html_esc(tags.title)}</b>\n"
-        f"Artist: {html_esc(tags.artist)}\n"
-        f"Album: {html_esc(tags.album)}\n"
-        f"Album artist: {html_esc(tags.albumartist)}\n"
-        f"Composer: {html_esc(tags.composer)}\n"
-        f"Genre: {html_esc(tags.genre)}\n"
-        f"Year: {html_esc(tags.date)}\n"
-        f"{html_esc(lyrics_card_text(tags.lyrics))}\n"
-        f"{audio}"
-    )
+    from app.captions import song_card
+
+    return song_card(tags, metrics, size_bytes=size_bytes)
 
 
 def _preview(tags: TagSet, identity, path: Path | None = None, report: dict | None = None) -> str:
     del report
-    return tag_preview(tags, _metrics_from_identity(identity, path))
+    size = None
+    if path is not None and path.is_file():
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = None
+    return tag_preview(tags, _metrics_from_identity(identity, path), size_bytes=size)
 
 
 def _tech_block(identity, path: Path | None = None, report: dict | None = None) -> str:
     del report
     return format_audio_block(_metrics_from_identity(identity, path))
-
-
-def _drive_link(chat_id: int, url: str | None) -> str:
-    if chat_id <= 0:
-        return ""
-    href = safe_link(url)
-    if not href:
-        return ""
-    return f'\nDrive: <a href="{href}">open</a>'
 
 
 def _save_location_text(saved: str, relative: str, extra: str = "") -> str:
@@ -379,6 +375,103 @@ def _build_report(hints: TagHints, identity: Identity, enrichment, tags: TagSet)
     return apply_chosen(report, tags, identity)
 
 
+def _file_is_corrupt(path: Path) -> bool:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return True
+    if size <= 0:
+        return True
+    try:
+        read_audio_metrics(path)
+    except Exception:
+        if size >= 4096:
+            log.warning("audio metrics failed path=%s size=%s", path, size, exc_info=True)
+            return True
+        return False
+    return False
+
+
+async def _reuse_logged_copy(ctx: Ctx, job: Job, tmp: Path) -> bool:
+    """SHA match skips identify. Existing folder art also skips the cover picker."""
+    from app.paths import file_sha256
+    from app.relocate import tags_from_track
+
+    sha = await asyncio.to_thread(file_sha256, tmp)
+    existing = ctx.catalog.find_user_track_by_sha(job.user_id or 0, sha) if job.user_id else None
+    indexed = None
+    if existing is None:
+        from app.library_index import find_indexed_sha
+
+        indexed = find_indexed_sha(ctx, sha)
+        if indexed is None:
+            return False
+    if existing is not None:
+        tags = normalize_tagset(tags_from_track(existing), ctx.genre)
+    else:
+        tags = normalize_tagset(
+            TagSet(
+                title=str(indexed.get("title") or ""),
+                artist=str(indexed.get("artist") or ""),
+                album=str(indexed.get("album") or ""),
+                albumartist=str(indexed.get("albumartist") or ""),
+                genre=str(indexed.get("genre") or ""),
+            ),
+            ctx.genre,
+        )
+    identity = Identity(confidence="high", title=tags.title, album=tags.album, source="songlog")
+    if existing is not None and existing.identity_json:
+        try:
+            identity = identity_from_dict(json.loads(existing.identity_json))
+            identity.confidence = "high"
+        except (TypeError, ValueError):
+            pass
+    report: dict = {}
+    if existing is not None and existing.source_report_json:
+        try:
+            loaded = json.loads(existing.source_report_json)
+            if isinstance(loaded, dict):
+                report = loaded
+        except (TypeError, ValueError):
+            report = {}
+    if existing is not None:
+        topic = str(getattr(existing, "topic_name", "") or job.topic_name or "")
+    else:
+        topic = str((indexed or {}).get("topic_name") or job.topic_name or "")
+    folder = await existing_album_cover(ctx, topic, tags.album, tags.albumartist or tags.artist)
+    cover, mime = (None, None)
+    if folder and folder.data:
+        cover, mime = folder.data, folder.mime or "image/jpeg"
+        report["manual_cover_final"] = True
+        await _embed_cover(tmp, tags, cover, mime)
+    else:
+        cover, mime = await asyncio.to_thread(read_cover, tmp)
+    await edit_status(ctx, job, _preview(tags, identity, tmp, report))
+    await _library_commit_with_cover(
+        ctx,
+        job=job,
+        local=tmp,
+        tags=tags,
+        identity=identity,
+        report=report,
+        file_cover=(cover, mime),
+        pending_id=job.source_pending_id,
+    )
+    return True
+
+
+async def _wait_identify_pace(ctx: Ctx) -> None:
+    """External identify calls wait for the rate window instead of failing the song."""
+    from app.rate_limit import retry_after
+
+    limit = int(getattr(ctx.settings, "rate_api_per_minute", 60) or 60)
+    while True:
+        delay = retry_after("identify", 0, limit)
+        if delay <= 0:
+            return
+        await asyncio.sleep(delay)
+
+
 async def process_job(job: Job, ctx: Ctx) -> None:
     if job.user_id:
         from app.relocate import ctx_for_user
@@ -389,7 +482,9 @@ async def process_job(job: Job, ctx: Ctx) -> None:
     work.mkdir(parents=True, exist_ok=True)
     tmp = work / f"source{suffix_for(job.file_name, job.local_path)}"
     try:
-        await edit_status(ctx, job, f"Downloading <code>{html_esc(job.file_name)}</code>…")
+        from app.audio_in import CHECKS_TEXT, CORRUPT_TEXT, identify_slots
+
+        await edit_status(ctx, job, CHECKS_TEXT)
         if job.local_path:
             await asyncio.to_thread(shutil.copy2, job.local_path, tmp)
         else:
@@ -397,12 +492,20 @@ async def process_job(job: Job, ctx: Ctx) -> None:
             await ctx.bot.download(file, destination=tmp)
             await asyncio.to_thread(discard_download, file.file_path)
 
+        if await asyncio.to_thread(_file_is_corrupt, tmp):
+            await edit_status(ctx, job, CORRUPT_TEXT)
+            return
+
+        if await _reuse_logged_copy(ctx, job, tmp):
+            return
+
         hints = await asyncio.to_thread(read_hints, tmp, job.file_name)
         file_cover = await asyncio.to_thread(read_cover, tmp)
-        await edit_status(ctx, job, "Fingerprinting / identifying…")
-        identity = await asyncio.to_thread(identify_file, tmp, hints, settings, ctx.mb)
+        async with identify_slots():
+            await _wait_identify_pace(ctx)
+            identity = await asyncio.to_thread(identify_file, tmp, hints, settings, ctx.mb)
 
-        await edit_status(ctx, job, "Fetching lyrics, genre…")
+        await _wait_identify_pace(ctx)
         enrichment = await enrich(
             ctx.http,
             identity,
@@ -414,14 +517,19 @@ async def process_job(job: Job, ctx: Ctx) -> None:
         tags = normalize_tagset(tags, ctx.genre)
         if not tags.title:
             tags.title = Path(job.file_name).stem
+        await edit_status(ctx, job, _preview(tags, identity, tmp))
 
         # No tag write here: every path out of this function either writes tags
         # itself (cover resolution, review confirm, expiry) or discards the file.
         # Writing now would only add a full mutagen rewrite of a large FLAC.
         report = _build_report(hints, identity, enrichment, tags)
+        if job.source_pending_id:
+            prior_row = ctx.catalog.get_pending_review(job.source_pending_id)
+            prior = _loads(prior_row.source_report_json, {}) if prior_row else {}
+            if isinstance(prior, dict) and prior.get("text_status"):
+                report["text_status"] = True
         _stamp_languages(ctx, report, tags)
         if settings.authenticity_check:
-            await edit_status(ctx, job, "Checking authenticity…")
             try:
                 auth = await asyncio.to_thread(
                     analyze_flac,
@@ -459,32 +567,31 @@ async def process_job(job: Job, ctx: Ctx) -> None:
             if existing and existing.id != restart_replace:
                 new_q = quality(identity.bit_depth, identity.sample_rate)
                 old_q = quality(existing.bit_depth, existing.sample_rate)
-                if existing.status == "uploaded" and new_q <= old_q:
-                    await edit_status(
+                if existing.status == "uploaded" and new_q > old_q:
+                    await _library_commit_with_cover(
                         ctx,
-                        job,
-                        "Duplicate — already in library "
-                        f"({old_q[0]}/{old_q[1]}). Skipped.\n\n{_preview(tags, identity, tmp, report)}",
+                        job=job,
+                        local=tmp,
+                        tags=tags,
+                        identity=identity,
+                        report=report,
+                        replace_id=existing.id,
+                        old_drive_id=existing.drive_file_id,
+                        replaced=True,
+                        old_q=old_q,
+                        new_q=new_q,
+                        file_cover=file_cover,
+                        pending_id=job.source_pending_id,
                     )
                     return
-                await _library_commit_with_cover(
-                    ctx,
-                    job=job,
-                    local=tmp,
-                    tags=tags,
-                    identity=identity,
-                    report=report,
-                    replace_id=existing.id,
-                    old_drive_id=existing.drive_file_id,
-                    replaced=existing.status == "uploaded" and new_q > old_q,
-                    old_q=old_q,
-                    new_q=new_q,
-                    file_cover=file_cover,
-                    pending_id=job.source_pending_id,
-                )
-                return
 
         if identity.confidence == "low":
+            await start_tag_review(ctx, job, tmp, hints, tags, identity, report)
+            return
+
+        file_tags = normalize_tagset(hints_to_tagset(hints), ctx.genre)
+        if not _tag_maps_equal(asdict(file_tags), asdict(tags)):
+            identity.candidates = []
             await start_tag_review(ctx, job, tmp, hints, tags, identity, report)
             return
 
@@ -519,6 +626,8 @@ async def start_tag_review(
     dest = await asyncio.to_thread(place_file, tmp, dest)
     original = normalize_tagset(hints_to_tagset(hints), ctx.genre)
     tags = normalize_tagset(tags, ctx.genre)
+    if identity.candidates:
+        report["match_selected"] = 0
     if job.source_pending_id:
         pending_id = job.source_pending_id
         ctx.catalog.update_pending_review(
@@ -560,27 +669,106 @@ async def start_tag_review(
             file_name=job.file_name,
             expires_at=_expires_at(),
         )
-    if job.private:
-        ctx.catalog.update_pending_review(pending_id, phase="edit:fields")
-        from app.edit_ui import show_field_menu
-
-        row = ctx.catalog.get_pending_review(pending_id)
-        if row:
-            await show_field_menu(ctx, row)
-        status_id = job.status_message_id
+    phase = "match" if identity.candidates else "tags"
+    if _identify_busy(ctx, job.chat_id, pending_id):
+        ctx.catalog.update_pending_review(pending_id, phase=phase, status="queued")
+        log.info("identify queued id=%s chat=%s", pending_id, job.chat_id)
+        return
+    ctx.catalog.update_pending_review(pending_id, phase=phase, status="waiting")
+    if phase == "match":
+        text = match_prompt_text(identity.acoustid or "", len(identity.candidates))
+        markup = match_keyboard(pending_id, identity.candidates, 0, selected=0)
     else:
         text = format_summary(
             original,
             tags,
             tags,
-            reason=identity.confidence_reason,
-            tech=_tech_block(identity, dest, report),
             genre_mapper=ctx.genre,
         )
         markup = review_keyboard(pending_id, original, tags, tags)
-        status_id = await edit_status(ctx, job, text, markup)
+    status_id = await _post_identify_prompt(ctx, job, text, markup)
     ctx.catalog.update_pending_review(pending_id, status_message_id=status_id)
     log.info("review waiting id=%s file=%s reason=%s", pending_id, job.file_name, identity.confidence_reason)
+
+
+async def _post_identify_prompt(ctx: Ctx, job: Job, text: str, markup) -> int:
+    """Identify prompts sit under the song card and are removed when that stage ends."""
+    kwargs: dict = {
+        "chat_id": job.chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "reply_markup": markup,
+    }
+    if job.thread_id:
+        kwargs["message_thread_id"] = job.thread_id
+    anchor = job.public_message_id or 0
+    if anchor and anchor != job.status_message_id:
+        kwargs["reply_to_message_id"] = anchor
+    elif job.public_message_id:
+        kwargs["reply_to_message_id"] = job.public_message_id
+    try:
+        sent = await ctx.bot.send_message(**kwargs)
+        return sent.message_id
+    except Exception:
+        log.warning("identify prompt send failed", exc_info=True)
+        return await edit_status(ctx, job, text, markup)
+
+
+async def _show_cover_prompt(ctx: Ctx, job: Job, text: str, markup) -> int:
+    """Cover picker stays under the song card. Later edits reuse that message."""
+    public = int(job.public_message_id or 0)
+    if job.status_message_id and public and job.status_message_id != public:
+        return await edit_status(ctx, job, text, markup)
+    sent = await _post_identify_prompt(ctx, job, text, markup)
+    job.status_message_id = sent
+    return sent
+
+
+async def _drop_identify_prompt(ctx: Ctx, row: PendingReview) -> None:
+    public = int(row.public_message_id or 0)
+    prompt = int(row.status_message_id or 0)
+    if prompt and prompt != public:
+        with contextlib.suppress(Exception):
+            await ctx.bot.delete_message(chat_id=row.chat_id, message_id=prompt)
+        if public:
+            ctx.catalog.update_pending_review(row.id, status_message_id=public)
+
+
+def _identify_busy(ctx: Ctx, chat_id: int, excluding_id: int) -> bool:
+    for row in ctx.catalog.list_pending_by_status("waiting"):
+        if row.id == excluding_id or row.chat_id != chat_id:
+            continue
+        if row.phase in {"match", "tags", "lang", "edit:fields"}:
+            return True
+    return False
+
+
+async def _promote_queued_identify(ctx: Ctx, chat_id: int) -> None:
+    if _identify_busy(ctx, chat_id, 0):
+        return
+    queued = [
+        row
+        for row in ctx.catalog.list_pending_by_status("queued")
+        if row.chat_id == chat_id and row.phase in {"match", "tags"}
+    ]
+    if not queued:
+        return
+    row = queued[0]
+    ctx.catalog.update_pending_review(row.id, status="waiting")
+    if row.phase == "match":
+        identity = identity_from_dict(_loads(row.identity_json, {}))
+        text = match_prompt_text(identity.acoustid or "", len(identity.candidates))
+        report = _loads(row.source_report_json, {})
+        selected = _match_selected(report if isinstance(report, dict) else {})
+        markup = match_keyboard(
+            row.id, [asdict(c) for c in identity.candidates], selected // 5, selected=selected
+        )
+    else:
+        await _refresh_tag_ui(ctx, ctx.catalog.get_pending_review(row.id) or row)
+        return
+    status_id = await _post_identify_prompt(ctx, _job_from_pending(row), text, markup)
+    ctx.catalog.update_pending_review(row.id, status_message_id=status_id)
 
 
 def _set_cover_report(report: dict, source: str, caa_release: str | None = None) -> None:
@@ -596,10 +784,14 @@ def _cover_picker_meta(report: dict) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
-def _busy_cover_leader(ctx: Ctx, *, excluding_id: int | None = None) -> PendingReview | None:
+def _busy_cover_leader(
+    ctx: Ctx, *, chat_id: int | None = None, excluding_id: int | None = None
+) -> PendingReview | None:
     rows = ctx.catalog.list_pending_by_phase("cover", "waiting", "processing", "expiring")
     for row in rows:
         if excluding_id is not None and row.id == excluding_id:
+            continue
+        if chat_id is not None and row.chat_id != chat_id:
             continue
         picker = _cover_picker_meta(_loads(row.source_report_json, {}))
         if picker.get("role") == "leader":
@@ -607,8 +799,10 @@ def _busy_cover_leader(ctx: Ctx, *, excluding_id: int | None = None) -> PendingR
     return None
 
 
-def cover_park_role(ctx: Ctx, album_key: str, *, excluding_id: int | None = None) -> str:
-    leader = _busy_cover_leader(ctx, excluding_id=excluding_id)
+def cover_park_role(
+    ctx: Ctx, album_key: str, *, chat_id: int | None = None, excluding_id: int | None = None
+) -> str:
+    leader = _busy_cover_leader(ctx, chat_id=chat_id, excluding_id=excluding_id)
     busy_key = None
     if leader is not None:
         picker = _cover_picker_meta(_loads(leader.source_report_json, {}))
@@ -622,11 +816,16 @@ def _cover_status_markup(pending_id: int, picker: dict) -> InlineKeyboardMarkup 
     if role != "leader" and not from_review:
         return None
     options = list(picker.get("options") or []) if role == "leader" else []
+    try:
+        selected = int(picker.get("selected")) if picker.get("selected") is not None else 0
+    except (TypeError, ValueError):
+        selected = 0
     return cover_keyboard(
         pending_id,
         options,
         from_review=from_review,
         waiting=role != "leader",
+        selected=selected,
     )
 
 
@@ -717,10 +916,8 @@ def _cleanup_cover_option_files(local: Path, options: list) -> None:
 
 
 def _cover_caption(index: int, option: dict, album: str, albumartist: str) -> str:
-    caption = cover_option_text(index, option)
-    if index == 0:
-        caption = f"Pick cover\n{albumartist} — {album}\n{caption}"
-    return caption[:1024]
+    del index, album, albumartist
+    return cover_image_caption(option)
 
 
 def _gallery_kwargs(job: Job, reply_to_message_id: int | None = None) -> dict:
@@ -852,14 +1049,20 @@ async def _ensure_leader_gallery(
         return []
     job = _job_from_pending(leader)
     media_ids = await _send_cover_gallery(
-        ctx, job, Path(leader.local_path).parent, options, album, albumartist
+        ctx,
+        job,
+        Path(leader.local_path).parent,
+        options,
+        album,
+        albumartist,
+        reply_to_message_id=job.public_message_id or None,
     )
     picker["media_message_ids"] = media_ids
     report["cover_picker"] = picker
     ctx.catalog.update_pending_review(leader.id, source_report_json=_dumps(report))
     if media_ids:
         text = _cover_status_text(picker, leader.file_name)
-        status_id = await edit_status(ctx, job, text, _cover_status_markup(leader.id, picker))
+        status_id = await _show_cover_prompt(ctx, job, text, _cover_status_markup(leader.id, picker))
         ctx.catalog.update_pending_review(leader.id, status_message_id=status_id)
     return media_ids
 
@@ -1025,8 +1228,8 @@ async def maybe_cover_picker(
     )
 
     async with _cover_pick_lock:
-        role = cover_park_role(ctx, album_k)
-        leader = _busy_cover_leader(ctx) if role != "leader" else None
+        role = cover_park_role(ctx, album_k, chat_id=job.chat_id)
+        leader = _busy_cover_leader(ctx, chat_id=job.chat_id) if role != "leader" else None
         if role != "leader":
             if role == "follower" and leader:
                 await _ensure_leader_gallery(ctx, leader, album, albumartist)
@@ -1044,7 +1247,7 @@ async def maybe_cover_picker(
             }
             new_id = _upsert_cover_pending(ctx, dest=dest, report=parked, **park_kwargs)
             picker = parked["cover_picker"]
-            status_id = await edit_status(
+            status_id = await _show_cover_prompt(
                 ctx, job, _cover_status_text(picker, job.file_name), _cover_status_markup(new_id, picker)
             )
             ctx.catalog.update_pending_review(new_id, status_message_id=status_id)
@@ -1059,7 +1262,6 @@ async def maybe_cover_picker(
         if data:
             cover_tuple = (data, mime or "image/jpeg")
 
-    await edit_status(ctx, job, "Fetching album cover options…")
     options = await list_cover_candidates(ctx, ident, cover_tuple)
     if len(options) <= 1:
         opt = options[0] if options else None
@@ -1073,8 +1275,8 @@ async def maybe_cover_picker(
     option_meta = _write_cover_option_files(options, dest.parent)
 
     async with _cover_pick_lock:
-        role = cover_park_role(ctx, album_k)
-        leader = _busy_cover_leader(ctx) if role != "leader" else None
+        role = cover_park_role(ctx, album_k, chat_id=job.chat_id)
+        leader = _busy_cover_leader(ctx, chat_id=job.chat_id) if role != "leader" else None
         if role != "leader":
             if role == "follower":
                 _cleanup_cover_option_files(dest, option_meta)
@@ -1092,7 +1294,7 @@ async def maybe_cover_picker(
             }
             new_id = _upsert_cover_pending(ctx, dest=dest, report=parked, **park_kwargs)
             picker = parked["cover_picker"]
-            status_id = await edit_status(
+            status_id = await _show_cover_prompt(
                 ctx, job, _cover_status_text(picker, job.file_name), _cover_status_markup(new_id, picker)
             )
             ctx.catalog.update_pending_review(new_id, status_message_id=status_id)
@@ -1111,12 +1313,18 @@ async def maybe_cover_picker(
         }
         new_id = _upsert_cover_pending(ctx, dest=dest, report=parked, **park_kwargs)
         picker = parked["cover_picker"]
-        status_id = await edit_status(
+        status_id = await _show_cover_prompt(
             ctx, job, _cover_status_text(picker, job.file_name), _cover_status_markup(new_id, picker)
         )
         ctx.catalog.update_pending_review(new_id, status_message_id=status_id)
         media_ids = await _send_cover_gallery(
-            ctx, job, dest.parent, option_meta, album, albumartist
+            ctx,
+            job,
+            dest.parent,
+            option_meta,
+            album,
+            albumartist,
+            reply_to_message_id=job.public_message_id or None,
         )
         picker["options"] = option_meta
         picker["media_message_ids"] = media_ids
@@ -1238,6 +1446,8 @@ async def _resume_library_after_cover(
     identity: Identity,
     report: dict,
 ) -> None:
+    await _drop_identify_prompt(ctx, row)
+    row = ctx.catalog.get_pending_review(row.id) or row
     job = _job_from_pending(row)
     _bind_primary_language(job, report, ctx.genre)
     qr = report.get("quality_replace") or {}
@@ -1449,7 +1659,6 @@ async def _promote_queued_cover(ctx: Ctx, row: PendingReview, picker: dict) -> N
 
     option_meta = list(picker.get("options") or [])
     if not option_meta:
-        await edit_status(ctx, job, "Fetching album cover options…")
         ident = cover_identity(identity, tags)
         data, mime = await asyncio.to_thread(read_cover, local)
         cover_tuple = (data, mime or "image/jpeg") if data else None
@@ -1474,12 +1683,18 @@ async def _promote_queued_cover(ctx: Ctx, row: PendingReview, picker: dict) -> N
     ctx.catalog.update_pending_review(
         row.id, source_report_json=_dumps(report), status="waiting"
     )
-    status_id = await edit_status(
+    status_id = await _show_cover_prompt(
         ctx, job, _cover_status_text(picker, row.file_name), _cover_status_markup(row.id, picker)
     )
     ctx.catalog.update_pending_review(row.id, status_message_id=status_id)
     media_ids = await _send_cover_gallery(
-        ctx, job, local.parent, option_meta, album, albumartist
+        ctx,
+        job,
+        local.parent,
+        option_meta,
+        album,
+        albumartist,
+        reply_to_message_id=job.public_message_id or None,
     )
     picker["options"] = option_meta
     picker["media_message_ids"] = media_ids
@@ -1745,26 +1960,15 @@ def _bind_primary_language(job: Job, report: dict, mapper) -> None:
 
 
 async def _restore_language_prompt(ctx: Ctx, row: PendingReview) -> None:
-    from app.ephemeral import send_or_edit_private
-
     report = _loads(row.source_report_json, {})
     if not isinstance(report, dict):
         report = {}
     langs = [str(item) for item in (report.get("languages") or []) if str(item).strip()]
-    uid = getattr(row, "user_id", 0) or 0
-    ref = await send_or_edit_private(
-        ctx,
-        chat_id=row.chat_id,
-        user_id=uid or row.chat_id,
-        text=language_prompt_text(langs),
-        previous=report.get("lang_prompt") if isinstance(report.get("lang_prompt"), dict) else None,
-        thread_id=row.thread_id,
-        parse_mode="HTML",
-        reply_markup=language_keyboard(row.id, langs),
+    job = _job_from_pending(row)
+    status_id = await _show_cover_prompt(
+        ctx, job, language_prompt_text(langs), language_keyboard(row.id, langs)
     )
-    if ref and ref != report.get("lang_prompt"):
-        report["lang_prompt"] = ref
-        ctx.catalog.update_pending_review(row.id, source_report_json=_dumps(report))
+    ctx.catalog.update_pending_review(row.id, status_message_id=status_id)
 
 
 async def _maybe_prompt_language(
@@ -1856,7 +2060,6 @@ async def _maybe_prompt_language(
         )
     row = ctx.catalog.get_pending_review(pending)
     if row:
-        await edit_status(ctx, job, "Pick a primary language for the library folder.")
         await _restore_language_prompt(ctx, row)
     return True
 
@@ -1875,10 +2078,17 @@ async def _apply_language_choice(ctx: Ctx, row: PendingReview, slug: str) -> Non
         return
     report["primary_language"] = chosen
     report["language_confirmed"] = True
+    if isinstance(working, dict):
+        working["genre"] = ctx.genre.pin_language(str(working.get("genre") or ""), chosen)
     tags = normalize_tagset(tagset_from_dict(working), ctx.genre)
+    tags = replace(tags, genre=ctx.genre.pin_language(tags.genre, chosen))
+    await _drop_identify_prompt(ctx, row)
+    await _promote_queued_identify(ctx, row.chat_id)
+    row = ctx.catalog.get_pending_review(row.id) or row
     local = Path(row.local_path)
     job = _job_from_pending(row)
     _bind_primary_language(job, report, ctx.genre)
+    await edit_status(ctx, job, _preview(tags, identity, local if local.is_file() else None, report))
     ctx.catalog.update_pending_review(
         row.id,
         source_report_json=_dumps(report),
@@ -1955,13 +2165,25 @@ async def _restore_dest_prompt(ctx: Ctx, row: PendingReview) -> None:
         chat_id=row.chat_id,
         user_id=uid or row.chat_id,
         text=dest_prompt_text(
-            prefs.dest, prefs.correct_telegram, prefs.skip_save_prompt, prefs.delete_original
+            prefs.dest,
+            prefs.correct_telegram,
+            prefs.skip_save_prompt,
+            prefs.delete_original,
+            show_skip=bool(report.get("ask_skip", False)),
         ),
         previous=report.get("dest_prompt") if isinstance(report.get("dest_prompt"), dict) else None,
         thread_id=row.thread_id,
         parse_mode="HTML",
         reply_markup=dest_keyboard(
-            row.id, prefs.dest, prefs.correct_telegram, prefs.skip_save_prompt, prefs.delete_original
+            row.id,
+            prefs.dest,
+            prefs.correct_telegram,
+            prefs.skip_save_prompt,
+            prefs.delete_original,
+            ask_dest=bool(report.get("ask_dest", True)),
+            ask_correct=bool(report.get("ask_correct", True)),
+            ask_delete=bool(report.get("ask_delete", True)),
+            ask_skip=bool(report.get("ask_skip", False)),
         ),
     )
     if ref and ref != report.get("dest_prompt"):
@@ -1993,19 +2215,37 @@ async def _maybe_prompt_dest(
     uid = job.user_id or 0
     user = ctx.catalog.get_user(uid) if uid else None
     prefs = _user_save_prefs(ctx, uid)
+    from app.prefs import asks_questions, load_user_prefs
+
+    process = load_user_prefs(ctx, uid)
     if not user or not user.logged_in:
         report["drive_dest"] = "none"
         report["dest_confirmed"] = True
-        report["correct_telegram"] = False
-        if "delete_original" not in report:
-            report["delete_original"] = prefs.delete_original
-        job.delete_original = bool(report.get("delete_original"))
+        report["correct_telegram"] = True
+        report["delete_original"] = process.delete == "yes"
+        job.correct_telegram = True
+        job.delete_original = bool(report["delete_original"])
         return False
-    _fill_dest_defaults(report, prefs)
-    if report["skip_save_prompt"]:
+    report["ask_dest"] = process.save == "ask"
+    report["ask_correct"] = process.correct == "ask"
+    report["ask_delete"] = process.delete == "ask"
+    report["ask_skip"] = False
+    if not asks_questions(process, logged_in=True):
+        if process.save != "ask":
+            report["drive_dest"] = process.save
+        report["correct_telegram"] = process.correct == "yes"
+        report["delete_original"] = process.delete == "yes"
+        report["skip_save_prompt"] = True
         report["dest_confirmed"] = True
         _apply_dest_to_job(job, _dest_state(report))
         return False
+    _fill_dest_defaults(report, prefs)
+    if process.save != "ask":
+        report["drive_dest"] = process.save
+    if process.correct != "ask":
+        report["correct_telegram"] = process.correct == "yes"
+    if process.delete != "ask":
+        report["delete_original"] = process.delete == "yes"
     report["quality_replace"] = {
         "replaced": replaced,
         "old_q": list(old_q) if old_q else None,
@@ -2112,7 +2352,66 @@ def _sidecar_payload(job: Job, tags: TagSet, identity: Identity) -> dict:
     }
 
 
+async def _autoforward_card(ctx: Ctx, job: Job, message_id: int) -> None:
+    from app.prefs import load_user_prefs
+
+    if not message_id or not job.user_id:
+        return
+    prefs = load_user_prefs(ctx, job.user_id)
+    for chat_id in prefs.auto_forward:
+        if chat_id == job.chat_id:
+            continue
+        try:
+            await ctx.bot.forward_message(
+                chat_id=chat_id,
+                from_chat_id=job.chat_id,
+                message_id=message_id,
+            )
+        except Exception:
+            log.warning("autoforward failed chat=%s", chat_id, exc_info=True)
+
+
 async def _commit_upload(
+    ctx: Ctx,
+    *,
+    job: Job,
+    local: Path,
+    tags: TagSet,
+    identity: Identity,
+    kind: str,
+    source_report: dict,
+    replace_id: int | None = None,
+    old_drive_id: str | None = None,
+    replaced: bool = False,
+    old_q: tuple[int, int] | None = None,
+    new_q: tuple[int, int] | None = None,
+    pending_id: int | None = None,
+    conflict_action: str | None = None,
+    track_id: int | None = None,
+) -> Path | None:
+    from app.audio_in import user_upload_lock
+
+    async with user_upload_lock(job.user_id or job.chat_id):
+        return await _commit_upload_locked(
+            ctx,
+            job=job,
+            local=local,
+            tags=tags,
+            identity=identity,
+            kind=kind,
+            source_report=source_report,
+            replace_id=replace_id,
+            old_drive_id=old_drive_id,
+            replaced=replaced,
+            old_q=old_q,
+            new_q=new_q,
+            pending_id=pending_id,
+            conflict_action=conflict_action,
+            track_id=track_id,
+        )
+
+
+async def _commit_upload_locked(
     ctx: Ctx,
     *,
     job: Job,
@@ -2138,6 +2437,13 @@ async def _commit_upload(
     from app.relocate import ctx_for_user
 
     want_drive = _want_drive(source_report)
+    if uid:
+        from app.formats import detect_format, user_allowed_formats
+
+        fmt = detect_format(str(local), "")
+        if fmt and fmt not in set(user_allowed_formats(ctx, uid)):
+            want_drive = False
+            source_report["drive_dest"] = "none"
     if uid and want_drive:
         ctx = ctx_for_user(ctx, uid)
     if kind == "library":
@@ -2196,6 +2502,11 @@ async def _commit_upload(
                 }
             ]
 
+    from app.paths import file_sha256
+
+    audio_sha = await asyncio.to_thread(file_sha256, dest)
+    if isinstance(source_report, dict):
+        source_report["sha256"] = audio_sha
     if conflict_action == "skip":
         skipped_id = track_id or ctx.catalog.insert_pending(
             kind=kind,
@@ -2211,7 +2522,10 @@ async def _commit_upload(
             album=tags.album,
             status="skipped",
             user_id=uid,
+            audio_sha256=audio_sha,
         )
+        if track_id:
+            ctx.catalog.update_track(track_id, audio_sha256=audio_sha)
         if pending_id is not None:
             ctx.catalog.update_pending_review(pending_id, status="skipped", track_id=skipped_id)
         await edit_status(
@@ -2328,6 +2642,7 @@ async def _commit_upload(
             artist=tags.artist,
             album=tags.album,
             user_id=uid,
+            audio_sha256=audio_sha,
         )
 
     if pending_id is not None:
@@ -2396,6 +2711,7 @@ async def _commit_upload(
             "kind": kind,
             "source_chat_id": job.chat_id,
             "source_message_id": job.source_message_id or None,
+            "audio_sha256": audio_sha,
         }
         if pending_id is not None:
             completed = ctx.catalog.get_pending_review(pending_id)
@@ -2432,16 +2748,7 @@ async def _commit_upload(
         if job.user_id:
             note = "Could not update the group file." if not want_drive else "Drive upload failed. File kept locally."
             await notify_user(ctx, job.user_id, note, chat_id=job.chat_id)
-        fail = (
-            "Could not update the group file."
-            if not want_drive
-            else "Tagged, but Drive upload failed. Kept locally."
-        )
-        await edit_status(
-            ctx,
-            job,
-            f"{fail}\n\n{_preview(tags, identity, dest, source_report)}",
-        )
+        await edit_status(ctx, job, _preview(tags, identity, dest, source_report))
         return dest
 
     extra = ""
@@ -2454,7 +2761,6 @@ async def _commit_upload(
         saved = "Updated the group file" if (replace_id is not None or correct) else "Tagged (not copied to Drive)"
     else:
         saved = f"Saved ({dest_label})"
-    from app.captions import music_caption
     from app.telegram_file import update_public_audio
 
     public_id = job.public_message_id or 0
@@ -2469,8 +2775,32 @@ async def _commit_upload(
         completed = ctx.catalog.get_pending_review(pending_id)
         if completed and completed.telegram_file_id:
             telegram_file_id = completed.telegram_file_id
-    caption = music_caption(tags=tags)
-    if public_id:
+    caption = _preview(tags, identity, dest, source_report)
+    text_status = bool((source_report or {}).get("text_status"))
+    if public_id and text_status:
+        from app.telegram_file import message_file_id, send_public_audio
+
+        full_caption = caption
+        sent = await send_public_audio(
+            ctx,
+            job.chat_id,
+            dest,
+            caption=full_caption,
+            thread_id=job.thread_id,
+            tags=tags,
+        )
+        with contextlib.suppress(Exception):
+            await ctx.bot.delete_message(chat_id=job.chat_id, message_id=public_id)
+        public_id = sent.message_id
+        job.status_message_id = public_id
+        job.public_message_id = public_id
+        new_file = message_file_id(sent)
+        if new_file:
+            telegram_file_id = new_file
+            ctx.catalog.update_track(track_id, telegram_file_id=new_file)
+        ctx.catalog.bind_track_message(track_id, job.chat_id, public_id)
+        await _autoforward_card(ctx, job, public_id)
+    elif public_id:
         new_file = await update_public_audio(
             ctx,
             chat_id=job.chat_id,
@@ -2484,13 +2814,10 @@ async def _commit_upload(
             telegram_file_id = new_file
             ctx.catalog.update_track(track_id, telegram_file_id=new_file)
         ctx.catalog.bind_track_message(track_id, job.chat_id, public_id)
+        await _autoforward_card(ctx, job, public_id)
     if delete_original:
         await _delete_original_telegram(ctx, job, public_id)
-    await edit_status(
-        ctx,
-        job,
-        f"{_preview(tags, identity, dest, source_report)}{_drive_link(job.chat_id, url)}",
-    )
+    await edit_status(ctx, job, _preview(tags, identity, dest, source_report))
     if job.chat_id <= 0 and uid and _group_save_note_enabled(ctx, uid):
         from app.ephemeral import send_private
 
@@ -2686,15 +3013,12 @@ def _load_pending_state(row: PendingReview) -> tuple[dict, dict, dict, Identity,
 
 
 async def _refresh_tag_ui(ctx: Ctx, row: PendingReview) -> None:
-    original, recommended, working, identity, report, _candidates = _load_pending_state(row)
+    original, recommended, working, _identity, _report, _candidates = _load_pending_state(row)
     job = _job_from_pending(row)
-    path = Path(row.local_path) if row.local_path else None
     text = format_summary(
         original,
         recommended,
         working,
-        reason=identity.confidence_reason,
-        tech=_tech_block(identity, path, report),
         genre_mapper=ctx.genre,
     )
     status_id = await edit_status(ctx, job, text, review_keyboard(row.id, original, recommended, working))
@@ -2738,6 +3062,86 @@ async def _run_claimed_action(ctx: Ctx, row: PendingReview, action) -> None:
             )
 
 
+def _tag_maps_equal(left: dict, right: dict) -> bool:
+    keys = (
+        "title",
+        "album",
+        "artist",
+        "albumartist",
+        "composer",
+        "genre",
+        "date",
+        "tracknumber",
+        "discnumber",
+    )
+    return all(
+        str(left.get(key) or "").strip() == str(right.get(key) or "").strip() for key in keys
+    )
+
+
+def _match_selected(report: dict) -> int:
+    try:
+        value = int(report.get("match_selected") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, value)
+
+
+async def _show_match_choices(ctx: Ctx, row: PendingReview, *, page: int | None = None) -> None:
+    identity = identity_from_dict(_loads(row.identity_json, {}))
+    report = _loads(row.source_report_json, {})
+    selected = _match_selected(report if isinstance(report, dict) else {})
+    if page is None:
+        page = selected // 5
+    text = match_prompt_text(identity.acoustid or "", len(identity.candidates))
+    markup = match_keyboard(
+        row.id, [asdict(c) for c in identity.candidates], page, selected=selected
+    )
+    await edit_status(ctx, _job_from_pending(row), text, markup)
+    ctx.catalog.update_pending_review(row.id, status="waiting")
+
+
+async def _confirm_song_match(ctx: Ctx, row: PendingReview, index: int) -> None:
+    if not await _apply_candidate(ctx, row, index):
+        return
+    refreshed = ctx.catalog.get_pending_review(row.id)
+    if refreshed is None or refreshed.status != "waiting":
+        return
+    await _accept_song_match(ctx, refreshed)
+
+
+async def _accept_song_match(ctx: Ctx, row: PendingReview) -> None:
+    original, recommended, working, identity, report, _cands = _load_pending_state(row)
+    if _tag_maps_equal(original, recommended):
+        await _drop_identify_prompt(ctx, row)
+        row = ctx.catalog.get_pending_review(row.id) or row
+    if not _tag_maps_equal(original, recommended):
+        ctx.catalog.update_pending_review(row.id, phase="tags", status="waiting")
+        refreshed = ctx.catalog.get_pending_review(row.id)
+        if refreshed:
+            await _refresh_tag_ui(ctx, refreshed)
+        return
+    local = Path(row.local_path)
+    tags = normalize_tagset(tagset_from_dict(working or recommended), ctx.genre)
+    job = _job_from_pending(row)
+    report_dict = report if isinstance(report, dict) else {}
+    await edit_status(
+        ctx, job, _preview(tags, identity, local if local.is_file() else None, report_dict)
+    )
+    await _library_commit_with_cover(
+        ctx,
+        job=job,
+        local=local,
+        tags=tags,
+        identity=identity,
+        report=report if isinstance(report, dict) else {},
+        pending_id=row.id,
+        replace_id=row.replace_id,
+        old_drive_id=row.old_drive_id,
+        track_id=row.track_id,
+    )
+
+
 async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMContext) -> None:
     action = parse_callback(callback.data)
     if action is None:
@@ -2749,6 +3153,10 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
         return
     if callback.message and callback.message.chat.id != row.chat_id:
         await callback.answer()
+        return
+    from app.membership import answer_if_blocked
+
+    if await answer_if_blocked(ctx, callback):
         return
     if callback.from_user and not await allow_from_callback(ctx, callback):
         await callback.answer("Access denied.", show_alert=True)
@@ -2776,14 +3184,33 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
             return
         await _run_claimed_action(ctx, row, _apply_cover_back(ctx, row))
         return
+    if action.op == "match_page" and action.index is not None:
+        await _show_match_choices(ctx, row, page=action.index)
+        return
     if action.op == "ok":
         await state.clear()
+        if row.phase == "match":
+            report = _loads(row.source_report_json, {})
+            index = _match_selected(report if isinstance(report, dict) else {})
+            await _run_claimed_action(ctx, row, _confirm_song_match(ctx, row, index))
+            await _promote_queued_identify(ctx, row.chat_id)
+            return
+        if row.phase == "cover":
+            report = _loads(row.source_report_json, {})
+            picker = _cover_picker_meta(report if isinstance(report, dict) else {})
+            try:
+                index = int(picker.get("selected") or 0)
+            except (TypeError, ValueError):
+                index = 0
+            await _run_claimed_action(ctx, row, _apply_cover_choice(ctx, row, index))
+            return
         if row.phase == "dest":
             await _run_claimed_action(ctx, row, _apply_dest_confirm(ctx, row))
             return
         await _run_claimed_action(
             ctx, row, _apply_confirm(ctx, row, kind="library")
         )
+        await _promote_queued_identify(ctx, row.chat_id)
         return
     if action.op == "rev":
         await state.clear()
@@ -2795,16 +3222,32 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
         if row.phase != "cover":
             ctx.catalog.update_pending_review(row.id, status="waiting")
             return
-        await state.clear()
-        await _run_claimed_action(
-            ctx, row, _apply_cover_choice(ctx, row, action.index)
+        report = _loads(row.source_report_json, {})
+        if not isinstance(report, dict):
+            report = {}
+        picker = _cover_picker_meta(report)
+        picker["selected"] = action.index
+        report["cover_picker"] = picker
+        ctx.catalog.update_pending_review(
+            row.id, source_report_json=_dumps(report), status="waiting"
+        )
+        await edit_status(
+            ctx,
+            _job_from_pending(row),
+            _cover_status_text(picker, row.file_name),
+            _cover_status_markup(row.id, picker),
         )
         return
     if action.op == "cand" and action.index is not None:
-        await state.clear()
-        await _run_claimed_action(
-            ctx, row, _apply_candidate(ctx, row, action.index)
+        report = _loads(row.source_report_json, {})
+        if not isinstance(report, dict):
+            report = {}
+        report["match_selected"] = action.index
+        ctx.catalog.update_pending_review(
+            row.id, source_report_json=_dumps(report), status="waiting"
         )
+        row = ctx.catalog.get_pending_review(row.id) or row
+        await _show_match_choices(ctx, row, page=action.index // 5)
         return
     if action.op == "toggle" and action.field:
         original, recommended, working, _identity, _report, _cands = _load_pending_state(row)
@@ -2876,6 +3319,24 @@ async def handle_pending_callback(callback: CallbackQuery, ctx: Ctx, state: FSMC
     ctx.catalog.update_pending_review(row.id, status="waiting")
 
 
+async def _delete_process_messages(ctx: Ctx, row: PendingReview) -> bool:
+    ids: list[int] = []
+    public = int(row.public_message_id or 0)
+    prompt = int(row.status_message_id or 0)
+    if public:
+        ids.append(public)
+    if prompt and prompt not in ids:
+        ids.append(prompt)
+    removed = False
+    for message_id in ids:
+        try:
+            await ctx.bot.delete_message(chat_id=row.chat_id, message_id=message_id)
+            removed = True
+        except Exception:
+            log.debug("cancel delete failed chat=%s message=%s", row.chat_id, message_id)
+    return removed
+
+
 async def cancel_pending(ctx: Ctx, row: PendingReview) -> None:
     report = _loads(row.source_report_json, {})
     picker = _cover_picker_meta(report)
@@ -2905,14 +3366,29 @@ async def cancel_pending(ctx: Ctx, row: PendingReview) -> None:
     if local and row.local_path:
         with contextlib.suppress(OSError):
             local.parent.rmdir()
-    await edit_status(ctx, _job_from_pending(row), "Cancelled.")
+    if row.phase in {"match", "tags", "lang"}:
+        removed = await _delete_process_messages(ctx, row)
+        if not removed:
+            await edit_status(ctx, _job_from_pending(row), "Cancelled.")
+    else:
+        side_prompt = row.status_message_id and row.status_message_id != (row.public_message_id or 0)
+        if row.phase == "cover" and side_prompt:
+            try:
+                await ctx.bot.delete_message(chat_id=row.chat_id, message_id=row.status_message_id)
+            except Exception:
+                await edit_status(ctx, _job_from_pending(row), "Cancelled.")
+        else:
+            await edit_status(ctx, _job_from_pending(row), "Cancelled.")
     if was_leader:
         await _requeue_cover_followers(ctx, album_k, excluding_id=row.id)
         await _promote_next_cover_picker(ctx, excluding_id=row.id)
     ctx.catalog.update_pending_review(row.id, status="cancelled")
+    await _promote_queued_identify(ctx, row.chat_id)
 
 
 async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
+    await _drop_identify_prompt(ctx, row)
+    row = ctx.catalog.get_pending_review(row.id) or row
     _original, _recommended, working, identity, report, _cands = _load_pending_state(row)
     tags = normalize_tagset(tagset_from_dict(working), ctx.genre)
     local = Path(row.local_path)
@@ -2928,6 +3404,7 @@ async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
     report = apply_chosen(report, tags, identity)
 
     job = _job_from_pending(row)
+    await edit_status(ctx, job, _preview(tags, identity, local, report if isinstance(report, dict) else {}))
     if kind == "library" and identity.mb_recording_id and _want_drive(report):
         existing = ctx.catalog.find_library_by_mbid(
             identity.mb_recording_id, getattr(row, "user_id", 0) or None
@@ -2935,31 +3412,23 @@ async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
         if existing and existing.id != row.replace_id:
             new_q = quality(identity.bit_depth, identity.sample_rate)
             old_q = quality(existing.bit_depth, existing.sample_rate)
-            if existing.status == "uploaded" and new_q <= old_q:
-                ctx.catalog.update_pending_review(row.id, status="done")
-                await edit_status(
+            if existing.status == "uploaded" and new_q > old_q:
+                await _library_commit_with_cover(
                     ctx,
-                    job,
-                    "Duplicate — already in library "
-                    f"({old_q[0]}/{old_q[1]}). Skipped.\n\n{_preview(tags, identity, local, report)}",
+                    job=job,
+                    local=local,
+                    tags=tags,
+                    identity=identity,
+                    report=report,
+                    replace_id=existing.id,
+                    old_drive_id=existing.drive_file_id,
+                    replaced=True,
+                    old_q=old_q,
+                    new_q=new_q,
+                    pending_id=row.id,
+                    file_cover=(cover, mime),
                 )
                 return
-            await _library_commit_with_cover(
-                ctx,
-                job=job,
-                local=local,
-                tags=tags,
-                identity=identity,
-                report=report,
-                replace_id=existing.id,
-                old_drive_id=existing.drive_file_id,
-                replaced=existing.status == "uploaded" and new_q > old_q,
-                old_q=old_q,
-                new_q=new_q,
-                pending_id=row.id,
-                file_cover=(cover, mime),
-            )
-            return
 
     if kind != "library":
         _stamp_languages(ctx, report, tags)
@@ -3029,16 +3498,16 @@ async def _apply_confirm(ctx: Ctx, row: PendingReview, *, kind: str) -> None:
     )
 
 
-async def _apply_candidate(ctx: Ctx, row: PendingReview, index: int) -> None:
+async def _apply_candidate(ctx: Ctx, row: PendingReview, index: int) -> bool:
     _original, _recommended, _working, identity, report, candidates = _load_pending_state(row)
     if index < 0 or index >= len(candidates):
-        ctx.catalog.update_pending_review(row.id, status="waiting")
-        return
+        await _show_match_choices(ctx, row)
+        return False
     cand = candidates[index]
     mbid = cand.get("mb_recording_id") if isinstance(cand, dict) else cand.mb_recording_id
     if not mbid:
-        ctx.catalog.update_pending_review(row.id, status="waiting")
-        return
+        await _show_match_choices(ctx, row)
+        return False
     job = _job_from_pending(row)
     await edit_status(ctx, job, "Loading that recording…")
     try:
@@ -3059,8 +3528,8 @@ async def _apply_candidate(ctx: Ctx, row: PendingReview, index: int) -> None:
         ctx.catalog.update_pending_review(row.id, status="waiting")
         row = ctx.catalog.get_pending_review(row.id)
         if row:
-            await _refresh_tag_ui(ctx, row)
-        return
+            await _show_match_choices(ctx, row)
+        return False
     new_identity.candidates = identity.candidates
     new_identity.confidence = "low"
     new_identity.confidence_reason = identity.confidence_reason
@@ -3091,9 +3560,7 @@ async def _apply_candidate(ctx: Ctx, row: PendingReview, index: int) -> None:
         source_report_json=_dumps(report),
         status="waiting",
     )
-    row = ctx.catalog.get_pending_review(row.id)
-    if row:
-        await _refresh_tag_ui(ctx, row)
+    return True
 
 
 async def _apply_drive_choice(ctx: Ctx, row: PendingReview, action: str) -> None:

@@ -4,9 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from app.models import TagSet
-from app.telegram_file import message_file_id, send_public_audio, update_public_audio
+from app.telegram_file import audio_thumbnail, message_file_id, send_public_audio, update_public_audio
 
 
 class MessageFileIdTests(unittest.TestCase):
@@ -20,6 +21,19 @@ class MessageFileIdTests(unittest.TestCase):
     def test_document_fallback(self) -> None:
         msg = SimpleNamespace(audio=None, document=SimpleNamespace(file_id="doc-1"))
         self.assertEqual(message_file_id(msg), "doc-1")
+
+
+class ThumbnailTests(unittest.TestCase):
+    def test_jpeg_cover_becomes_telegram_thumbnail(self) -> None:
+        jpeg = b"\xff\xd8" + b"x" * 32
+        with patch("app.tags.read_cover", return_value=(jpeg, "image/jpeg")):
+            thumb = audio_thumbnail(Path("song.flac"))
+        self.assertIsNotNone(thumb)
+        self.assertEqual(thumb.filename, "cover.jpg")
+
+    def test_non_jpeg_cover_is_skipped(self) -> None:
+        with patch("app.tags.read_cover", return_value=(b"PNG", "image/png")):
+            self.assertIsNone(audio_thumbnail(Path("song.flac")))
 
 
 class SendPublicAudioTests(unittest.IsolatedAsyncioTestCase):

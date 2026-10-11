@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import secrets
+import time
 from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 
 from app.membership import allow_from_callback, allow_user, touch, user_is_bot
 from app.models import Ctx, TrackRecord
@@ -17,6 +20,7 @@ from app.util import safe_link
 
 log = logging.getLogger(__name__)
 PAGE_SIZE = 8
+_REVIEW_PAGES: dict[str, dict] = {}
 
 
 def review_label(track: TrackRecord) -> str:
@@ -28,19 +32,31 @@ def review_label(track: TrackRecord) -> str:
     return text[:64]
 
 
-def review_list_keyboard(items: list[TrackRecord], page: int) -> InlineKeyboardMarkup:
+def _review_ttl(ctx: Ctx) -> int:
+    return int(getattr(ctx.settings, "pagination_ttl_seconds", 300) or 300)
+
+
+def review_list_keyboard(
+    items: list[TrackRecord], page: int, *, ctx: Ctx, user_id: int
+) -> InlineKeyboardMarkup:
     pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, pages - 1))
     start = page * PAGE_SIZE
+    now = time.time()
+    dead = [key for key, row in _REVIEW_PAGES.items() if row.get("exp", 0) <= now]
+    for key in dead:
+        _REVIEW_PAGES.pop(key, None)
+    token = secrets.token_urlsafe(6)
+    _REVIEW_PAGES[token] = {"user_id": user_id, "exp": now + _review_ttl(ctx)}
     rows = [
         [InlineKeyboardButton(text=review_label(track), callback_data=f"rvt:{track.id}")]
         for track in items[start : start + PAGE_SIZE]
     ]
     nav: list[InlineKeyboardButton] = []
     if page:
-        nav.append(InlineKeyboardButton(text="Previous", callback_data=f"rvp:{page - 1}"))
+        nav.append(InlineKeyboardButton(text="Previous", callback_data=f"rvp:{token}:{page - 1}"))
     if page + 1 < pages:
-        nav.append(InlineKeyboardButton(text="Next", callback_data=f"rvp:{page + 1}"))
+        nav.append(InlineKeyboardButton(text="Next", callback_data=f"rvp:{token}:{page + 1}"))
     if nav:
         rows.append(nav)
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -141,20 +157,113 @@ async def _show_list(message: Message, ctx: Ctx, page: int = 0, *, edit: bool = 
     await _sync_drive_review(ctx, user_id)
     items = ctx.catalog.list_review_tracks(user_id or None)
     if not items:
-        await _deliver_list(message, "Review queue is empty.", edit=edit)
+        await _send_review_reply(message, ctx, user_id, "Review Pile: 0", None, edit=edit)
         return
     pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, pages - 1))
-    text = f"<b>Review queue</b> — page {page + 1}/{pages}\nPick a song, then react on the info card."
-    await _deliver_list(message, text, review_list_keyboard(items, page), edit=edit)
+    text = f"Review Pile: {len(items)}"
+    markup = review_list_keyboard(items, page, ctx=ctx, user_id=user_id)
+    from app.user_cmd import _webapp_url
+
+    url = _webapp_url(ctx, "review")
+    if url and markup is not None:
+        markup.inline_keyboard.append(
+            [InlineKeyboardButton(text="Open Review", web_app=WebAppInfo(url=url))]
+        )
+    await _send_review_reply(message, ctx, user_id, text, markup, edit=edit)
+
+
+async def _send_review_reply(message: Message, ctx: Ctx, user_id: int, text: str, markup, *, edit: bool) -> None:
+    """Group /review goes to the user's private chat, including an empty pile."""
+    if message.chat.type != "private" and not edit:
+        try:
+            await ctx.bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
+            return
+        except Exception:
+            log.debug("review private send failed", exc_info=True)
+    await _deliver_list(message, text, markup, edit=edit)
 
 
 async def _send_card(callback: CallbackQuery, ctx: Ctx, track: TrackRecord) -> None:
+    from app.audio_in import downloading_text, source_deleted
+    from app.captions import song_card
+    from app.notify import send_notice
+    from app.telegram_file import send_public_audio
+
     track = await hydrate_track_tags(ctx, track)
     assert callback.message is not None
-    text = format_song_card(track, chat_id=callback.message.chat.id)
-    sent = await callback.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    chat = callback.message.chat
+    user_id = callback.from_user.id if callback.from_user else 0
+    name = track.title or track.file_name or "file"
+    path = Path(track.local_path) if track.local_path else None
+    tags = read_tags_for_card(track)
+    drive_id = ""
+    if path is None or not path.is_file():
+        drive_id = str(getattr(track, "drive_file_id", "") or "")
+        from app.user_cmd import _drive_expired
+
+        if drive_id and await _drive_expired(ctx, user_id, chat.id):
+            return
+        if not drive_id:
+            await send_notice(ctx, user_id, "File not found", level="error", chat_id=chat.id)
+            return
+    with contextlib.suppress(Exception):
+        await ctx.bot.send_chat_action(chat.id, "upload_document")
+    placeholder = await callback.message.answer(downloading_text(name, 0))
+    if await source_deleted(ctx.bot, chat.id, placeholder.message_id):
+        await send_notice(ctx, user_id, "Download cancelled", level="info", chat_id=chat.id)
+        return
+    if drive_id and (path is None or not path.is_file()):
+        from app.user_cmd import DownloadCancelled, _download_drive_file
+
+        async def _alive() -> bool:
+            return not await source_deleted(ctx.bot, chat.id, placeholder.message_id)
+
+        async def _paint(pct: int) -> None:
+            await ctx.bot.edit_message_text(
+                downloading_text(name, pct),
+                chat_id=chat.id,
+                message_id=placeholder.message_id,
+            )
+
+        try:
+            path = await _download_drive_file(
+                ctx,
+                user_id,
+                drive_id,
+                chat.id,
+                alive=_alive,
+                on_update=_paint,
+            )
+        except DownloadCancelled:
+            await send_notice(ctx, user_id, "Download cancelled", level="info", chat_id=chat.id)
+            return
+    if await source_deleted(ctx.bot, chat.id, placeholder.message_id):
+        await send_notice(ctx, user_id, "Download cancelled", level="info", chat_id=chat.id)
+        return
+    if path is None or not path.is_file():
+        await send_notice(ctx, user_id, "File not found", level="error", chat_id=chat.id)
+        with contextlib.suppress(Exception):
+            await placeholder.delete()
+        return
+    from app.tags import read_audio_metrics
+
+    metrics = None
+    try:
+        metrics = await asyncio.to_thread(read_audio_metrics, path)
+    except Exception:
+        log.debug("review card metrics failed", exc_info=True)
+    sent = await send_public_audio(
+        ctx,
+        chat.id,
+        path,
+        caption=song_card(tags, metrics),
+        thread_id=callback.message.message_thread_id,
+        tags=tags,
+    )
     ctx.catalog.bind_track_message(track.id, sent.chat.id, sent.message_id)
+    with contextlib.suppress(Exception):
+        await placeholder.delete()
     thread_id = callback.message.message_thread_id
     if track.thread_id is None and thread_id:
         ctx.catalog.update_track(track.id, thread_id=thread_id)
@@ -165,33 +274,36 @@ def build_review_command_router() -> Router:
 
     @router.message(Command("review", "reviews"))
     async def review_cmd(message: Message, ctx: Ctx) -> None:
+        from app.user_cmd import _blocked
+
+        if await _blocked(message, ctx):
+            return
         if not await _authorized(message, ctx):
             if message.chat.type == "private":
                 await message.reply("Private access requires membership in a known group.")
             return
         touch(ctx, message.from_user.id, message.from_user)
-        from app.ephemeral import send_private
-        from app.user_cmd import _web_or_url_keyboard
-
-        kb = _web_or_url_keyboard(ctx, "review", None, "Open review")
-        await send_private(
-            ctx,
-            chat_id=message.chat.id,
-            user_id=message.from_user.id,
-            text="Your review folder. Mini App if available, or pick below.",
-            reply_markup=kb,
-        )
         await _show_list(message, ctx, user_id=message.from_user.id)
 
-    @router.callback_query(F.data.regexp(r"^rvp:\d+$"))
+    @router.callback_query(F.data.regexp(r"^rvp:[^:]+:\d+$"))
     async def review_page(callback: CallbackQuery, ctx: Ctx) -> None:
+        from app.membership import answer_if_blocked
+
+        if await answer_if_blocked(ctx, callback):
+            return
         if not await allow_from_callback(ctx, callback):
             await callback.answer("Access denied.", show_alert=True)
             return
         if not callback.message:
             await callback.answer()
             return
-        page = int((callback.data or "rvp:0").split(":", 1)[1])
+        _token, page_s = (callback.data or "rvp:x:0").split(":", 1)[1].rsplit(":", 1)
+        row = _REVIEW_PAGES.get(_token)
+        if not row or row.get("exp", 0) <= time.time() or row.get("user_id") != callback.from_user.id:
+            _REVIEW_PAGES.pop(_token, None)
+            await callback.answer("Expired.", show_alert=True)
+            return
+        page = int(page_s)
         await callback.answer()
         try:
             await _show_list(callback.message, ctx, page, edit=True, user_id=callback.from_user.id)
@@ -200,6 +312,10 @@ def build_review_command_router() -> Router:
 
     @router.callback_query(F.data.regexp(r"^rvt:\d+$"))
     async def review_pick(callback: CallbackQuery, ctx: Ctx) -> None:
+        from app.membership import answer_if_blocked
+
+        if await answer_if_blocked(ctx, callback):
+            return
         if not await allow_from_callback(ctx, callback):
             await callback.answer("Access denied.", show_alert=True)
             return
