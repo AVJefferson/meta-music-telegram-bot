@@ -2777,7 +2777,7 @@ async def _commit_upload_locked(
             telegram_file_id = completed.telegram_file_id
     caption = _preview(tags, identity, dest, source_report)
     text_status = bool((source_report or {}).get("text_status"))
-    if public_id and text_status:
+    if text_status:
         from app.telegram_file import message_file_id, send_public_audio
 
         full_caption = caption
@@ -2789,8 +2789,9 @@ async def _commit_upload_locked(
             thread_id=job.thread_id,
             tags=tags,
         )
-        with contextlib.suppress(Exception):
-            await ctx.bot.delete_message(chat_id=job.chat_id, message_id=public_id)
+        if public_id:
+            with contextlib.suppress(Exception):
+                await ctx.bot.delete_message(chat_id=job.chat_id, message_id=public_id)
         public_id = sent.message_id
         job.status_message_id = public_id
         job.public_message_id = public_id
@@ -2817,7 +2818,8 @@ async def _commit_upload_locked(
         await _autoforward_card(ctx, job, public_id)
     if delete_original:
         await _delete_original_telegram(ctx, job, public_id)
-    await edit_status(ctx, job, _preview(tags, identity, dest, source_report))
+    if not text_status:
+        await edit_status(ctx, job, _preview(tags, identity, dest, source_report))
     if job.chat_id <= 0 and uid and _group_save_note_enabled(ctx, uid):
         from app.ephemeral import send_private
 

@@ -57,8 +57,9 @@ async def ingest_local_audio(
                 message_id=sent_id,
                 parse_mode="HTML",
             )
-        except Exception:
-            log.debug("placeholder edit failed message=%s", sent_id, exc_info=True)
+        except Exception as exc:
+            if "message is not modified" not in str(exc).lower():
+                log.debug("placeholder edit failed message=%s", sent_id, exc_info=True)
         sent_file_id = telegram_file_id
     else:
         sent = await send_public_audio(

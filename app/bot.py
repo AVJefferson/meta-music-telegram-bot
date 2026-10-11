@@ -129,7 +129,6 @@ def is_flac_message(message: Message) -> bool:
 async def intake_audio_message(message: Message, ctx: Ctx) -> None:
     from app.audio_in import (
         BLOCKED_TEXT,
-        CHECKS_TEXT,
         CORRUPT_TEXT,
         FORMAT_TEXT,
         LARGE_TEXT,
@@ -208,7 +207,6 @@ async def intake_audio_message(message: Message, ctx: Ctx) -> None:
             except Exception:
                 await status.edit_text(CORRUPT_TEXT)
                 return
-            await status.edit_text(CHECKS_TEXT)
             await ingest_local_audio(
                 ctx,
                 chat=message.chat,
@@ -219,9 +217,8 @@ async def intake_audio_message(message: Message, ctx: Ctx) -> None:
                 topic_name="",
                 telegram_file_id=file_id,
                 source_message_id=message.message_id,
+                status_message_id=status.message_id,
             )
-            with contextlib.suppress(Exception):
-                await status.delete()
         except SongDeleted:
             local.unlink(missing_ok=True)
             from app.notify import send_notice
